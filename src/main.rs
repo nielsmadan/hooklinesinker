@@ -218,7 +218,11 @@ fn run_doctor(json: bool) {
     let status_store = StatusStore::open(paths::state_root());
     let consumer_store = ConsumerStore::open(paths::state_root());
 
-    checks.push(permissions_check(&paths::state_root()));
+    let permissions = permissions_check(&paths::state_root());
+    if !permissions.ok {
+        fatal = true;
+    }
+    checks.push(permissions);
 
     checks.push(DoctorCheck {
         name: "active_version_target",
