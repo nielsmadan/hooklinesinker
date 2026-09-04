@@ -180,14 +180,19 @@ fn validate_sink(sink: Option<&str>) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn temp_root() -> PathBuf {
+        // the wall clock is only microsecond-resolution here, so two parallel tests
+        // sharing a tick would otherwise share a store
+        let id = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         std::env::temp_dir().join(format!(
-            "hooklinesinker-consumers-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "hooklinesinker-consumers-test-{}-{nanos}-{id}",
+            std::process::id()
         ))
     }
 
