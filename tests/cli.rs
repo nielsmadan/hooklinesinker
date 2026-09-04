@@ -529,6 +529,39 @@ fn sessions_json_omits_a_dead_record_without_removing_it() {
 }
 
 #[test]
+fn ingest_without_a_session_id_writes_no_ledger_record() {
+    let temp = unique_temp_dir("ingest-empty-session-id");
+    let ingest = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args([
+            "ingest",
+            "--agent",
+            "opencode",
+            "--event",
+            "session.created",
+        ])
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert!(ingest.status.success());
+
+    let ledger_files = std::fs::read_dir(temp.join("hooklinesinker/status"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(ledger_files, 0);
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["sessions"], serde_json::json!([]));
+}
+
+#[test]
 fn sessions_json_reports_an_empty_envelope_for_a_fresh_state_dir() {
     let temp = unique_temp_dir("sessions-empty");
     let output = Command::cargo_bin("hooklinesinker")

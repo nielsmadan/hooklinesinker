@@ -42,6 +42,9 @@ optional fields are safe; anything else needs a protocol bump and both consumers
   filter dead bindings out of their results but leave the files alone; the sweep inside
   `ingest` removes them and fans out the `running:false` event push consumers depend on. A
   read that deleted would swallow that event, and Juggler has no re-hydration timer.
+- **An empty `session.id` is never recorded.** Such an event is normalized and fanned out to
+  sinks (consumers key rows on terminal identity) but kept out of the ledger: its binding is
+  hashed over an empty id and would outlive every real session in the same live process.
 - **State is private.** `$XDG_STATE_HOME/hooklinesinker` is read through the CLI's JSON
   commands, never by a consumer opening files. Keep the JSON envelopes stable and complete —
   in particular, `problems` must reach the caller rather than being swallowed.

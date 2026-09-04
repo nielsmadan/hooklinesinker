@@ -1103,6 +1103,91 @@ fn a_read_between_the_kill_and_the_next_ingest_still_lets_the_sweep_fan_out() {
 }
 
 #[test]
+fn an_event_without_a_session_id_reaches_sinks_but_never_the_ledger() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let consumers = consumer_store();
+    consumers
+        .register(consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+    let liveness = FakeProcessLookup::with_owner(ProcessIdentity {
+        pid: 740,
+        started_at: "77".into(),
+        host: "host-a".into(),
+    });
+    liveness.set_alive(740, "77");
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+
+    let outcome = ingest(&ctx, Agent::Opencode, "session.created", "{}", 740);
+
+    assert!(outcome.problem.is_none());
+    let bodies = client.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["session"]["id"], "");
+    assert_eq!(bodies[0]["running"], true);
+    assert_eq!(ledger_files(&root), 0);
+    assert!(store.sessions_envelope(&liveness).sessions.is_empty());
+
+    ingest(
+        &ctx,
+        Agent::Opencode,
+        "session.status.busy",
+        r#"{"session_id":"oc-1"}"#,
+        740,
+    );
+
+    assert_eq!(ledger_files(&root), 1);
+    let sessions = store.sessions_envelope(&liveness).sessions;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session.id, "oc-1");
+}
+
+#[test]
+fn every_agent_drops_an_empty_session_id_from_the_ledger() {
+    let cases = [
+        (Agent::Claude, "SessionStart"),
+        (Agent::Codex, "SessionStart"),
+        (Agent::Opencode, "session.created"),
+        (Agent::Pi, "session_start"),
+    ];
+    for (agent, event) in cases {
+        let root = temp_home();
+        let store = StatusStore::open(root.clone()).unwrap();
+        let liveness = FakeProcessLookup::with_owner(ProcessIdentity {
+            pid: 750,
+            started_at: "78".into(),
+            host: "host-a".into(),
+        });
+        liveness.set_alive(750, "78");
+
+        ingest(
+            &state::IngestContext {
+                store: &store,
+                liveness: &liveness,
+                consumers: None,
+                http_client: &RecordingHttpClient::default(),
+            },
+            agent,
+            event,
+            r#"{"session_id":""}"#,
+            750,
+        );
+
+        assert_eq!(ledger_files(&root), 0, "{agent:?} {event}");
+    }
+}
+
+#[test]
 fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
     let store = store();
     let consumers = consumer_store();

@@ -83,6 +83,9 @@ decodes as `unknown` rather than failing the record.
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which additionally separates two terminals driving the same native session.
 
+An event whose `session.id` is empty (an agent announcing itself before its session id exists)
+is delivered to sinks but never stored, so it can never appear in `sessions --json`.
+
 `sessions --json` and `doctor` never mutate the ledger. A record whose process is gone is
 filtered out of both, and removed by the next `ingest`, which fans out one `running:false`
 event as it goes — so a poll landing between the kill and the next hook event cannot swallow

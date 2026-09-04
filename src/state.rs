@@ -292,17 +292,24 @@ pub fn handle_ingest(
 ) -> IngestOutcome {
     let store = ctx.store;
     let process = ctx.liveness.owner_of(hook_pid, agent);
-    let mut recorded_event: Option<StatusEvent> = None;
+    let mut normalized_event: Option<StatusEvent> = None;
     let outcome =
         normalize(agent, event, input, env, process).and_then(|maybe_event| match maybe_event {
+            // An event carrying no agent session id reaches sinks (consumers key
+            // rows on terminal identity) but never the ledger: its binding would
+            // outlive every real session in the same still-running process.
+            Some(status_event) if status_event.session.id.is_empty() => {
+                normalized_event = Some(status_event);
+                Ok(())
+            }
             Some(status_event) if status_event.running => {
                 store.record(&status_event)?;
-                recorded_event = Some(status_event);
+                normalized_event = Some(status_event);
                 Ok(())
             }
             Some(status_event) => {
                 store.end(&status_event.binding_id)?;
-                recorded_event = Some(status_event);
+                normalized_event = Some(status_event);
                 Ok(())
             }
             None => Ok(()),
@@ -330,7 +337,7 @@ pub fn handle_ingest(
         store,
         ctx.consumers,
         ctx.http_client,
-        recorded_event.as_ref(),
+        normalized_event.as_ref(),
         &swept,
     );
 
@@ -341,10 +348,10 @@ fn fan_out_to_sinks(
     store: &StatusStore,
     consumers: Option<&ConsumerStore>,
     http_client: &dyn HttpClient,
-    recorded_event: Option<&StatusEvent>,
+    normalized_event: Option<&StatusEvent>,
     swept: &[StatusEvent],
 ) {
-    if recorded_event.is_none() && swept.is_empty() {
+    if normalized_event.is_none() && swept.is_empty() {
         return;
     }
     let Some(consumers) = consumers else {
@@ -372,7 +379,7 @@ fn fan_out_to_sinks(
         }
     };
 
-    if let Some(event) = recorded_event {
+    if let Some(event) = normalized_event {
         record_problems(fanout.send(event, &status_consumers));
     }
     for swept_event in swept {
