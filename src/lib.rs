@@ -1,5 +1,7 @@
 pub mod consumers;
 pub mod environment;
+pub mod hooks;
+pub mod install;
 pub mod normalize;
 pub mod paths;
 pub mod processes;

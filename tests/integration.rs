@@ -1,5 +1,7 @@
 use hooklinesinker::consumers::{Consumer, ConsumerStore};
 use hooklinesinker::environment::{self, EnvSource};
+use hooklinesinker::hooks::{HookManager, HookRoots, HookState};
+use hooklinesinker::install::{Candidate, Installer, SemVer};
 use hooklinesinker::normalize::{HookEnvironment, normalize};
 use hooklinesinker::processes::ProcessLookup;
 use hooklinesinker::protocol::{
@@ -1063,5 +1065,158 @@ fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
         problems
             .iter()
             .any(|p| p.message.starts_with("sink juggler failed"))
+    );
+}
+
+// The OpenCode and Pi TypeScript adapters (assets/opencode-hooklinesinker.ts,
+// assets/pi-hooklinesinker.ts) pipe a bare `{"session_id": ..., "cwd": ...}`
+// object to `ingest` on stdin — never terminal/tmux/git/remote fields, which
+// normalize.rs sources from the hook environment instead. These tests pin
+// that exact stdin contract against normalize()'s NativeEvent expectations.
+
+#[test]
+fn opencode_adapter_stdin_shape_normalizes_with_its_explicit_cwd() {
+    let native = r#"{"session_id":"opencode-session","cwd":"/tmp/opencode-project"}"#;
+    let event = normalize(
+        Agent::Opencode,
+        "session.status.busy",
+        native,
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(event.phase, Phase::Working);
+    assert_eq!(event.session.id, "opencode-session");
+    assert_eq!(event.session.cwd, "/tmp/opencode-project");
+}
+
+#[test]
+fn opencode_adapter_synthetic_session_created_has_no_session_id_yet() {
+    let native = "{}";
+    let event = normalize(
+        Agent::Opencode,
+        "session.created",
+        native,
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(event.phase, Phase::Idle);
+    assert_eq!(event.session.id, "");
+}
+
+#[test]
+fn pi_adapter_stdin_shape_omits_cwd_and_falls_back_to_the_hook_environment() {
+    let native = r#"{"session_id":"pi-session"}"#;
+    let event = normalize(
+        Agent::Pi,
+        "agent_start",
+        native,
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(event.phase, Phase::Working);
+    assert_eq!(event.session.id, "pi-session");
+    assert_eq!(event.session.cwd, test_environment().cwd);
+}
+
+fn fake_candidate_binary(base: &std::path::Path, version: &str) -> PathBuf {
+    let path = base
+        .join("candidate-src")
+        .join(format!("hooklinesinker-{version}"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, format!("candidate {version}")).unwrap();
+    path
+}
+
+fn hook_manager_at(base: &std::path::Path, binary_path: PathBuf) -> HookManager {
+    HookManager::new(HookRoots {
+        claude_dir: base.join("claude"),
+        codex_dir: base.join("codex"),
+        opencode_config_dir: base.join("opencode"),
+        pi_agent_dir: base.join("pi"),
+        binary_path,
+    })
+}
+
+#[test]
+fn two_consumers_share_one_activation_and_both_still_receive_sink_fanout() {
+    let base = temp_home();
+    let install = Installer::open(base.join("data")).unwrap();
+    let consumers = consumer_store();
+
+    let installed = install
+        .install_candidate(Candidate {
+            version: SemVer::parse("0.1.0").unwrap(),
+            protocol_major: PROTOCOL_VERSION,
+            binary_path: fake_candidate_binary(&base, "0.1.0"),
+        })
+        .unwrap();
+    consumers
+        .register(consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+
+    // A second, unrelated consumer registering afterward must not reactivate
+    // the same version, and both consumers must remain registered together.
+    let installed_again = install
+        .install_candidate(Candidate {
+            version: SemVer::parse("0.1.0").unwrap(),
+            protocol_major: PROTOCOL_VERSION,
+            binary_path: fake_candidate_binary(&base, "0.1.0"),
+        })
+        .unwrap();
+    consumers
+        .register(consumer("ringleader", &["status"], None))
+        .unwrap();
+
+    assert_eq!(installed.active_version, installed_again.active_version);
+    assert_eq!(consumers.requested_capabilities("status").unwrap().len(), 2);
+
+    let client = RecordingHttpClient::default();
+    let status_consumers = consumers.requested_capabilities("status").unwrap();
+    SinkFanout::new(&client).send(&status_event(), &status_consumers);
+    assert_eq!(client.urls(), ["http://127.0.0.1:7483/hook"]);
+}
+
+#[test]
+fn last_consumer_uninstall_removes_installed_claude_hooks_and_the_active_symlink() {
+    let base = temp_home();
+    let install = Installer::open(base.join("data")).unwrap();
+    let consumers = consumer_store();
+    let hooks = hook_manager_at(&base, install.binary_path());
+
+    install
+        .install_candidate(Candidate {
+            version: SemVer::parse("0.1.0").unwrap(),
+            protocol_major: PROTOCOL_VERSION,
+            binary_path: fake_candidate_binary(&base, "0.1.0"),
+        })
+        .unwrap();
+    consumers
+        .register(consumer("juggler", &["status"], None))
+        .unwrap();
+    hooks.install(Agent::Claude).unwrap();
+    assert!(base.join("claude/settings.json").exists());
+
+    let outcome = install
+        .uninstall_consumer(&consumers, &hooks, "juggler")
+        .unwrap();
+    assert!(outcome.was_last_consumer);
+    assert_eq!(
+        hooks.status(Agent::Claude).unwrap().state,
+        HookState::Missing
+    );
+    assert!(!install.binary_path().exists());
+    assert!(
+        base.join("data/versions/0.1.0/hooklinesinker").exists(),
+        "version directories must survive last-consumer cleanup"
     );
 }

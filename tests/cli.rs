@@ -17,6 +17,17 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     ))
 }
 
+fn hooklinesinker_isolated(temp: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("hooklinesinker").unwrap();
+    cmd.env("XDG_STATE_HOME", temp);
+    cmd.env("HOME", temp.join("home"));
+    cmd.env("XDG_DATA_HOME", temp.join("data"));
+    cmd.env_remove("XDG_CONFIG_HOME");
+    cmd.env_remove("OPENCODE_CONFIG_DIR");
+    cmd.env_remove("PI_CODING_AGENT_DIR");
+    cmd
+}
+
 #[test]
 fn version_reports_protocol_one() {
     let output = Command::cargo_bin("hooklinesinker")
@@ -54,13 +65,7 @@ fn plain_version_prints_human_readable_line() {
 
 #[test]
 fn unimplemented_subcommands_exit_two_with_stderr_message() {
-    let cases: &[&[&str]] = &[
-        &["sessions"],
-        &["consumers"],
-        &["hooks", "install", "--agent", "claude"],
-        &["hooks", "status", "--agent", "claude"],
-        &["hooks", "uninstall", "--agent", "claude"],
-    ];
+    let cases: &[&[&str]] = &[&["sessions"], &["consumers"]];
 
     for args in cases {
         let output = Command::cargo_bin("hooklinesinker")
@@ -79,21 +84,74 @@ fn unimplemented_subcommands_exit_two_with_stderr_message() {
 }
 
 #[test]
-fn hooks_status_accepts_json_flag() {
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
+fn hooks_status_reports_missing_before_install() {
+    let temp = unique_temp_dir("hooks-status-missing");
+    let output = hooklinesinker_isolated(&temp)
         .args(["hooks", "status", "--agent", "codex", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["protocol"], 1);
+    assert_eq!(value["agent"], "codex");
+    assert_eq!(value["state"], "missing");
+    assert_eq!(value["entries"], serde_json::json!([]));
+}
+
+#[test]
+fn hooks_install_writes_claude_settings_with_the_stable_binary_path() {
+    let temp = unique_temp_dir("hooks-install-claude");
+    let output = hooklinesinker_isolated(&temp)
+        .args(["hooks", "install", "--agent", "claude"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let settings_path = temp.join("home/.claude/settings.json");
+    let settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("hooklinesinker"));
+    assert!(command.ends_with("ingest --agent claude --event SessionStart"));
+
+    let status_output = hooklinesinker_isolated(&temp)
+        .args(["hooks", "status", "--agent", "claude", "--json"])
+        .output()
+        .unwrap();
+    assert!(status_output.status.success());
+    let status: Value = serde_json::from_slice(&status_output.stdout).unwrap();
+    assert_eq!(status["state"], "installed");
+    assert_eq!(status["entries"].as_array().unwrap().len(), 11);
+}
+
+#[test]
+fn hooks_uninstall_removes_what_hooks_install_wrote() {
+    let temp = unique_temp_dir("hooks-uninstall");
+    hooklinesinker_isolated(&temp)
+        .args(["hooks", "install", "--agent", "codex"])
+        .output()
+        .unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["hooks", "uninstall", "--agent", "codex"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let status_output = hooklinesinker_isolated(&temp)
+        .args(["hooks", "status", "--agent", "codex", "--json"])
+        .output()
+        .unwrap();
+    let status: Value = serde_json::from_slice(&status_output.stdout).unwrap();
+    assert_eq!(status["state"], "missing");
 }
 
 #[test]
 fn install_accepts_optional_sink() {
     let temp = unique_temp_dir("install-sink");
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args([
             "install",
             "--consumer",
@@ -118,11 +176,47 @@ fn install_accepts_optional_sink() {
 }
 
 #[test]
+fn install_activates_a_versioned_binary_behind_a_stable_symlink() {
+    let temp = unique_temp_dir("install-activates");
+    let output = hooklinesinker_isolated(&temp)
+        .args(["install", "--consumer", "juggler"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let bin_path = temp.join("data/hooklinesinker/bin/hooklinesinker");
+    let metadata = std::fs::symlink_metadata(&bin_path).unwrap();
+    assert!(metadata.file_type().is_symlink());
+    let target = std::fs::read_link(&bin_path).unwrap();
+    assert!(!target.is_absolute());
+
+    let expected_version = env!("CARGO_PKG_VERSION");
+    let version_binary = temp
+        .join("data/hooklinesinker/versions")
+        .join(expected_version)
+        .join("hooklinesinker");
+    assert!(version_binary.exists());
+
+    let doctor_output = hooklinesinker_isolated(&temp)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let doctor: Value = serde_json::from_slice(&doctor_output.stdout).unwrap();
+    let checks = doctor["checks"].as_array().unwrap();
+    let active_version_check = checks
+        .iter()
+        .find(|c| c["name"] == "active_version_target")
+        .unwrap();
+    assert_eq!(
+        active_version_check["detail"],
+        format!("v{expected_version} (protocol 1)")
+    );
+}
+
+#[test]
 fn install_without_a_sink_registers_a_pull_only_consumer() {
     let temp = unique_temp_dir("install-no-sink");
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["install", "--consumer", "ringleader"])
         .output()
         .unwrap();
@@ -141,9 +235,7 @@ fn install_without_a_sink_registers_a_pull_only_consumer() {
 #[test]
 fn install_rejects_an_invalid_consumer_name() {
     let temp = unique_temp_dir("install-invalid-name");
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["install", "--consumer", "Not Valid"])
         .output()
         .unwrap();
@@ -160,16 +252,12 @@ fn install_rejects_an_invalid_consumer_name() {
 #[test]
 fn uninstall_removes_a_registered_consumer() {
     let temp = unique_temp_dir("uninstall");
-    Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    hooklinesinker_isolated(&temp)
         .args(["install", "--consumer", "juggler"])
         .output()
         .unwrap();
 
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["uninstall", "--consumer", "juggler"])
         .output()
         .unwrap();
@@ -183,11 +271,37 @@ fn uninstall_removes_a_registered_consumer() {
 }
 
 #[test]
+fn uninstalling_the_last_consumer_removes_the_active_symlink_but_keeps_the_version_directory() {
+    let temp = unique_temp_dir("uninstall-last-consumer");
+    hooklinesinker_isolated(&temp)
+        .args(["install", "--consumer", "juggler"])
+        .output()
+        .unwrap();
+    let bin_path = temp.join("data/hooklinesinker/bin/hooklinesinker");
+    assert!(bin_path.exists());
+    let expected_version = env!("CARGO_PKG_VERSION");
+    let version_binary = temp
+        .join("data/hooklinesinker/versions")
+        .join(expected_version)
+        .join("hooklinesinker");
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["uninstall", "--consumer", "juggler"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    assert!(!bin_path.exists());
+    assert!(
+        version_binary.exists(),
+        "version directories must survive last-consumer cleanup"
+    );
+}
+
+#[test]
 fn uninstall_of_a_never_registered_consumer_still_succeeds() {
     let temp = unique_temp_dir("uninstall-missing");
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["uninstall", "--consumer", "never-registered"])
         .output()
         .unwrap();
@@ -197,9 +311,7 @@ fn uninstall_of_a_never_registered_consumer_still_succeeds() {
 #[test]
 fn consumers_json_reports_registered_consumers() {
     let temp = unique_temp_dir("consumers-json");
-    Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    hooklinesinker_isolated(&temp)
         .args([
             "install",
             "--consumer",
@@ -210,9 +322,7 @@ fn consumers_json_reports_registered_consumers() {
         .output()
         .unwrap();
 
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["consumers", "--json"])
         .output()
         .unwrap();
@@ -242,9 +352,7 @@ fn consumers_json_reports_an_empty_envelope_for_a_fresh_state_dir() {
 #[test]
 fn doctor_json_reports_ok_for_a_fresh_state_dir() {
     let temp = unique_temp_dir("doctor-fresh");
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["doctor", "--json"])
         .output()
         .unwrap();
@@ -268,14 +376,24 @@ fn doctor_json_reports_ok_for_a_fresh_state_dir() {
         ]
     );
     assert!(checks.iter().all(|c| c["ok"] == true));
+    let active_version_check = checks
+        .iter()
+        .find(|c| c["name"] == "active_version_target")
+        .unwrap();
+    assert_eq!(active_version_check["detail"], "not installed");
+    let hook_status_check = checks.iter().find(|c| c["name"] == "hook_status").unwrap();
+    assert!(
+        hook_status_check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Missing")
+    );
 }
 
 #[test]
 fn doctor_human_output_has_one_line_per_check() {
     let temp = unique_temp_dir("doctor-human");
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["doctor"])
         .output()
         .unwrap();
@@ -300,9 +418,7 @@ fn doctor_does_not_fail_on_a_stale_sink_error() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["doctor", "--json"])
         .output()
         .unwrap();
@@ -329,9 +445,7 @@ fn doctor_fails_when_a_status_record_is_unparseable() {
     std::fs::create_dir_all(&status_dir).unwrap();
     std::fs::write(status_dir.join("broken.json"), b"not json").unwrap();
 
-    let output = Command::cargo_bin("hooklinesinker")
-        .unwrap()
-        .env("XDG_STATE_HOME", &temp)
+    let output = hooklinesinker_isolated(&temp)
         .args(["doctor", "--json"])
         .output()
         .unwrap();

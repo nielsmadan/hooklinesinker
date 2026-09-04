@@ -16,6 +16,26 @@ pub fn state_root() -> PathBuf {
     )
 }
 
+pub fn data_root_with(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    if let Some(xdg) = xdg_data_home
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("hooklinesinker");
+    }
+    PathBuf::from(home.unwrap_or(".")).join(".local/share/hooklinesinker")
+}
+
+pub fn data_root() -> PathBuf {
+    data_root_with(
+        std::env::var("XDG_DATA_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+pub fn home_dir() -> Option<String> {
+    std::env::var("HOME").ok()
+}
+
 pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     set_private_dir_mode(path)
@@ -57,6 +77,30 @@ mod tests {
         assert_eq!(
             root,
             PathBuf::from("/home/user/.local/state/hooklinesinker")
+        );
+    }
+
+    #[test]
+    fn xdg_data_home_wins_when_set() {
+        let root = data_root_with(Some("/custom/data"), Some("/home/user"));
+        assert_eq!(root, PathBuf::from("/custom/data/hooklinesinker"));
+    }
+
+    #[test]
+    fn empty_xdg_data_home_falls_back_to_home() {
+        let root = data_root_with(Some(""), Some("/home/user"));
+        assert_eq!(
+            root,
+            PathBuf::from("/home/user/.local/share/hooklinesinker")
+        );
+    }
+
+    #[test]
+    fn missing_xdg_data_home_falls_back_to_home() {
+        let root = data_root_with(None, Some("/home/user"));
+        assert_eq!(
+            root,
+            PathBuf::from("/home/user/.local/share/hooklinesinker")
         );
     }
 }

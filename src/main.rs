@@ -1,9 +1,11 @@
 mod cli;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, HooksCommand};
 use hooklinesinker::consumers::{Consumer, ConsumerStore};
 use hooklinesinker::environment::{self, SystemEnv};
+use hooklinesinker::hooks::{HookManager, HookRoots, HookState, HookStatus};
+use hooklinesinker::install::{InstalledVersion, Installer, UninstallOutcome};
 use hooklinesinker::paths;
 use hooklinesinker::processes::{SystemProcessLookup, now_rfc3339};
 use hooklinesinker::protocol::{Agent, PROTOCOL_VERSION};
@@ -22,8 +24,17 @@ fn main() {
         Command::Doctor { json } => run_doctor(json),
         Command::Install { consumer, sink } => run_install(&consumer, sink.as_deref()),
         Command::Uninstall { consumer } => run_uninstall(&consumer),
+        Command::Hooks { command } => run_hooks(command),
         _ => not_implemented(),
     }
+}
+
+fn open_installer() -> io::Result<Installer> {
+    Installer::open(paths::data_root())
+}
+
+fn hook_manager(installer: &Installer) -> HookManager {
+    HookManager::new(HookRoots::from_env(installer.binary_path()))
 }
 
 fn print_version(json: bool) {
@@ -129,11 +140,17 @@ fn run_install(consumer_name: &str, sink: Option<&str>) {
         capabilities: vec!["status".to_string()],
         sink: sink.map(str::to_string),
     };
-    let result =
-        ConsumerStore::open(paths::state_root()).and_then(|store| store.register(consumer));
+    let result = (|| -> io::Result<InstalledVersion> {
+        let installer = open_installer()?;
+        let consumers = ConsumerStore::open(paths::state_root())?;
+        installer.install_current(&consumers, consumer)
+    })();
     match result {
-        Ok(()) => {
-            println!("registered consumer {consumer_name}");
+        Ok(installed) => {
+            println!(
+                "registered consumer {consumer_name} (active version {}, protocol {})",
+                installed.active_version, installed.protocol_major
+            );
         }
         Err(e) => {
             eprintln!("failed to register consumer {consumer_name}: {e}");
@@ -143,10 +160,19 @@ fn run_install(consumer_name: &str, sink: Option<&str>) {
 }
 
 fn run_uninstall(consumer_name: &str) {
-    let result =
-        ConsumerStore::open(paths::state_root()).and_then(|store| store.remove(consumer_name));
+    let result = (|| -> io::Result<UninstallOutcome> {
+        let installer = open_installer()?;
+        let consumers = ConsumerStore::open(paths::state_root())?;
+        let hooks = hook_manager(&installer);
+        installer.uninstall_consumer(&consumers, &hooks, consumer_name)
+    })();
     match result {
-        Ok(()) => {
+        Ok(outcome) if outcome.was_last_consumer => {
+            println!(
+                "removed consumer {consumer_name} (last consumer; hooks and active binary removed)"
+            );
+        }
+        Ok(_) => {
             println!("removed consumer {consumer_name}");
         }
         Err(e) => {
@@ -154,6 +180,73 @@ fn run_uninstall(consumer_name: &str) {
             std::process::exit(1);
         }
     }
+}
+
+fn run_hooks(command: HooksCommand) {
+    match command {
+        HooksCommand::Install { agent } => run_hooks_install(agent),
+        HooksCommand::Status { agent, json } => run_hooks_status(agent, json),
+        HooksCommand::Uninstall { agent } => run_hooks_uninstall(agent),
+    }
+}
+
+fn run_hooks_install(agent: Agent) {
+    match with_hook_manager(|hooks| hooks.install(agent)) {
+        Ok(status) => print_hook_status_human(&status),
+        Err(e) => {
+            eprintln!("failed to install {agent:?} hooks: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_hooks_uninstall(agent: Agent) {
+    match with_hook_manager(|hooks| hooks.uninstall(agent)) {
+        Ok(status) => print_hook_status_human(&status),
+        Err(e) => {
+            eprintln!("failed to uninstall {agent:?} hooks: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_hooks_status(agent: Agent, json: bool) {
+    match with_hook_manager(|hooks| hooks.status(agent)) {
+        Ok(status) if json => print_hook_status_json(&status),
+        Ok(status) => print_hook_status_human(&status),
+        Err(e) => {
+            eprintln!("failed to read {agent:?} hook status: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn with_hook_manager(
+    f: impl FnOnce(&HookManager) -> io::Result<HookStatus>,
+) -> io::Result<HookStatus> {
+    let installer = open_installer()?;
+    let hooks = hook_manager(&installer);
+    f(&hooks)
+}
+
+fn print_hook_status_json(status: &HookStatus) {
+    let envelope = serde_json::json!({
+        "protocol": PROTOCOL_VERSION,
+        "agent": status.agent,
+        "state": status.state,
+        "path": status.path,
+        "entries": status.entries,
+    });
+    println!("{envelope}");
+}
+
+fn print_hook_status_human(status: &HookStatus) {
+    println!(
+        "[{:?}] {:?}: {}",
+        status.agent,
+        status.state,
+        status.path.display()
+    );
 }
 
 struct DoctorCheck {
@@ -224,11 +317,30 @@ fn run_doctor(json: bool) {
     }
     checks.push(permissions);
 
-    checks.push(DoctorCheck {
-        name: "active_version_target",
-        ok: true,
-        detail: "not implemented yet: self-install lands in a later task".to_string(),
-    });
+    let active_version_check = match open_installer().and_then(|i| i.active_version_summary()) {
+        Ok(Some(installed)) => DoctorCheck {
+            name: "active_version_target",
+            ok: true,
+            detail: format!(
+                "v{} (protocol {})",
+                installed.active_version, installed.protocol_major
+            ),
+        },
+        Ok(None) => DoctorCheck {
+            name: "active_version_target",
+            ok: true,
+            detail: "not installed".to_string(),
+        },
+        Err(e) => {
+            fatal = true;
+            DoctorCheck {
+                name: "active_version_target",
+                ok: false,
+                detail: format!("failed to read active version: {e}"),
+            }
+        }
+    };
+    checks.push(active_version_check);
 
     push_parse_problems_check(
         &mut checks,
@@ -239,11 +351,42 @@ fn run_doctor(json: bool) {
         |store| store.parse_problems(),
     );
 
-    checks.push(DoctorCheck {
-        name: "hook_status",
-        ok: true,
-        detail: "not implemented yet: hook reconciliation lands in a later task".to_string(),
-    });
+    let hook_status_check = match open_installer() {
+        Ok(installer) => {
+            let hooks = hook_manager(&installer);
+            let mut summaries = Vec::new();
+            let mut problems = Vec::new();
+            for agent in [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi] {
+                match hooks.status(agent) {
+                    Ok(status) => {
+                        summaries.push(format!("{agent:?}={:?}", status.state));
+                        if matches!(status.state, HookState::Drifted | HookState::Unsupported) {
+                            problems.push(format!("{agent:?} hooks are {:?}", status.state));
+                        }
+                    }
+                    Err(e) => problems.push(format!("{agent:?} hook status failed: {e}")),
+                }
+            }
+            DoctorCheck {
+                name: "hook_status",
+                ok: problems.is_empty(),
+                detail: if problems.is_empty() {
+                    summaries.join(", ")
+                } else {
+                    problems.join("; ")
+                },
+            }
+        }
+        Err(e) => DoctorCheck {
+            name: "hook_status",
+            ok: false,
+            detail: format!("failed to prepare hook installer: {e}"),
+        },
+    };
+    if !hook_status_check.ok {
+        fatal = true;
+    }
+    checks.push(hook_status_check);
 
     push_parse_problems_check(
         &mut checks,
