@@ -1,3 +1,4 @@
+use hooklinesinker::environment::{self, EnvSource};
 use hooklinesinker::normalize::{HookEnvironment, normalize};
 use hooklinesinker::processes::ProcessLookup;
 use hooklinesinker::protocol::{
@@ -112,6 +113,56 @@ impl ProcessLookup for FakeProcessLookup {
             .unwrap()
             .get(&identity.pid)
             .is_some_and(|started_at| started_at == &identity.started_at)
+    }
+}
+
+struct FakeEnvSource {
+    vars: HashMap<String, String>,
+    commands: HashMap<(String, Vec<String>), String>,
+    hostname: String,
+}
+
+impl FakeEnvSource {
+    fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+            commands: HashMap::new(),
+            hostname: "test-host".into(),
+        }
+    }
+
+    fn with_var(mut self, key: &str, value: &str) -> Self {
+        self.vars.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    fn with_command(mut self, program: &str, args: &[&str], output: &str) -> Self {
+        self.commands.insert(
+            (
+                program.to_string(),
+                args.iter().map(|a| a.to_string()).collect(),
+            ),
+            output.to_string(),
+        );
+        self
+    }
+}
+
+impl EnvSource for FakeEnvSource {
+    fn var(&self, name: &str) -> Option<String> {
+        self.vars.get(name).cloned()
+    }
+
+    fn command_output(&self, program: &str, args: &[&str]) -> Option<String> {
+        let key = (
+            program.to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        );
+        self.commands.get(&key).cloned()
+    }
+
+    fn local_hostname(&self) -> String {
+        self.hostname.clone()
     }
 }
 
@@ -527,4 +578,211 @@ fn ingest_records_a_health_problem_on_malformed_input_and_still_succeeds() {
     assert!(outcome.problem.is_some());
     let problems = store.health_problems().unwrap();
     assert_eq!(problems.len(), 1);
+}
+
+#[test]
+fn scalar_type_mismatch_error_omits_the_offending_value() {
+    let result = normalize(
+        Agent::Claude,
+        "PreToolUse",
+        r#"{"session_id": 424242}"#,
+        &test_environment(),
+        test_process(),
+    );
+    let message = result.unwrap_err().to_string();
+    assert!(!message.contains("424242"));
+    assert!(message.contains("invalid native event JSON"));
+}
+
+#[test]
+fn a_type_mismatched_scalar_in_native_json_never_reaches_the_health_record() {
+    let store = store();
+    let liveness = FakeProcessLookup::new();
+    let outcome = state::handle_ingest(
+        &store,
+        &liveness,
+        Agent::Claude,
+        "PreToolUse",
+        r#"{"session_id": 424242}"#,
+        &test_environment(),
+        1,
+    );
+    assert!(outcome.problem.is_some());
+    let problems = store.health_problems().unwrap();
+    assert_eq!(problems.len(), 1);
+    assert!(!problems[0].message.contains("424242"));
+    assert!(problems[0].message.contains("invalid native event JSON"));
+}
+
+#[test]
+fn detects_kitty_terminal_from_env_vars() {
+    let env = FakeEnvSource::new()
+        .with_var("KITTY_WINDOW_ID", "7")
+        .with_var("KITTY_LISTEN_ON", "unix:/tmp/kitty")
+        .with_var("KITTY_PID", "999");
+    let gathered = environment::gather_environment(&env, "/tmp/project".into());
+    let terminal = gathered.terminal.unwrap();
+    assert_eq!(terminal.terminal_type.as_deref(), Some("kitty"));
+    assert_eq!(terminal.session_id.as_deref(), Some("7"));
+    assert_eq!(terminal.kitty_listen_on.as_deref(), Some("unix:/tmp/kitty"));
+    assert_eq!(terminal.kitty_pid.as_deref(), Some("999"));
+}
+
+#[test]
+fn iterm_takes_precedence_over_wezterm_when_kitty_absent() {
+    let env = FakeEnvSource::new()
+        .with_var("ITERM_SESSION_ID", "iterm-1")
+        .with_var("WEZTERM_PANE", "wez-1");
+    let gathered = environment::gather_environment(&env, "/tmp".into());
+    let terminal = gathered.terminal.unwrap();
+    assert_eq!(terminal.terminal_type.as_deref(), Some("iterm2"));
+    assert_eq!(terminal.session_id.as_deref(), Some("iterm-1"));
+}
+
+#[test]
+fn no_terminal_env_vars_means_no_terminal_identity() {
+    let env = FakeEnvSource::new();
+    let gathered = environment::gather_environment(&env, "/tmp".into());
+    assert!(gathered.terminal.is_none());
+}
+
+#[test]
+fn tmux_pane_resolves_session_name_via_the_injected_command_runner() {
+    let env = FakeEnvSource::new()
+        .with_var("TMUX_PANE", "%3")
+        .with_command(
+            "tmux",
+            &["display-message", "-p", "-t", "%3", "#{session_name}"],
+            "work",
+        );
+    let gathered = environment::gather_environment(&env, "/tmp".into());
+    let tmux = gathered.tmux.unwrap();
+    assert_eq!(tmux.pane.as_deref(), Some("%3"));
+    assert_eq!(tmux.session_name.as_deref(), Some("work"));
+}
+
+#[test]
+fn git_identity_resolves_via_the_injected_command_runner() {
+    let env = FakeEnvSource::new()
+        .with_command(
+            "git",
+            &["-C", "/tmp/project", "rev-parse", "--show-toplevel"],
+            "/tmp/project",
+        )
+        .with_command(
+            "git",
+            &["-C", "/tmp/project", "rev-parse", "--abbrev-ref", "HEAD"],
+            "main",
+        );
+    let gathered = environment::gather_environment(&env, "/tmp/project".into());
+    let git = gathered.git.unwrap();
+    assert_eq!(git.repo.as_deref(), Some("project"));
+    assert_eq!(git.branch.as_deref(), Some("main"));
+}
+
+#[test]
+fn no_git_toplevel_means_no_git_identity() {
+    let env = FakeEnvSource::new();
+    let gathered = environment::gather_environment(&env, "/tmp/project".into());
+    assert!(gathered.git.is_none());
+}
+
+#[test]
+fn remote_host_combines_user_and_short_hostname_when_ssh_connected() {
+    let env = FakeEnvSource::new()
+        .with_var("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22")
+        .with_var("USER", "alice")
+        .with_var("HOSTNAME", "build.example.com");
+    let gathered = environment::gather_environment(&env, "/tmp".into());
+    assert_eq!(gathered.remote_host.as_deref(), Some("alice@build"));
+}
+
+#[test]
+fn remote_host_is_none_without_ssh_connection() {
+    let env = FakeEnvSource::new().with_var("USER", "alice");
+    let gathered = environment::gather_environment(&env, "/tmp".into());
+    assert!(gathered.remote_host.is_none());
+}
+
+#[test]
+fn a_populated_environment_lands_on_the_normalized_status_event() {
+    let env = FakeEnvSource::new()
+        .with_var("KITTY_WINDOW_ID", "7")
+        .with_var("TMUX_PANE", "%3")
+        .with_command(
+            "tmux",
+            &["display-message", "-p", "-t", "%3", "#{session_name}"],
+            "work",
+        )
+        .with_command(
+            "git",
+            &["-C", "/tmp/project", "rev-parse", "--show-toplevel"],
+            "/tmp/project",
+        )
+        .with_command(
+            "git",
+            &["-C", "/tmp/project", "rev-parse", "--abbrev-ref", "HEAD"],
+            "main",
+        )
+        .with_var("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22")
+        .with_var("USER", "alice")
+        .with_var("HOSTNAME", "build.example.com");
+    let hook_env = environment::gather_environment(&env, "/tmp/project".into());
+
+    let event = normalize(
+        Agent::Claude,
+        "SessionStart",
+        generic_native_json(),
+        &hook_env,
+        test_process(),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        event.terminal.unwrap().terminal_type.as_deref(),
+        Some("kitty")
+    );
+    assert_eq!(event.tmux.unwrap().session_name.as_deref(), Some("work"));
+    assert_eq!(event.git.unwrap().branch.as_deref(), Some("main"));
+    assert_eq!(event.remote_host.as_deref(), Some("alice@build"));
+}
+
+#[test]
+fn sessions_envelope_reports_a_problem_when_a_dead_record_cannot_be_removed() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    store.record(&status("stuck-session", 999, 99)).unwrap();
+
+    let status_dir = root.join("status");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
+    let liveness = FakeProcessLookup::new();
+    let envelope = store.sessions_envelope(&liveness);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    assert!(envelope.sessions.is_empty());
+    assert!(
+        !envelope.problems.is_empty(),
+        "expected a diagnostic when a dead record could not be removed"
+    );
+}
+
+#[test]
+fn sessions_envelope_includes_recorded_health_problems() {
+    let store = store();
+    store.record_health("a prior operational failure").unwrap();
+    let liveness = all_alive();
+    let envelope = store.sessions_envelope(&liveness);
+    assert_eq!(envelope.problems.len(), 1);
+    assert_eq!(envelope.problems[0].message, "a prior operational failure");
 }

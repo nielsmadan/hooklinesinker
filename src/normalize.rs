@@ -88,7 +88,11 @@ pub fn normalize(
     let native: NativeEvent = serde_json::from_str(input).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid native event JSON: {e}"),
+            format!(
+                "invalid native event JSON at line {} column {}",
+                e.line(),
+                e.column()
+            ),
         )
     })?;
 

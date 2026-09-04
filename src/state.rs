@@ -138,6 +138,33 @@ impl StatusStore {
             Err(e) => Err(e),
         }
     }
+
+    pub fn sessions_envelope(&self, liveness: &dyn ProcessLookup) -> SessionsEnvelope {
+        let mut problems = Vec::new();
+        let sessions = match self.running(liveness) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                problems.push(HealthProblem {
+                    observed_at: now_rfc3339(),
+                    message: format!("failed to read running sessions: {e}"),
+                });
+                Vec::new()
+            }
+        };
+        match self.health_problems() {
+            Ok(recorded) => problems.extend(recorded),
+            Err(e) => problems.push(HealthProblem {
+                observed_at: now_rfc3339(),
+                message: format!("failed to read health problems: {e}"),
+            }),
+        }
+        SessionsEnvelope { sessions, problems }
+    }
+}
+
+pub struct SessionsEnvelope {
+    pub sessions: Vec<StatusEvent>,
+    pub problems: Vec<HealthProblem>,
 }
 
 struct LockGuard {

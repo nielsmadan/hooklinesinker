@@ -163,6 +163,61 @@ fn ingest_writes_a_ledger_record_that_sessions_json_can_read() {
 }
 
 #[test]
+fn ingest_captures_terminal_and_remote_host_from_the_process_environment() {
+    let temp = unique_temp_dir("env-capture");
+    let ingest = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .env("KITTY_WINDOW_ID", "42")
+        .env_remove("KITTY_LISTEN_ON")
+        .env_remove("KITTY_PID")
+        .env_remove("ITERM_SESSION_ID")
+        .env_remove("WEZTERM_PANE")
+        .env_remove("TMUX_PANE")
+        .env("SSH_CONNECTION", "203.0.113.5 1234 203.0.113.9 22")
+        .env("USER", "alice")
+        .env("HOSTNAME", "build-host.example.com")
+        .args(["ingest", "--agent", "claude", "--event", "SessionStart"])
+        .write_stdin(r#"{"session_id":"env-session"}"#)
+        .output()
+        .unwrap();
+    assert!(ingest.status.success());
+    assert!(ingest.stderr.is_empty());
+
+    let ledger_files: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/status"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(ledger_files.len(), 1);
+    let record: Value = serde_json::from_slice(&std::fs::read(&ledger_files[0]).unwrap()).unwrap();
+    assert_eq!(record["terminal"]["sessionId"], "42");
+    assert_eq!(record["terminal"]["terminalType"], "kitty");
+    assert_eq!(record["remoteHost"], "alice@build-host");
+}
+
+#[test]
+fn sessions_json_reports_a_problem_when_the_state_store_cannot_be_opened() {
+    let temp = unique_temp_dir("sessions-open-failure");
+    std::fs::create_dir_all(&temp).unwrap();
+    // Occupy the exact path hooklinesinker needs as a directory with a plain
+    // file, so StatusStore::open's create_dir_all fails deterministically.
+    std::fs::write(temp.join("hooklinesinker"), b"not a directory").unwrap();
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["protocol"], 1);
+    assert_eq!(value["sessions"], serde_json::json!([]));
+    let problems = value["problems"].as_array().unwrap();
+    assert!(!problems.is_empty());
+}
+
+#[test]
 fn missing_required_flag_is_a_clap_usage_error_not_unimplemented() {
     let output = Command::cargo_bin("hooklinesinker")
         .unwrap()

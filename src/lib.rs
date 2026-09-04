@@ -1,3 +1,4 @@
+pub mod environment;
 pub mod normalize;
 pub mod paths;
 pub mod processes;
