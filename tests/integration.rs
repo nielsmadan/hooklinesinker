@@ -1,14 +1,16 @@
+use hooklinesinker::consumers::{Consumer, ConsumerStore};
 use hooklinesinker::environment::{self, EnvSource};
 use hooklinesinker::normalize::{HookEnvironment, normalize};
 use hooklinesinker::processes::ProcessLookup;
 use hooklinesinker::protocol::{
     Agent, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity, StatusEvent,
 };
+use hooklinesinker::sinks::{HttpClient, SinkFanout};
 use hooklinesinker::state::{self, StatusStore};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -26,6 +28,78 @@ fn temp_home() -> PathBuf {
 
 fn store() -> StatusStore {
     StatusStore::open(temp_home()).unwrap()
+}
+
+fn consumer_store() -> ConsumerStore {
+    ConsumerStore::open(temp_home()).unwrap()
+}
+
+fn consumer(name: &str, capabilities: &[&str], sink: Option<&str>) -> Consumer {
+    Consumer {
+        name: name.to_string(),
+        protocol: PROTOCOL_VERSION,
+        capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+        sink: sink.map(str::to_string),
+    }
+}
+
+fn status_event() -> StatusEvent {
+    status("fanout-session", 4200, 42)
+}
+
+type RecordedCall = (String, Vec<u8>);
+
+#[derive(Clone, Default)]
+struct RecordingHttpClient {
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
+}
+
+impl RecordingHttpClient {
+    fn urls(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(url, _)| url.clone())
+            .collect()
+    }
+
+    fn bodies(&self) -> Vec<serde_json::Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, body)| serde_json::from_slice(body).unwrap())
+            .collect()
+    }
+}
+
+impl HttpClient for RecordingHttpClient {
+    fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((url.to_string(), body.to_vec()));
+        Ok(200)
+    }
+}
+
+struct FailingHttpClient;
+
+impl HttpClient for FailingHttpClient {
+    fn post_json(&self, _url: &str, _body: &[u8]) -> Result<u16, String> {
+        Err("connection refused".to_string())
+    }
+}
+
+fn ingest(
+    ctx: &state::IngestContext,
+    agent: Agent,
+    event: &str,
+    input: &str,
+    hook_pid: u32,
+) -> state::IngestOutcome {
+    state::handle_ingest(ctx, agent, event, input, &test_environment(), hook_pid)
 }
 
 fn status(session_id: &str, pid: u32, started_at: u64) -> StatusEvent {
@@ -523,13 +597,16 @@ fn unrelated_ingest_sweeps_a_dead_binding() {
     let dying_liveness = FakeProcessLookup::with_owner(dying_process);
     dying_liveness.set_alive(700, "70");
 
-    let outcome = state::handle_ingest(
-        &store,
-        &dying_liveness,
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &dying_liveness,
+            consumers: None,
+            http_client: &RecordingHttpClient::default(),
+        },
         Agent::Claude,
         "SessionStart",
         r#"{"session_id":"dying-session"}"#,
-        &test_environment(),
         700,
     );
     assert!(outcome.problem.is_none());
@@ -546,13 +623,16 @@ fn unrelated_ingest_sweeps_a_dead_binding() {
     // simulates the dying session's process having exited by the time the
     // unrelated session's ingest runs.
 
-    let outcome = state::handle_ingest(
-        &store,
-        &other_liveness,
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &other_liveness,
+            consumers: None,
+            http_client: &RecordingHttpClient::default(),
+        },
         Agent::Codex,
         "SessionStart",
         r#"{"session_id":"other-session"}"#,
-        &test_environment(),
         701,
     );
     assert!(outcome.problem.is_none());
@@ -566,13 +646,16 @@ fn unrelated_ingest_sweeps_a_dead_binding() {
 fn ingest_records_a_health_problem_on_malformed_input_and_still_succeeds() {
     let store = store();
     let liveness = FakeProcessLookup::new();
-    let outcome = state::handle_ingest(
-        &store,
-        &liveness,
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: None,
+            http_client: &RecordingHttpClient::default(),
+        },
         Agent::Claude,
         "PreToolUse",
         "{not json",
-        &test_environment(),
         1,
     );
     assert!(outcome.problem.is_some());
@@ -598,13 +681,16 @@ fn scalar_type_mismatch_error_omits_the_offending_value() {
 fn a_type_mismatched_scalar_in_native_json_never_reaches_the_health_record() {
     let store = store();
     let liveness = FakeProcessLookup::new();
-    let outcome = state::handle_ingest(
-        &store,
-        &liveness,
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: None,
+            http_client: &RecordingHttpClient::default(),
+        },
         Agent::Claude,
         "PreToolUse",
         r#"{"session_id": 424242}"#,
-        &test_environment(),
         1,
     );
     assert!(outcome.problem.is_some());
@@ -785,4 +871,197 @@ fn sessions_envelope_includes_recorded_health_problems() {
     let envelope = store.sessions_envelope(&liveness);
     assert_eq!(envelope.problems.len(), 1);
     assert_eq!(envelope.problems[0].message, "a prior operational failure");
+}
+
+#[test]
+fn fanout_sends_only_to_status_consumers() {
+    let client = RecordingHttpClient::default();
+    let consumers = vec![
+        consumer("juggler", &["status"], Some("http://127.0.0.1:7483/hook")),
+        consumer("ringleader", &["status"], None),
+    ];
+    SinkFanout::new(client.clone()).send(&status_event(), &consumers);
+    assert_eq!(client.urls(), ["http://127.0.0.1:7483/hook"]);
+}
+
+#[test]
+fn unsupported_capability_does_not_change_registration() {
+    let store = consumer_store();
+    store
+        .register(consumer("juggler", &["status"], None))
+        .unwrap();
+    assert!(store.register(consumer("future", &["raw"], None)).is_err());
+    assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn ingest_fans_out_the_recorded_event_to_registered_status_sinks() {
+    let store = store();
+    let consumers = consumer_store();
+    consumers
+        .register(consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+    let liveness = FakeProcessLookup::with_owner(ProcessIdentity {
+        pid: 900,
+        started_at: "90".into(),
+        host: "host-a".into(),
+    });
+    liveness.set_alive(900, "90");
+
+    ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        },
+        Agent::Claude,
+        "SessionStart",
+        r#"{"session_id":"fanout-session"}"#,
+        900,
+    );
+
+    let bodies = client.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["session"]["id"], "fanout-session");
+    assert_eq!(bodies[0]["running"], true);
+    assert_eq!(bodies[0]["event"], "SessionStart");
+}
+
+#[test]
+fn a_dead_binding_swept_during_an_unrelated_ingest_produces_a_running_false_post() {
+    let store = store();
+    let consumers = consumer_store();
+    consumers
+        .register(consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+
+    let dying_process = ProcessIdentity {
+        pid: 710,
+        started_at: "71".into(),
+        host: "host-a".into(),
+    };
+    let dying_liveness = FakeProcessLookup::with_owner(dying_process);
+    dying_liveness.set_alive(710, "71");
+    ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &dying_liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        },
+        Agent::Claude,
+        "SessionStart",
+        r#"{"session_id":"dying-session"}"#,
+        710,
+    );
+    assert_eq!(client.urls().len(), 1);
+
+    let other_process = ProcessIdentity {
+        pid: 711,
+        started_at: "72".into(),
+        host: "host-a".into(),
+    };
+    let other_liveness = FakeProcessLookup::with_owner(other_process);
+    other_liveness.set_alive(711, "72");
+    // pid 710 is unknown to `other_liveness`, so the dying session reads as
+    // dead and is swept by this unrelated ingest.
+
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &other_liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        },
+        Agent::Codex,
+        "SessionStart",
+        r#"{"session_id":"other-session"}"#,
+        711,
+    );
+    assert!(outcome.problem.is_none());
+
+    let bodies = client.bodies();
+    assert_eq!(bodies.len(), 3);
+    let swept_body = bodies
+        .iter()
+        .find(|b| b["session"]["id"] == "dying-session" && b["event"] == "swept")
+        .expect("expected a synthetic swept POST for the dead binding");
+    assert_eq!(swept_body["running"], false);
+}
+
+#[test]
+fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
+    let store = store();
+    let consumers = consumer_store();
+    consumers
+        .register(consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+
+    let dying_process = ProcessIdentity {
+        pid: 720,
+        started_at: "73".into(),
+        host: "host-a".into(),
+    };
+    let dying_liveness = FakeProcessLookup::with_owner(dying_process);
+    dying_liveness.set_alive(720, "73");
+    ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &dying_liveness,
+            consumers: Some(&consumers),
+            http_client: &FailingHttpClient,
+        },
+        Agent::Claude,
+        "SessionStart",
+        r#"{"session_id":"failing-sink-session"}"#,
+        720,
+    );
+
+    let other_process = ProcessIdentity {
+        pid: 721,
+        started_at: "74".into(),
+        host: "host-a".into(),
+    };
+    let other_liveness = FakeProcessLookup::with_owner(other_process);
+    other_liveness.set_alive(721, "74");
+
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &other_liveness,
+            consumers: Some(&consumers),
+            http_client: &FailingHttpClient,
+        },
+        Agent::Codex,
+        "SessionStart",
+        r#"{"session_id":"other-session-2"}"#,
+        721,
+    );
+
+    assert!(outcome.problem.is_none());
+    let remaining = store.running(&other_liveness).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session.id, "other-session-2");
+
+    let problems = store.health_problems().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.message.starts_with("sink juggler failed"))
+    );
 }

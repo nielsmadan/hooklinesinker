@@ -1,6 +1,8 @@
+use crate::consumers::ConsumerStore;
 use crate::normalize::{HookEnvironment, normalize};
 use crate::processes::{ProcessLookup, now_rfc3339};
 use crate::protocol::{Agent, StatusEvent};
+use crate::sinks::{HttpClient, SinkFanout};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -139,6 +141,33 @@ impl StatusStore {
         }
     }
 
+    pub fn parse_problems(&self) -> io::Result<Vec<String>> {
+        let _guard = self.lock()?;
+        let mut problems = Vec::new();
+        let entries = match fs::read_dir(&self.bindings_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(problems),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if serde_json::from_slice::<StatusEvent>(&bytes).is_err() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>");
+                problems.push(format!("failed to parse status record {name}"));
+            }
+        }
+        Ok(problems)
+    }
+
     pub fn sessions_envelope(&self, liveness: &dyn ProcessLookup) -> SessionsEnvelope {
         let mut problems = Vec::new();
         let sessions = match self.running(liveness) {
@@ -167,12 +196,12 @@ pub struct SessionsEnvelope {
     pub problems: Vec<HealthProblem>,
 }
 
-struct LockGuard {
+pub(crate) struct LockGuard {
     file: File,
 }
 
 impl LockGuard {
-    fn acquire(path: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true);
         #[cfg(unix)]
@@ -192,7 +221,7 @@ impl Drop for LockGuard {
     }
 }
 
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp_path = path.with_extension("tmp");
     {
         let mut options = OpenOptions::new();
@@ -226,36 +255,116 @@ pub struct IngestOutcome {
     pub problem: Option<String>,
 }
 
+pub struct IngestContext<'a> {
+    pub store: &'a StatusStore,
+    pub liveness: &'a dyn ProcessLookup,
+    pub consumers: Option<&'a ConsumerStore>,
+    pub http_client: &'a dyn HttpClient,
+}
+
 pub fn handle_ingest(
-    store: &StatusStore,
-    liveness: &dyn ProcessLookup,
+    ctx: &IngestContext,
     agent: Agent,
     event: &str,
     input: &str,
     env: &HookEnvironment,
     hook_pid: u32,
 ) -> IngestOutcome {
-    let process = liveness.owner_of(hook_pid, agent);
+    let store = ctx.store;
+    let process = ctx.liveness.owner_of(hook_pid, agent);
+    let mut recorded_event: Option<StatusEvent> = None;
     let outcome =
         normalize(agent, event, input, env, process).and_then(|maybe_event| match maybe_event {
-            Some(status_event) if status_event.running => store.record(&status_event),
-            Some(status_event) => store.end(&status_event.binding_id),
+            Some(status_event) if status_event.running => {
+                store.record(&status_event)?;
+                recorded_event = Some(status_event);
+                Ok(())
+            }
+            Some(status_event) => {
+                store.end(&status_event.binding_id)?;
+                recorded_event = Some(status_event);
+                Ok(())
+            }
             None => Ok(()),
         });
 
     let mut problem = outcome.err().map(|e| e.to_string());
 
-    if let Err(e) = store.sweep(liveness) {
-        let message = format!("sweep failed: {e}");
-        problem = Some(match problem {
-            Some(existing) => format!("{existing}; {message}"),
-            None => message,
-        });
-    }
+    let swept = match store.sweep(ctx.liveness) {
+        Ok(swept) => swept,
+        Err(e) => {
+            let message = format!("sweep failed: {e}");
+            problem = Some(match problem {
+                Some(existing) => format!("{existing}; {message}"),
+                None => message,
+            });
+            Vec::new()
+        }
+    };
 
     if let Some(message) = &problem {
         let _ = store.record_health(message);
     }
 
+    fan_out_to_sinks(
+        store,
+        ctx.consumers,
+        ctx.http_client,
+        recorded_event.as_ref(),
+        &swept,
+    );
+
     IngestOutcome { problem }
+}
+
+fn fan_out_to_sinks(
+    store: &StatusStore,
+    consumers: Option<&ConsumerStore>,
+    http_client: &dyn HttpClient,
+    recorded_event: Option<&StatusEvent>,
+    swept: &[StatusEvent],
+) {
+    if recorded_event.is_none() && swept.is_empty() {
+        return;
+    }
+    let Some(consumers) = consumers else {
+        return;
+    };
+
+    let status_consumers = match consumers.requested_capabilities("status") {
+        Ok(status_consumers) => status_consumers,
+        Err(e) => {
+            let _ = store.record_health(&format!("sink consumer lookup failed: {e}"));
+            return;
+        }
+    };
+    if status_consumers.is_empty() {
+        return;
+    }
+
+    let fanout = SinkFanout::new(http_client);
+    let record_problems = |problems: Vec<crate::sinks::SinkProblem>| {
+        for problem in problems {
+            let _ = store.record_health(&format!(
+                "sink {} failed: {}",
+                problem.consumer, problem.message
+            ));
+        }
+    };
+
+    if let Some(event) = recorded_event {
+        record_problems(fanout.send(event, &status_consumers));
+    }
+    for swept_event in swept {
+        let synthetic = synthetic_swept_event(swept_event);
+        record_problems(fanout.send(&synthetic, &status_consumers));
+    }
+}
+
+fn synthetic_swept_event(swept: &StatusEvent) -> StatusEvent {
+    let mut synthetic = swept.clone();
+    synthetic.event = "swept".to_string();
+    synthetic.running = false;
+    synthetic.observed_at = now_rfc3339();
+    synthetic
 }

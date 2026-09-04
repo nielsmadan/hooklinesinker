@@ -57,9 +57,6 @@ fn unimplemented_subcommands_exit_two_with_stderr_message() {
     let cases: &[&[&str]] = &[
         &["sessions"],
         &["consumers"],
-        &["doctor"],
-        &["install", "--consumer", "juggler"],
-        &["uninstall", "--consumer", "juggler"],
         &["hooks", "install", "--agent", "claude"],
         &["hooks", "status", "--agent", "claude"],
         &["hooks", "uninstall", "--agent", "claude"],
@@ -93,8 +90,10 @@ fn hooks_status_accepts_json_flag() {
 
 #[test]
 fn install_accepts_optional_sink() {
+    let temp = unique_temp_dir("install-sink");
     let output = Command::cargo_bin("hooklinesinker")
         .unwrap()
+        .env("XDG_STATE_HOME", &temp)
         .args([
             "install",
             "--consumer",
@@ -104,7 +103,251 @@ fn install_accepts_optional_sink() {
         ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    assert!(output.status.success());
+
+    let consumer_files: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/consumers"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(consumer_files.len(), 1);
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(&consumer_files[0]).unwrap()).unwrap();
+    assert_eq!(record["name"], "juggler");
+    assert_eq!(record["capabilities"], serde_json::json!(["status"]));
+    assert_eq!(record["sink"], "http://127.0.0.1:7483/hook");
+}
+
+#[test]
+fn install_without_a_sink_registers_a_pull_only_consumer() {
+    let temp = unique_temp_dir("install-no-sink");
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["install", "--consumer", "ringleader"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let consumer_files: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/consumers"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(consumer_files.len(), 1);
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(&consumer_files[0]).unwrap()).unwrap();
+    assert_eq!(record["sink"], serde_json::Value::Null);
+}
+
+#[test]
+fn install_rejects_an_invalid_consumer_name() {
+    let temp = unique_temp_dir("install-invalid-name");
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["install", "--consumer", "Not Valid"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_ne!(output.status.code(), Some(2));
+    assert!(
+        std::fs::read_dir(temp.join("hooklinesinker/consumers"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+            == 0
+    );
+}
+
+#[test]
+fn uninstall_removes_a_registered_consumer() {
+    let temp = unique_temp_dir("uninstall");
+    Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["install", "--consumer", "juggler"])
+        .output()
+        .unwrap();
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["uninstall", "--consumer", "juggler"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let consumer_files: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/consumers"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(consumer_files.is_empty());
+}
+
+#[test]
+fn uninstall_of_a_never_registered_consumer_still_succeeds() {
+    let temp = unique_temp_dir("uninstall-missing");
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["uninstall", "--consumer", "never-registered"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[test]
+fn consumers_json_reports_registered_consumers() {
+    let temp = unique_temp_dir("consumers-json");
+    Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args([
+            "install",
+            "--consumer",
+            "juggler",
+            "--sink",
+            "http://127.0.0.1:7483/hook",
+        ])
+        .output()
+        .unwrap();
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["consumers", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["protocol"], 1);
+    let consumers = value["consumers"].as_array().unwrap();
+    assert_eq!(consumers.len(), 1);
+    assert_eq!(consumers[0]["name"], "juggler");
+}
+
+#[test]
+fn consumers_json_reports_an_empty_envelope_for_a_fresh_state_dir() {
+    let temp = unique_temp_dir("consumers-empty");
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["consumers", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["protocol"], 1);
+    assert_eq!(value["consumers"], serde_json::json!([]));
+}
+
+#[test]
+fn doctor_json_reports_ok_for_a_fresh_state_dir() {
+    let temp = unique_temp_dir("doctor-fresh");
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["protocol"], 1);
+    assert_eq!(value["exitCode"], 0);
+    let checks = value["checks"].as_array().unwrap();
+    let names: Vec<_> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            "version",
+            "permissions",
+            "active_version_target",
+            "consumer_parse_problems",
+            "hook_status",
+            "status_parse_problems",
+            "dead_records_removed",
+            "last_sink_error",
+        ]
+    );
+    assert!(checks.iter().all(|c| c["ok"] == true));
+}
+
+#[test]
+fn doctor_human_output_has_one_line_per_check() {
+    let temp = unique_temp_dir("doctor-human");
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 8);
+    assert!(lines.iter().all(|line| line.starts_with('[')));
+}
+
+#[test]
+fn doctor_does_not_fail_on_a_stale_sink_error() {
+    let temp = unique_temp_dir("doctor-sink-error");
+    let state_dir = temp.join("hooklinesinker");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("health.json"),
+        serde_json::json!([
+            {"observedAt": "2026-09-04T00:00:00Z", "message": "sink juggler failed: connection refused"}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["exitCode"], 0);
+    let checks = value["checks"].as_array().unwrap();
+    let last_sink_error = checks
+        .iter()
+        .find(|c| c["name"] == "last_sink_error")
+        .unwrap();
+    assert!(
+        last_sink_error["detail"]
+            .as_str()
+            .unwrap()
+            .contains("sink juggler failed")
+    );
+}
+
+#[test]
+fn doctor_fails_when_a_status_record_is_unparseable() {
+    let temp = unique_temp_dir("doctor-corrupt-status");
+    let status_dir = temp.join("hooklinesinker/status");
+    std::fs::create_dir_all(&status_dir).unwrap();
+    std::fs::write(status_dir.join("broken.json"), b"not json").unwrap();
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(value["exitCode"], 0);
+    assert_eq!(
+        output.status.code(),
+        value["exitCode"].as_i64().map(|c| c as i32)
+    );
+    let checks = value["checks"].as_array().unwrap();
+    let status_check = checks
+        .iter()
+        .find(|c| c["name"] == "status_parse_problems")
+        .unwrap();
+    assert_eq!(status_check["ok"], false);
 }
 
 #[test]
