@@ -1,0 +1,530 @@
+use hooklinesinker::normalize::{HookEnvironment, normalize};
+use hooklinesinker::processes::ProcessLookup;
+use hooklinesinker::protocol::{
+    Agent, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity, StatusEvent,
+};
+use hooklinesinker::state::{self, StatusStore};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn temp_home() -> PathBuf {
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "hooklinesinker-test-{}-{nanos}-{id}",
+        std::process::id()
+    ))
+}
+
+fn store() -> StatusStore {
+    StatusStore::open(temp_home()).unwrap()
+}
+
+fn status(session_id: &str, pid: u32, started_at: u64) -> StatusEvent {
+    StatusEvent {
+        protocol: PROTOCOL_VERSION,
+        binding_id: format!("{session_id}-{pid}-{started_at}"),
+        agent: Agent::Claude,
+        event: "PreToolUse".into(),
+        phase: Phase::Working,
+        running: true,
+        observed_at: "2026-09-04T00:00:00Z".into(),
+        session: SessionIdentity {
+            id: session_id.into(),
+            cwd: "/tmp".into(),
+            transcript_path: None,
+        },
+        process: Some(ProcessIdentity {
+            pid,
+            started_at: started_at.to_string(),
+            host: "test-host".into(),
+        }),
+        terminal: None,
+        tmux: None,
+        git: None,
+        remote_host: None,
+    }
+}
+
+struct AllAlive;
+
+impl ProcessLookup for AllAlive {
+    fn owner_of(&self, _hook_pid: u32, _agent: Agent) -> Option<ProcessIdentity> {
+        None
+    }
+
+    fn is_alive(&self, _identity: &ProcessIdentity) -> bool {
+        true
+    }
+}
+
+fn all_alive() -> AllAlive {
+    AllAlive
+}
+
+struct FakeProcessLookup {
+    owner: Option<ProcessIdentity>,
+    alive: Mutex<HashMap<u32, String>>,
+}
+
+impl FakeProcessLookup {
+    fn new() -> Self {
+        Self {
+            owner: None,
+            alive: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with_owner(identity: ProcessIdentity) -> Self {
+        Self {
+            owner: Some(identity),
+            alive: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn set_alive(&self, pid: u32, started_at: &str) {
+        self.alive
+            .lock()
+            .unwrap()
+            .insert(pid, started_at.to_string());
+    }
+
+    fn set_dead(&self, pid: u32) {
+        self.alive.lock().unwrap().remove(&pid);
+    }
+}
+
+impl ProcessLookup for FakeProcessLookup {
+    fn owner_of(&self, _hook_pid: u32, _agent: Agent) -> Option<ProcessIdentity> {
+        self.owner.clone()
+    }
+
+    fn is_alive(&self, identity: &ProcessIdentity) -> bool {
+        self.alive
+            .lock()
+            .unwrap()
+            .get(&identity.pid)
+            .is_some_and(|started_at| started_at == &identity.started_at)
+    }
+}
+
+fn test_environment() -> HookEnvironment {
+    HookEnvironment {
+        cwd: "/tmp/project".into(),
+        host: "test-host".into(),
+        ..Default::default()
+    }
+}
+
+fn test_process() -> Option<ProcessIdentity> {
+    Some(ProcessIdentity {
+        pid: 4242,
+        started_at: "2026-09-04T00:00:00Z".into(),
+        host: "test-host".into(),
+    })
+}
+
+fn normalize_for_test(agent: Agent, event: &str, native: &str) -> StatusEvent {
+    normalize(agent, event, native, &test_environment(), test_process())
+        .expect("normalize should succeed")
+        .expect("event should not be ignored")
+}
+
+fn generic_native_json() -> &'static str {
+    r#"{"session_id":"generic-session"}"#
+}
+
+#[test]
+fn claude_pre_tool_use_becomes_working_without_tool_payload() {
+    let native = include_str!("fixtures/claude-start.json");
+    let event = normalize_for_test(Agent::Claude, "PreToolUse", native);
+    assert_eq!(event.phase, Phase::Working);
+    assert_eq!(event.session.id, "claude-session");
+    let encoded = serde_json::to_value(event).unwrap();
+    assert!(encoded.pointer("/tool_input").is_none());
+    assert!(encoded.pointer("/tool_result").is_none());
+}
+
+#[test]
+fn two_processes_for_one_session_remain_two_bindings() {
+    let first = status("same-session", 100, 10);
+    let second = status("same-session", 200, 20);
+    let store = store();
+    store.record(&first).unwrap();
+    store.record(&second).unwrap();
+    assert_eq!(store.running(&all_alive()).unwrap().len(), 2);
+}
+
+#[test]
+fn codex_stop_fixture_normalizes_to_idle_and_running() {
+    let native = include_str!("fixtures/codex-stop.json");
+    let event = normalize_for_test(Agent::Codex, "Stop", native);
+    assert_eq!(event.phase, Phase::Idle);
+    assert!(event.running);
+    assert_eq!(event.session.id, "codex-session");
+}
+
+#[test]
+fn opencode_busy_fixture_normalizes_to_working() {
+    let native = include_str!("fixtures/opencode-busy.json");
+    let event = normalize_for_test(Agent::Opencode, "session.status.busy", native);
+    assert_eq!(event.phase, Phase::Working);
+    assert_eq!(event.session.id, "opencode-session");
+}
+
+#[test]
+fn pi_settled_fixture_normalizes_to_idle() {
+    let native = include_str!("fixtures/pi-settled.json");
+    let event = normalize_for_test(Agent::Pi, "agent_settled", native);
+    assert_eq!(event.phase, Phase::Idle);
+    assert_eq!(event.session.id, "pi-session");
+}
+
+#[test]
+fn every_normalized_phase_maps_correctly() {
+    let cases = [
+        (Agent::Claude, "SessionStart", Phase::Idle),
+        (Agent::Claude, "Stop", Phase::Idle),
+        (Agent::Claude, "StopFailure", Phase::Idle),
+        (Agent::Claude, "UserPromptSubmit", Phase::Working),
+        (Agent::Claude, "PreToolUse", Phase::Working),
+        (Agent::Claude, "PostToolUse", Phase::Working),
+        (Agent::Claude, "PostToolUseFailure", Phase::Working),
+        (Agent::Claude, "SubagentStart", Phase::Working),
+        (Agent::Claude, "PermissionRequest", Phase::Permission),
+        (Agent::Claude, "PreCompact", Phase::Compacting),
+        (Agent::Codex, "SessionStart", Phase::Idle),
+        (Agent::Codex, "Stop", Phase::Idle),
+        (Agent::Codex, "UserPromptSubmit", Phase::Working),
+        (Agent::Codex, "PreToolUse", Phase::Working),
+        (Agent::Codex, "PostToolUse", Phase::Working),
+        (Agent::Codex, "PostCompact", Phase::Working),
+        (Agent::Codex, "PermissionRequest", Phase::Permission),
+        (Agent::Codex, "PreCompact", Phase::Compacting),
+        (Agent::Opencode, "session.created", Phase::Idle),
+        (Agent::Opencode, "session.status.idle", Phase::Idle),
+        (Agent::Opencode, "session.idle", Phase::Idle),
+        (Agent::Opencode, "session.error", Phase::Idle),
+        (Agent::Opencode, "session.status.busy", Phase::Working),
+        (Agent::Opencode, "session.status.retry", Phase::Working),
+        (Agent::Opencode, "permission.asked", Phase::Permission),
+        (Agent::Opencode, "session.compacted", Phase::Compacting),
+        (Agent::Pi, "session_start", Phase::Idle),
+        (Agent::Pi, "agent_settled", Phase::Idle),
+        (Agent::Pi, "session_compact_idle", Phase::Idle),
+        (Agent::Pi, "agent_start", Phase::Working),
+        (Agent::Pi, "session_compact_working", Phase::Working),
+        (Agent::Pi, "permission_resolved", Phase::Working),
+        (Agent::Pi, "permission_prompt", Phase::Permission),
+        (Agent::Pi, "session_before_compact", Phase::Compacting),
+    ];
+    for (agent, event, phase) in cases {
+        let result = normalize_for_test(agent, event, generic_native_json());
+        assert_eq!(result.phase, phase, "{agent:?} {event}");
+        assert!(result.running, "{agent:?} {event}");
+    }
+}
+
+#[test]
+fn removal_events_end_the_binding() {
+    let cases = [
+        (Agent::Claude, "SessionEnd"),
+        (Agent::Codex, "SessionEnd"),
+        (Agent::Opencode, "session.deleted"),
+        (Agent::Opencode, "server.instance.disposed"),
+        (Agent::Pi, "session_shutdown"),
+    ];
+    for (agent, event) in cases {
+        let result = normalize_for_test(agent, event, generic_native_json());
+        assert!(!result.running, "{agent:?} {event}");
+    }
+}
+
+#[test]
+fn codex_stop_remains_idle_and_running_rather_than_ending() {
+    let result = normalize_for_test(Agent::Codex, "Stop", generic_native_json());
+    assert_eq!(result.phase, Phase::Idle);
+    assert!(result.running);
+}
+
+#[test]
+fn claude_subagent_stop_is_ignored_to_avoid_racing_the_parent_stop() {
+    let result = normalize(
+        Agent::Claude,
+        "SubagentStop",
+        generic_native_json(),
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn unknown_events_are_ignored() {
+    let result = normalize(
+        Agent::Claude,
+        "TotallyUnknownEvent",
+        generic_native_json(),
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn codex_request_user_input_tool_use_becomes_idle() {
+    let native = r#"{"session_id":"codex-session","tool_name":"request_user_input"}"#;
+    let result = normalize_for_test(Agent::Codex, "PreToolUse", native);
+    assert_eq!(result.phase, Phase::Idle);
+    assert!(result.running);
+}
+
+#[test]
+fn malformed_native_json_is_rejected() {
+    let result = normalize(
+        Agent::Claude,
+        "PreToolUse",
+        "{not json",
+        &test_environment(),
+        test_process(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn oversized_stdin_is_rejected_before_processing() {
+    let mut reader = std::io::Cursor::new(vec![b'a'; 2_000_000]);
+    let result = state::read_capped(&mut reader, 1_048_576);
+    assert!(result.is_err());
+}
+
+#[test]
+fn stdin_at_or_under_the_cap_is_accepted() {
+    let mut reader = std::io::Cursor::new(b"{}".to_vec());
+    let result = state::read_capped(&mut reader, 1_048_576).unwrap();
+    assert_eq!(result, "{}");
+}
+
+#[test]
+fn concurrent_record_writes_all_land() {
+    let store = std::sync::Arc::new(store());
+    let mut handles = Vec::new();
+    for i in 0..16u32 {
+        let store = store.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..10 {
+                store.record(&status("same-session", 100 + i, 10)).unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(store.running(&all_alive()).unwrap().len(), 16);
+}
+
+#[test]
+fn concurrent_writes_to_the_same_binding_never_produce_a_torn_file() {
+    let store = std::sync::Arc::new(store());
+    let mut handles = Vec::new();
+    for i in 0..8u32 {
+        let store = store.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..25 {
+                let mut event = status(&format!("session-{i}"), 900, 90);
+                event.binding_id = "shared-binding".into();
+                store.record(&event).unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(store.running(&all_alive()).unwrap().len(), 1);
+}
+
+#[test]
+fn running_excludes_and_removes_dead_bindings() {
+    let store = store();
+    store.record(&status("dead-session", 301, 31)).unwrap();
+    let liveness = FakeProcessLookup::new();
+    assert!(store.running(&liveness).unwrap().is_empty());
+    assert!(store.running(&all_alive()).unwrap().is_empty());
+}
+
+#[test]
+fn sweep_removes_dead_bindings_and_returns_them_with_running_false() {
+    let store = store();
+    store.record(&status("swept-session", 302, 32)).unwrap();
+    let liveness = FakeProcessLookup::new();
+    let swept = store.sweep(&liveness).unwrap();
+    assert_eq!(swept.len(), 1);
+    assert!(!swept[0].running);
+    assert_eq!(swept[0].session.id, "swept-session");
+    assert!(store.running(&all_alive()).unwrap().is_empty());
+}
+
+#[test]
+fn a_binding_that_was_alive_is_swept_once_its_process_exits() {
+    let store = store();
+    store.record(&status("exiting-session", 303, 33)).unwrap();
+    let liveness = FakeProcessLookup::new();
+    liveness.set_alive(303, "33");
+    assert_eq!(store.running(&liveness).unwrap().len(), 1);
+
+    liveness.set_dead(303);
+    let swept = store.sweep(&liveness).unwrap();
+    assert_eq!(swept.len(), 1);
+    assert_eq!(swept[0].session.id, "exiting-session");
+    assert!(store.running(&liveness).unwrap().is_empty());
+}
+
+#[test]
+fn pid_reuse_is_treated_as_a_dead_binding() {
+    let store = store();
+    store.record(&status("reused-session", 400, 1)).unwrap();
+    let liveness = FakeProcessLookup::new();
+    liveness.set_alive(400, "2");
+    assert!(store.running(&liveness).unwrap().is_empty());
+}
+
+#[test]
+fn records_without_process_identity_are_diagnostics_not_running() {
+    let store = store();
+    let mut event = status("orphan-session", 500, 50);
+    event.process = None;
+    store.record(&event).unwrap();
+    assert!(store.running(&all_alive()).unwrap().is_empty());
+    assert!(store.sweep(&all_alive()).unwrap().is_empty());
+    assert!(store.running(&all_alive()).unwrap().is_empty());
+}
+
+#[test]
+fn failed_write_leaves_the_previous_complete_record_intact() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let mut original = status("stable-session", 600, 60);
+    original.phase = Phase::Idle;
+    store.record(&original).unwrap();
+
+    let status_dir = root.join("status");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
+    let mut updated = original.clone();
+    updated.phase = Phase::Working;
+    let result = store.record(&updated);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    assert!(result.is_err());
+    let records = store.running(&all_alive()).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].phase, Phase::Idle);
+}
+
+#[cfg(unix)]
+#[test]
+fn state_directories_and_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    store.record(&status("perm-session", 800, 80)).unwrap();
+
+    let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(root_mode, 0o700);
+
+    let status_dir = root.join("status");
+    let status_dir_mode = std::fs::metadata(&status_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(status_dir_mode, 0o700);
+
+    let mut entries = std::fs::read_dir(&status_dir).unwrap();
+    let file_path = entries.next().unwrap().unwrap().path();
+    let file_mode = std::fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode, 0o600);
+}
+
+#[test]
+fn unrelated_ingest_sweeps_a_dead_binding() {
+    let store = store();
+
+    let dying_process = ProcessIdentity {
+        pid: 700,
+        started_at: "70".into(),
+        host: "host-a".into(),
+    };
+    let dying_liveness = FakeProcessLookup::with_owner(dying_process);
+    dying_liveness.set_alive(700, "70");
+
+    let outcome = state::handle_ingest(
+        &store,
+        &dying_liveness,
+        Agent::Claude,
+        "SessionStart",
+        r#"{"session_id":"dying-session"}"#,
+        &test_environment(),
+        700,
+    );
+    assert!(outcome.problem.is_none());
+    assert_eq!(store.running(&dying_liveness).unwrap().len(), 1);
+
+    let other_process = ProcessIdentity {
+        pid: 701,
+        started_at: "71".into(),
+        host: "host-a".into(),
+    };
+    let other_liveness = FakeProcessLookup::with_owner(other_process);
+    other_liveness.set_alive(701, "71");
+    // pid 700 is unknown to `other_liveness`, so it reads as dead: this
+    // simulates the dying session's process having exited by the time the
+    // unrelated session's ingest runs.
+
+    let outcome = state::handle_ingest(
+        &store,
+        &other_liveness,
+        Agent::Codex,
+        "SessionStart",
+        r#"{"session_id":"other-session"}"#,
+        &test_environment(),
+        701,
+    );
+    assert!(outcome.problem.is_none());
+
+    let remaining = store.running(&other_liveness).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session.id, "other-session");
+}
+
+#[test]
+fn ingest_records_a_health_problem_on_malformed_input_and_still_succeeds() {
+    let store = store();
+    let liveness = FakeProcessLookup::new();
+    let outcome = state::handle_ingest(
+        &store,
+        &liveness,
+        Agent::Claude,
+        "PreToolUse",
+        "{not json",
+        &test_environment(),
+        1,
+    );
+    assert!(outcome.problem.is_some());
+    let problems = store.health_problems().unwrap();
+    assert_eq!(problems.len(), 1);
+}

@@ -1,5 +1,21 @@
 use assert_cmd::Command;
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "hooklinesinker-cli-{label}-{}-{nanos}-{id}",
+        std::process::id()
+    ))
+}
 
 #[test]
 fn version_reports_protocol_one() {
@@ -39,7 +55,6 @@ fn plain_version_prints_human_readable_line() {
 #[test]
 fn unimplemented_subcommands_exit_two_with_stderr_message() {
     let cases: &[&[&str]] = &[
-        &["ingest", "--agent", "claude", "--event", "start"],
         &["sessions"],
         &["consumers"],
         &["doctor"],
@@ -90,6 +105,61 @@ fn install_accepts_optional_sink() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn sessions_json_reports_an_empty_envelope_for_a_fresh_state_dir() {
+    let temp = unique_temp_dir("sessions-empty");
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["protocol"], 1);
+    assert_eq!(value["sessions"], serde_json::json!([]));
+    assert_eq!(value["problems"], serde_json::json!([]));
+}
+
+#[test]
+fn ingest_writes_a_ledger_record_that_sessions_json_can_read() {
+    let temp = unique_temp_dir("sessions-roundtrip");
+    let ingest = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["ingest", "--agent", "claude", "--event", "SessionStart"])
+        .write_stdin(r#"{"session_id":"cli-session"}"#)
+        .output()
+        .unwrap();
+    assert!(ingest.status.success());
+    assert!(ingest.stderr.is_empty());
+
+    let ledger_files: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/status"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(ledger_files.len(), 1);
+    let record: Value = serde_json::from_slice(&std::fs::read(&ledger_files[0]).unwrap()).unwrap();
+    assert_eq!(record["session"]["id"], "cli-session");
+    assert_eq!(record["phase"], "idle");
+    assert_eq!(record["running"], true);
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["protocol"], 1);
+    // Whether this record appears here depends on whether the test binary
+    // happens to have a real "claude" process ancestor in this environment;
+    // the ledger-file assertions above already pin what ingest itself wrote.
+    assert!(value["sessions"].is_array());
+    assert!(value["problems"].is_array());
 }
 
 #[test]

@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
-
-use crate::protocol::Agent;
+use hooklinesinker::protocol::Agent;
 
 #[derive(Parser)]
 #[command(name = "hooklinesinker")]

@@ -1,0 +1,15 @@
+{
+  "session_id": "claude-session",
+  "transcript_path": "/Users/example/.claude/projects/demo/transcript.jsonl",
+  "cwd": "/Users/example/project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo hello",
+    "description": "print a greeting"
+  },
+  "tool_result": {
+    "stdout": "hello\n",
+    "stderr": ""
+  }
+}

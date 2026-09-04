@@ -3,14 +3,21 @@ name = "hooklinesinker"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "hooklinesinker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hooklinesinker"
 path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
+fs2 = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
+sysinfo = "0.38.4"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

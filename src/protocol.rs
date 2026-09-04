@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
