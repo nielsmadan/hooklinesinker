@@ -25,6 +25,8 @@ fn hooklinesinker_isolated(temp: &std::path::Path) -> Command {
     cmd.env_remove("XDG_CONFIG_HOME");
     cmd.env_remove("OPENCODE_CONFIG_DIR");
     cmd.env_remove("PI_CODING_AGENT_DIR");
+    cmd.env_remove("QWEN_HOME");
+    cmd.env_remove("KIMI_CODE_HOME");
     cmd
 }
 
@@ -124,6 +126,61 @@ fn hooks_install_writes_claude_settings_with_the_stable_binary_path() {
     let status: Value = serde_json::from_slice(&status_output.stdout).unwrap();
     assert_eq!(status["state"], "installed");
     assert_eq!(status["entries"].as_array().unwrap().len(), 11);
+}
+
+#[test]
+fn hooks_install_writes_droid_hooks_json_with_no_hooks_wrapper() {
+    let temp = unique_temp_dir("hooks-install-droid");
+    let output = hooklinesinker_isolated(&temp)
+        .args(["hooks", "install", "--agent", "droid"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let hooks_path = temp.join("home/.factory/hooks.json");
+    let value: Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    let command = value["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.ends_with("ingest --agent droid --event SessionStart"));
+    assert!(value.get("hooks").is_none());
+}
+
+#[test]
+fn hooks_install_honors_qwen_home_override() {
+    let temp = unique_temp_dir("hooks-install-qwen-home");
+    let qwen_home = temp.join("custom-qwen-home");
+    let output = hooklinesinker_isolated(&temp)
+        .env("QWEN_HOME", &qwen_home)
+        .args(["hooks", "install", "--agent", "qwen"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let settings_path = qwen_home.join("settings.json");
+    let settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.ends_with("ingest --agent qwen --event SessionStart"));
+}
+
+#[test]
+fn hooks_install_honors_kimi_code_home_override() {
+    let temp = unique_temp_dir("hooks-install-kimi-home");
+    let kimi_home = temp.join("custom-kimi-home");
+    let output = hooklinesinker_isolated(&temp)
+        .env("KIMI_CODE_HOME", &kimi_home)
+        .args(["hooks", "install", "--agent", "kimi"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let config_path = kimi_home.join("config.toml");
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("ingest --agent kimi --event SessionStart"));
 }
 
 #[test]

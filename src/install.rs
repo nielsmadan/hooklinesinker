@@ -237,7 +237,15 @@ impl Installer {
             });
         }
 
-        for agent in [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi] {
+        for agent in [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Opencode,
+            Agent::Pi,
+            Agent::Droid,
+            Agent::Qwen,
+            Agent::Kimi,
+        ] {
             hooks.uninstall(agent)?;
         }
 
@@ -340,6 +348,9 @@ mod tests {
             codex_dir: base.join("codex"),
             opencode_config_dir: base.join("opencode"),
             pi_agent_dir: base.join("pi"),
+            factory_dir: base.join("factory"),
+            qwen_config_dir: base.join("qwen"),
+            kimi_code_dir: base.join("kimi-code"),
             binary_path: install.binary_path(),
         })
     }

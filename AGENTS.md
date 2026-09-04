@@ -1,7 +1,8 @@
 # AGENTS.md
 
-Rust CLI that owns the agent status hooks for Claude Code, Codex, OpenCode and Pi, keeps a
-ledger of live sessions, and serves it to registered consumers (Juggler, ringleader).
+Rust CLI that owns the agent status hooks for Claude Code, Codex, OpenCode, Pi, Factory Droid,
+Qwen Code and Kimi Code CLI, keeps a ledger of live sessions, and serves it to registered
+consumers (Juggler, ringleader).
 `README.md` documents the surface; this file is the working brief.
 
 ## Commands
@@ -52,6 +53,10 @@ optional fields are safe; anything else needs a protocol bump and both consumers
   binary go only when the last consumer leaves.
 - **The active binary is shared.** `install` reuses a newer protocol-compatible active version
   rather than downgrading it, so install order between consumers never matters.
+- **Kimi's `config.toml` bricks entirely on one malformed `[[hooks]]` entry.** Its installer
+  uses `toml_edit`, writes only the strict `{event, command, timeout}` shape, verifies its own
+  rendering re-parses before ever touching disk, and removes only exact canonical `command`
+  matches — never the fuzzy near-match the JSON installers use.
 
 ## Layout
 

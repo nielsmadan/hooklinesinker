@@ -1,4 +1,5 @@
 use crate::protocol::{Agent, ProcessIdentity};
+use std::path::Path;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 pub trait ProcessLookup {
@@ -55,14 +56,46 @@ impl SystemProcessLookup {
         Self { system }
     }
 
+    // Kimi's own CLI renames its process via `process.title = "kimi-code"` at
+    // startup (confirmed from the shipped @moonshot-ai/kimi-code bundle), so the
+    // OS-visible name is "kimi-code" rather than the "kimi" command users type.
     fn expected_executable(agent: Agent) -> &'static str {
         match agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Opencode => "opencode",
             Agent::Pi => "pi",
+            Agent::Droid => "droid",
+            Agent::Qwen => "qwen",
+            Agent::Kimi => "kimi-code",
         }
     }
+}
+
+// Some agent CLIs are `#!/usr/bin/env node` shims (confirmed for Qwen's shipped
+// @qwen-code/qwen-code bundle, which never renames its process on non-Windows
+// platforms): the OS-visible process name is the interpreter's ("node", "bun",
+// "deno"), not the agent's own command name. npm's bin-shimming still invokes
+// the interpreter with the original command-named script path in argv, so fall
+// back to matching that path's file name when the direct name check misses and
+// the process is a known script runtime.
+fn is_script_runtime(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "node" | "bun" | "deno")
+}
+
+fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &str) -> bool {
+    if name.eq_ignore_ascii_case(expected) {
+        return true;
+    }
+    if !is_script_runtime(name) {
+        return false;
+    }
+    cmd.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .map(|f| f.to_string_lossy())
+            .is_some_and(|f| f.eq_ignore_ascii_case(expected))
+    })
 }
 
 impl Default for SystemProcessLookup {
@@ -82,11 +115,7 @@ impl ProcessLookup for SystemProcessLookup {
             }
             depth += 1;
             let process = self.system.process(pid)?;
-            if process
-                .name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(expected)
-            {
+            if is_owning_process(&process.name().to_string_lossy(), process.cmd(), expected) {
                 return Some(ProcessIdentity {
                     pid: usize::from(pid) as u32,
                     started_at: format_epoch_seconds(process.start_time()),
@@ -118,6 +147,34 @@ mod tests {
     #[test]
     fn a_known_timestamp_formats_correctly() {
         assert_eq!(format_epoch_seconds(1_798_761_296), "2026-12-31T23:54:56Z");
+    }
+
+    fn os_string_argv(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn exact_process_name_matches_without_inspecting_argv() {
+        assert!(is_owning_process("droid", &[], "droid"));
+        assert!(is_owning_process("kimi-code", &[], "kimi-code"));
+    }
+
+    #[test]
+    fn node_shim_matches_by_the_invoked_scripts_file_name() {
+        let argv = os_string_argv(&["node", "/usr/local/bin/qwen", "--flag"]);
+        assert!(is_owning_process("node", &argv, "qwen"));
+    }
+
+    #[test]
+    fn node_process_without_a_matching_argv_entry_does_not_match() {
+        let argv = os_string_argv(&["node", "/usr/local/bin/some-other-cli"]);
+        assert!(!is_owning_process("node", &argv, "qwen"));
+    }
+
+    #[test]
+    fn a_non_runtime_process_never_matches_via_the_argv_fallback() {
+        let argv = os_string_argv(&["bash", "-c", "qwen"]);
+        assert!(!is_owning_process("bash", &argv, "qwen"));
     }
 
     #[test]

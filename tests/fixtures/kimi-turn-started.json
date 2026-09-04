@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "TurnStarted",
+  "session_id": "kimi-session",
+  "session_title": "Refactor auth module",
+  "client_type": "cli",
+  "cwd": "/Users/example/project",
+  "turn_id": "turn-1",
+  "origin_kind": "user",
+  "origin_name": "user",
+  "prompt": "add tests"
+}

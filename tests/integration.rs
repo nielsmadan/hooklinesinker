@@ -326,6 +326,30 @@ fn pi_settled_fixture_normalizes_to_idle() {
 }
 
 #[test]
+fn droid_notification_permission_prompt_fixture_normalizes_to_permission() {
+    let native = include_str!("fixtures/droid-notification.json");
+    let event = normalize_for_test(Agent::Droid, "Notification", native);
+    assert_eq!(event.phase, Phase::Permission);
+    assert_eq!(event.session.id, "droid-session");
+}
+
+#[test]
+fn qwen_post_tool_use_failure_fixture_normalizes_to_working() {
+    let native = include_str!("fixtures/qwen-failure.json");
+    let event = normalize_for_test(Agent::Qwen, "PostToolUseFailure", native);
+    assert_eq!(event.phase, Phase::Working);
+    assert_eq!(event.session.id, "qwen-session");
+}
+
+#[test]
+fn kimi_turn_started_fixture_normalizes_to_working() {
+    let native = include_str!("fixtures/kimi-turn-started.json");
+    let event = normalize_for_test(Agent::Kimi, "TurnStarted", native);
+    assert_eq!(event.phase, Phase::Working);
+    assert_eq!(event.session.id, "kimi-session");
+}
+
+#[test]
 fn every_normalized_phase_maps_correctly() {
     let cases = [
         (Agent::Claude, "SessionStart", Phase::Idle),
@@ -362,6 +386,36 @@ fn every_normalized_phase_maps_correctly() {
         (Agent::Pi, "permission_resolved", Phase::Working),
         (Agent::Pi, "permission_prompt", Phase::Permission),
         (Agent::Pi, "session_before_compact", Phase::Compacting),
+        (Agent::Droid, "SessionStart", Phase::Idle),
+        (Agent::Droid, "Stop", Phase::Idle),
+        (Agent::Droid, "UserPromptSubmit", Phase::Working),
+        (Agent::Droid, "PreToolUse", Phase::Working),
+        (Agent::Droid, "PostToolUse", Phase::Working),
+        (Agent::Droid, "PreCompact", Phase::Compacting),
+        (Agent::Qwen, "SessionStart", Phase::Idle),
+        (Agent::Qwen, "Stop", Phase::Idle),
+        (Agent::Qwen, "StopFailure", Phase::Idle),
+        (Agent::Qwen, "UserPromptSubmit", Phase::Working),
+        (Agent::Qwen, "PreToolUse", Phase::Working),
+        (Agent::Qwen, "PostToolUse", Phase::Working),
+        (Agent::Qwen, "PostToolUseFailure", Phase::Working),
+        (Agent::Qwen, "PermissionDenied", Phase::Working),
+        (Agent::Qwen, "PostCompact", Phase::Working),
+        (Agent::Qwen, "PermissionRequest", Phase::Permission),
+        (Agent::Qwen, "PreCompact", Phase::Compacting),
+        (Agent::Kimi, "SessionStart", Phase::Idle),
+        (Agent::Kimi, "Stop", Phase::Idle),
+        (Agent::Kimi, "StopFailure", Phase::Idle),
+        (Agent::Kimi, "Interrupt", Phase::Idle),
+        (Agent::Kimi, "TurnStarted", Phase::Working),
+        (Agent::Kimi, "UserPromptSubmit", Phase::Working),
+        (Agent::Kimi, "PreToolUse", Phase::Working),
+        (Agent::Kimi, "PostToolUse", Phase::Working),
+        (Agent::Kimi, "PostToolUseFailure", Phase::Working),
+        (Agent::Kimi, "PermissionResult", Phase::Working),
+        (Agent::Kimi, "PostCompact", Phase::Working),
+        (Agent::Kimi, "PermissionRequest", Phase::Permission),
+        (Agent::Kimi, "PreCompact", Phase::Compacting),
     ];
     for (agent, event, phase) in cases {
         let result = normalize_for_test(agent, event, generic_native_json());
@@ -378,6 +432,9 @@ fn removal_events_end_the_binding() {
         (Agent::Opencode, "session.deleted"),
         (Agent::Opencode, "server.instance.disposed"),
         (Agent::Pi, "session_shutdown"),
+        (Agent::Droid, "SessionEnd"),
+        (Agent::Qwen, "SessionEnd"),
+        (Agent::Kimi, "SessionEnd"),
     ];
     for (agent, event) in cases {
         let result = normalize_for_test(agent, event, generic_native_json());
@@ -403,6 +460,132 @@ fn claude_subagent_stop_is_ignored_to_avoid_racing_the_parent_stop() {
     )
     .unwrap();
     assert!(result.is_none());
+}
+
+#[test]
+fn droid_notification_type_selects_the_right_phase() {
+    let cases = [
+        ("permission_prompt", Phase::Permission),
+        ("elicitation_dialog", Phase::Permission),
+        ("idle_prompt", Phase::Idle),
+    ];
+    for (notification_type, phase) in cases {
+        let native = format!(r#"{{"session_id":"s","notification_type":"{notification_type}"}}"#);
+        let event = normalize_for_test(Agent::Droid, "Notification", &native);
+        assert_eq!(event.phase, phase, "{notification_type}");
+    }
+}
+
+#[test]
+fn droid_notification_auth_success_is_ignored() {
+    let native = r#"{"session_id":"s","notification_type":"auth_success"}"#;
+    let result = normalize(
+        Agent::Droid,
+        "Notification",
+        native,
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn droid_subagent_stop_is_ignored() {
+    let result = normalize(
+        Agent::Droid,
+        "SubagentStop",
+        generic_native_json(),
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn qwen_notification_type_selects_the_right_phase() {
+    let cases = [
+        ("permission_prompt", Phase::Permission),
+        ("idle_prompt", Phase::Idle),
+    ];
+    for (notification_type, phase) in cases {
+        let native = format!(r#"{{"session_id":"s","notification_type":"{notification_type}"}}"#);
+        let event = normalize_for_test(Agent::Qwen, "Notification", &native);
+        assert_eq!(event.phase, phase, "{notification_type}");
+    }
+}
+
+#[test]
+fn qwen_notification_auth_success_is_ignored() {
+    let native = r#"{"session_id":"s","notification_type":"auth_success"}"#;
+    let result = normalize(
+        Agent::Qwen,
+        "Notification",
+        native,
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn qwen_session_delete_is_ignored_since_it_names_a_different_sessions_id() {
+    let result = normalize(
+        Agent::Qwen,
+        "SessionDelete",
+        r#"{"deleted_session_id":"some-other-session"}"#,
+        &test_environment(),
+        test_process(),
+    )
+    .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn qwen_unregistered_events_are_ignored() {
+    let events = [
+        "MessageDisplay",
+        "TodoCreated",
+        "TodoCompleted",
+        "SubagentStart",
+        "SubagentStop",
+    ];
+    for event in events {
+        let result = normalize(
+            Agent::Qwen,
+            event,
+            generic_native_json(),
+            &test_environment(),
+            test_process(),
+        )
+        .unwrap();
+        assert!(result.is_none(), "{event}");
+    }
+}
+
+#[test]
+fn kimi_unregistered_events_are_ignored() {
+    let events = [
+        "UserPromptQueued",
+        "TaskStarted",
+        "Notification",
+        "SubagentStart",
+        "SubagentStop",
+        "SessionHeartbeat",
+    ];
+    for event in events {
+        let result = normalize(
+            Agent::Kimi,
+            event,
+            generic_native_json(),
+            &test_environment(),
+            test_process(),
+        )
+        .unwrap();
+        assert!(result.is_none(), "{event}");
+    }
 }
 
 #[test]
@@ -1159,6 +1342,9 @@ fn every_agent_drops_an_empty_session_id_from_the_ledger() {
         (Agent::Codex, "SessionStart"),
         (Agent::Opencode, "session.created"),
         (Agent::Pi, "session_start"),
+        (Agent::Droid, "SessionStart"),
+        (Agent::Qwen, "SessionStart"),
+        (Agent::Kimi, "SessionStart"),
     ];
     for (agent, event) in cases {
         let root = temp_home();
@@ -1324,6 +1510,9 @@ fn hook_manager_at(base: &std::path::Path, binary_path: PathBuf) -> HookManager 
         codex_dir: base.join("codex"),
         opencode_config_dir: base.join("opencode"),
         pi_agent_dir: base.join("pi"),
+        factory_dir: base.join("factory"),
+        qwen_config_dir: base.join("qwen"),
+        kimi_code_dir: base.join("kimi-code"),
         binary_path,
     })
 }

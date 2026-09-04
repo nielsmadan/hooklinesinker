@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value as toml_value};
 
 const MARKER_PREFIX: &str = "// hooklinesinker-generated protocol=";
 const BIN_PLACEHOLDER: &str = "__HOOKLINESINKER_BIN__";
@@ -124,6 +125,194 @@ const CODEX_EVENTS: &[EventSpec] = &[
     },
 ];
 
+const DROID_EVENTS: &[EventSpec] = &[
+    EventSpec {
+        name: "SessionStart",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "UserPromptSubmit",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PreToolUse",
+        matcher: Some("*"),
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PostToolUse",
+        matcher: Some("*"),
+        timeout: 5,
+    },
+    EventSpec {
+        name: "Stop",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "Notification",
+        matcher: Some("*"),
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PreCompact",
+        matcher: Some("*"),
+        timeout: 5,
+    },
+    EventSpec {
+        name: "SessionEnd",
+        matcher: None,
+        timeout: 3,
+    },
+];
+
+// Qwen's settings.json timeout is milliseconds, unlike Claude/Codex's seconds.
+const QWEN_EVENTS: &[EventSpec] = &[
+    EventSpec {
+        name: "SessionStart",
+        matcher: None,
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "UserPromptSubmit",
+        matcher: None,
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "PreToolUse",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "PostToolUse",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "PostToolUseFailure",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "PermissionRequest",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "PermissionDenied",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "Stop",
+        matcher: None,
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "StopFailure",
+        matcher: None,
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "Notification",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "PreCompact",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "PostCompact",
+        matcher: Some("*"),
+        timeout: 5000,
+    },
+    EventSpec {
+        name: "SessionEnd",
+        matcher: None,
+        timeout: 3000,
+    },
+];
+
+// Kimi's config.toml `[[hooks]]` schema has no matcher-group concept: each
+// entry is a flat table, so EventSpec.matcher goes unused here (our rulings
+// apply the same phase to every matcher value of a given event).
+const KIMI_EVENTS: &[EventSpec] = &[
+    EventSpec {
+        name: "SessionStart",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "TurnStarted",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "UserPromptSubmit",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PreToolUse",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PostToolUse",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PostToolUseFailure",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PermissionRequest",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PermissionResult",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "Stop",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "StopFailure",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "Interrupt",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PreCompact",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "PostCompact",
+        matcher: None,
+        timeout: 5,
+    },
+    EventSpec {
+        name: "SessionEnd",
+        matcher: None,
+        timeout: 3,
+    },
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookState {
@@ -156,6 +345,9 @@ pub struct HookRoots {
     pub codex_dir: PathBuf,
     pub opencode_config_dir: PathBuf,
     pub pi_agent_dir: PathBuf,
+    pub factory_dir: PathBuf,
+    pub qwen_config_dir: PathBuf,
+    pub kimi_code_dir: PathBuf,
     pub binary_path: PathBuf,
 }
 
@@ -174,11 +366,22 @@ impl HookRoots {
         let pi_agent_dir = nonempty_env("PI_CODING_AGENT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(&home).join(".pi/agent"));
+        // Droid has no documented home-relocation env var.
+        let factory_dir = PathBuf::from(&home).join(".factory");
+        let qwen_config_dir = nonempty_env("QWEN_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&home).join(".qwen"));
+        let kimi_code_dir = nonempty_env("KIMI_CODE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&home).join(".kimi-code"));
         Self {
             claude_dir,
             codex_dir,
             opencode_config_dir,
             pi_agent_dir,
+            factory_dir,
+            qwen_config_dir,
+            kimi_code_dir,
             binary_path,
         }
     }
@@ -204,12 +407,14 @@ impl HookManager {
                 &self.claude_settings_path(),
                 CLAUDE_EVENTS,
                 ReconcileMode::Install,
+                HooksLocation::Nested("hooks"),
             ),
             Agent::Codex => self.reconcile_json(
                 agent,
                 &self.codex_hooks_path(),
                 CODEX_EVENTS,
                 ReconcileMode::Install,
+                HooksLocation::Nested("hooks"),
             ),
             Agent::Opencode => self.install_ts(
                 agent,
@@ -223,17 +428,60 @@ impl HookManager {
                 PI_TEMPLATE,
                 &self.pi_legacy_path(),
             ),
+            Agent::Droid => self.reconcile_json(
+                agent,
+                &self.droid_hooks_path(),
+                DROID_EVENTS,
+                ReconcileMode::Install,
+                HooksLocation::TopLevel,
+            ),
+            Agent::Qwen => self.reconcile_json(
+                agent,
+                &self.qwen_settings_path(),
+                QWEN_EVENTS,
+                ReconcileMode::Install,
+                HooksLocation::Nested("hooks"),
+            ),
+            Agent::Kimi => self.reconcile_toml(
+                agent,
+                &self.kimi_config_path(),
+                KIMI_EVENTS,
+                ReconcileMode::Install,
+            ),
         }
     }
 
     pub fn status(&self, agent: Agent) -> io::Result<HookStatus> {
         match agent {
-            Agent::Claude => self.status_json(agent, &self.claude_settings_path(), CLAUDE_EVENTS),
-            Agent::Codex => self.status_json(agent, &self.codex_hooks_path(), CODEX_EVENTS),
+            Agent::Claude => self.status_json(
+                agent,
+                &self.claude_settings_path(),
+                CLAUDE_EVENTS,
+                HooksLocation::Nested("hooks"),
+            ),
+            Agent::Codex => self.status_json(
+                agent,
+                &self.codex_hooks_path(),
+                CODEX_EVENTS,
+                HooksLocation::Nested("hooks"),
+            ),
             Agent::Opencode => {
                 self.status_ts(agent, &self.opencode_plugin_path(), OPENCODE_TEMPLATE)
             }
             Agent::Pi => self.status_ts(agent, &self.pi_extension_path(), PI_TEMPLATE),
+            Agent::Droid => self.status_json(
+                agent,
+                &self.droid_hooks_path(),
+                DROID_EVENTS,
+                HooksLocation::TopLevel,
+            ),
+            Agent::Qwen => self.status_json(
+                agent,
+                &self.qwen_settings_path(),
+                QWEN_EVENTS,
+                HooksLocation::Nested("hooks"),
+            ),
+            Agent::Kimi => self.status_toml(agent, &self.kimi_config_path(), KIMI_EVENTS),
         }
     }
 
@@ -244,12 +492,14 @@ impl HookManager {
                 &self.claude_settings_path(),
                 CLAUDE_EVENTS,
                 ReconcileMode::Uninstall,
+                HooksLocation::Nested("hooks"),
             ),
             Agent::Codex => self.reconcile_json(
                 agent,
                 &self.codex_hooks_path(),
                 CODEX_EVENTS,
                 ReconcileMode::Uninstall,
+                HooksLocation::Nested("hooks"),
             ),
             Agent::Opencode => self.uninstall_ts(
                 agent,
@@ -262,6 +512,26 @@ impl HookManager {
                 &self.pi_extension_path(),
                 PI_TEMPLATE,
                 &self.pi_legacy_path(),
+            ),
+            Agent::Droid => self.reconcile_json(
+                agent,
+                &self.droid_hooks_path(),
+                DROID_EVENTS,
+                ReconcileMode::Uninstall,
+                HooksLocation::TopLevel,
+            ),
+            Agent::Qwen => self.reconcile_json(
+                agent,
+                &self.qwen_settings_path(),
+                QWEN_EVENTS,
+                ReconcileMode::Uninstall,
+                HooksLocation::Nested("hooks"),
+            ),
+            Agent::Kimi => self.reconcile_toml(
+                agent,
+                &self.kimi_config_path(),
+                KIMI_EVENTS,
+                ReconcileMode::Uninstall,
             ),
         }
     }
@@ -302,12 +572,25 @@ impl HookManager {
             .join("juggler-pi.ts")
     }
 
+    fn droid_hooks_path(&self) -> PathBuf {
+        self.roots.factory_dir.join("hooks.json")
+    }
+
+    fn qwen_settings_path(&self) -> PathBuf {
+        self.roots.qwen_config_dir.join("settings.json")
+    }
+
+    fn kimi_config_path(&self) -> PathBuf {
+        self.roots.kimi_code_dir.join("config.toml")
+    }
+
     fn reconcile_json(
         &self,
         agent: Agent,
         path: &Path,
         events: &[EventSpec],
         mode: ReconcileMode,
+        location: HooksLocation,
     ) -> io::Result<HookStatus> {
         let root = read_json_root(path)?;
         if root.is_none() && matches!(mode, ReconcileMode::Uninstall) {
@@ -318,25 +601,32 @@ impl HookManager {
                 entries: Vec::new(),
             });
         }
-        let mut root = root.unwrap_or_default();
+        let root = root.unwrap_or_default();
 
-        let hooks_value = root.remove("hooks");
-        let mut hooks = match hooks_value {
-            None => Map::new(),
-            Some(Value::Object(map)) => map,
-            Some(other) => {
-                root.insert("hooks".to_string(), other);
-                return Ok(HookStatus {
-                    agent,
-                    state: HookState::Unsupported,
-                    path: path.to_path_buf(),
-                    entries: Vec::new(),
-                });
+        let (mut root, mut hooks) = match location {
+            HooksLocation::Nested(key) => {
+                let mut root = root;
+                match root.remove(key) {
+                    None => (root, Map::new()),
+                    Some(Value::Object(map)) => (root, map),
+                    Some(other) => {
+                        root.insert(key.to_string(), other);
+                        return Ok(HookStatus {
+                            agent,
+                            state: HookState::Unsupported,
+                            path: path.to_path_buf(),
+                            entries: Vec::new(),
+                        });
+                    }
+                }
             }
+            HooksLocation::TopLevel => (Map::new(), root),
         };
 
         if managed_event_shape_is_unsupported(&hooks, events) {
-            root.insert("hooks".to_string(), Value::Object(hooks));
+            if let HooksLocation::Nested(key) = location {
+                root.insert(key.to_string(), Value::Object(hooks));
+            }
             return Ok(HookStatus {
                 agent,
                 state: HookState::Unsupported,
@@ -388,13 +678,19 @@ impl HookManager {
             }
         }
 
-        root.insert("hooks".to_string(), Value::Object(hooks));
-        let mut bytes = serde_json::to_vec_pretty(&Value::Object(root))
+        let final_root = match location {
+            HooksLocation::Nested(key) => {
+                root.insert(key.to_string(), Value::Object(hooks));
+                root
+            }
+            HooksLocation::TopLevel => hooks,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&Value::Object(final_root))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         bytes.push(b'\n');
         write_agent_config(path, &bytes)?;
 
-        self.status_json(agent, path, events)
+        self.status_json(agent, path, events, location)
     }
 
     fn status_json(
@@ -402,6 +698,7 @@ impl HookManager {
         agent: Agent,
         path: &Path,
         events: &[EventSpec],
+        location: HooksLocation,
     ) -> io::Result<HookStatus> {
         let Some(root) = read_json_root(path)? else {
             return Ok(HookStatus {
@@ -412,24 +709,27 @@ impl HookManager {
             });
         };
 
-        let hooks = match root.get("hooks") {
-            None => {
-                return Ok(HookStatus {
-                    agent,
-                    state: HookState::Missing,
-                    path: path.to_path_buf(),
-                    entries: Vec::new(),
-                });
-            }
-            Some(Value::Object(map)) => map,
-            Some(_) => {
-                return Ok(HookStatus {
-                    agent,
-                    state: HookState::Unsupported,
-                    path: path.to_path_buf(),
-                    entries: Vec::new(),
-                });
-            }
+        let hooks = match location {
+            HooksLocation::Nested(key) => match root.get(key) {
+                None => {
+                    return Ok(HookStatus {
+                        agent,
+                        state: HookState::Missing,
+                        path: path.to_path_buf(),
+                        entries: Vec::new(),
+                    });
+                }
+                Some(Value::Object(map)) => map,
+                Some(_) => {
+                    return Ok(HookStatus {
+                        agent,
+                        state: HookState::Unsupported,
+                        path: path.to_path_buf(),
+                        entries: Vec::new(),
+                    });
+                }
+            },
+            HooksLocation::TopLevel => &root,
         };
 
         if managed_event_shape_is_unsupported(hooks, events) {
@@ -473,6 +773,179 @@ impl HookManager {
         let state = if installed_events.len() == events.len() {
             HookState::Installed
         } else if any_found {
+            HookState::Drifted
+        } else {
+            HookState::Missing
+        };
+
+        Ok(HookStatus {
+            agent,
+            state,
+            path: path.to_path_buf(),
+            entries,
+        })
+    }
+
+    // Kimi's config.toml bricks entirely on one malformed [[hooks]] entry, so
+    // this only ever removes exact-command matches, only ever writes entries
+    // with the schema's plain {event, command, timeout} shape, and re-parses
+    // its own rendering before it ever touches disk.
+    fn reconcile_toml(
+        &self,
+        agent: Agent,
+        path: &Path,
+        events: &[EventSpec],
+        mode: ReconcileMode,
+    ) -> io::Result<HookStatus> {
+        let existing = match fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if existing.is_none() && matches!(mode, ReconcileMode::Uninstall) {
+            return Ok(HookStatus {
+                agent,
+                state: HookState::Missing,
+                path: path.to_path_buf(),
+                entries: Vec::new(),
+            });
+        }
+
+        let mut doc = parse_toml_document(path, existing.as_deref().unwrap_or(""))?;
+
+        if let Some(item) = doc.get("hooks")
+            && !item.is_array_of_tables()
+        {
+            return Ok(HookStatus {
+                agent,
+                state: HookState::Unsupported,
+                path: path.to_path_buf(),
+                entries: Vec::new(),
+            });
+        }
+
+        let mut kept = ArrayOfTables::new();
+        let mut any_found = false;
+        if let Some(item) = doc.get("hooks") {
+            let array = item
+                .as_array_of_tables()
+                .expect("non-array-of-tables shape rejected above");
+            for table in array.iter() {
+                let command = table.get("command").and_then(Item::as_str);
+                let is_ours = events.iter().any(|spec| {
+                    Some(canonical_command(&self.roots.binary_path, agent, spec.name).as_str())
+                        == command
+                });
+                if is_ours {
+                    any_found = true;
+                } else {
+                    kept.push(table.clone());
+                }
+            }
+        }
+
+        let should_write = match mode {
+            ReconcileMode::Uninstall => {
+                if any_found {
+                    if kept.is_empty() {
+                        doc.remove("hooks");
+                    } else {
+                        doc["hooks"] = Item::ArrayOfTables(kept);
+                    }
+                }
+                any_found
+            }
+            ReconcileMode::Install => {
+                for spec in events {
+                    kept.push(kimi_hook_table(&self.roots.binary_path, agent, spec));
+                }
+                doc["hooks"] = Item::ArrayOfTables(kept);
+                true
+            }
+        };
+
+        if should_write {
+            let rendered = doc.to_string();
+            // Refuse to write anything the CLI would reject: verify our own
+            // rendering re-parses before it ever reaches disk.
+            parse_toml_document(path, &rendered)?;
+            write_agent_config(path, rendered.as_bytes())?;
+            // And once more from the bytes that actually landed, since a
+            // malformed config.toml disables every Kimi hook, not just ours.
+            let on_disk = fs::read_to_string(path)?;
+            parse_toml_document(path, &on_disk)?;
+        }
+
+        self.status_toml(agent, path, events)
+    }
+
+    fn status_toml(
+        &self,
+        agent: Agent,
+        path: &Path,
+        events: &[EventSpec],
+    ) -> io::Result<HookStatus> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(HookStatus {
+                    agent,
+                    state: HookState::Missing,
+                    path: path.to_path_buf(),
+                    entries: Vec::new(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        let doc = parse_toml_document(path, &text)?;
+
+        let array = match doc.get("hooks") {
+            None => {
+                return Ok(HookStatus {
+                    agent,
+                    state: HookState::Missing,
+                    path: path.to_path_buf(),
+                    entries: Vec::new(),
+                });
+            }
+            Some(item) => match item.as_array_of_tables() {
+                Some(array) => array,
+                None => {
+                    return Ok(HookStatus {
+                        agent,
+                        state: HookState::Unsupported,
+                        path: path.to_path_buf(),
+                        entries: Vec::new(),
+                    });
+                }
+            },
+        };
+
+        let mut entries = Vec::new();
+        let mut installed_events: HashSet<&str> = HashSet::new();
+        for (index, table) in array.iter().enumerate() {
+            let command = table.get("command").and_then(Item::as_str);
+            let Some((spec, command)) = command.and_then(|command| {
+                events
+                    .iter()
+                    .find(|spec| {
+                        canonical_command(&self.roots.binary_path, agent, spec.name) == command
+                    })
+                    .map(|spec| (spec, command))
+            }) else {
+                continue;
+            };
+            installed_events.insert(spec.name);
+            entries.push(HookEntry {
+                event: spec.name.to_string(),
+                group_index: index,
+                command: command.to_string(),
+            });
+        }
+
+        let state = if !events.is_empty() && installed_events.len() == events.len() {
+            HookState::Installed
+        } else if !entries.is_empty() {
             HookState::Drifted
         } else {
             HookState::Missing
@@ -575,6 +1048,14 @@ enum ReconcileMode {
     Uninstall,
 }
 
+// Claude/Codex/Qwen nest their hook groups under a top-level "hooks" key;
+// Droid's hooks.json is itself the event map, with no wrapper.
+#[derive(Clone, Copy)]
+enum HooksLocation {
+    Nested(&'static str),
+    TopLevel,
+}
+
 enum GroupOwnership {
     Ours { exact: bool },
     Foreign,
@@ -586,6 +1067,9 @@ fn wire_name(agent: Agent) -> &'static str {
         Agent::Codex => "codex",
         Agent::Opencode => "opencode",
         Agent::Pi => "pi",
+        Agent::Droid => "droid",
+        Agent::Qwen => "qwen",
+        Agent::Kimi => "kimi",
     }
 }
 
@@ -658,6 +1142,29 @@ fn build_group(spec: &EventSpec, canonical: &str) -> Value {
         Value::Array(vec![Value::Object(handler)]),
     );
     Value::Object(group)
+}
+
+fn kimi_hook_table(binary_path: &Path, agent: Agent, spec: &EventSpec) -> Table {
+    let mut table = Table::new();
+    table.insert("event", toml_value(spec.name));
+    table.insert(
+        "command",
+        toml_value(canonical_command(binary_path, agent, spec.name)),
+    );
+    table.insert("timeout", toml_value(spec.timeout as i64));
+    table
+}
+
+fn parse_toml_document(path: &Path, text: &str) -> io::Result<DocumentMut> {
+    if text.is_empty() {
+        return Ok(DocumentMut::new());
+    }
+    text.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid TOML: {e}", path.display()),
+        )
+    })
 }
 
 fn read_json_root(path: &Path) -> io::Result<Option<Map<String, Value>>> {
@@ -761,6 +1268,9 @@ mod tests {
             codex_dir: base.join("codex"),
             opencode_config_dir: base.join("opencode"),
             pi_agent_dir: base.join("pi"),
+            factory_dir: base.join("factory"),
+            qwen_config_dir: base.join("qwen"),
+            kimi_code_dir: base.join("kimi-code"),
             binary_path,
         };
         (HookManager::new(roots), base)
@@ -1066,6 +1576,412 @@ mod tests {
     }
 
     #[test]
+    fn droid_install_on_a_missing_file_creates_all_eight_events_with_no_hooks_wrapper() {
+        let (manager, base) = manager();
+        let status = manager.install(Agent::Droid).unwrap();
+        assert_eq!(status.state, HookState::Installed);
+        assert_eq!(status.entries.len(), 8);
+
+        let path = base.join("factory").join("hooks.json");
+        let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert!(
+            value.get("hooks").is_none(),
+            "droid's hooks.json is keyed directly by event name, with no wrapper"
+        );
+        let session_start = &value["SessionStart"][0];
+        assert_eq!(
+            session_start["hooks"][0]["command"],
+            format!(
+                "{} ingest --agent droid --event SessionStart",
+                base.join("bin").join("hooklinesinker").display()
+            )
+        );
+        assert_eq!(session_start["hooks"][0]["timeout"], 5);
+        assert!(session_start.get("matcher").is_none());
+        let pre_tool_use = &value["PreToolUse"][0];
+        assert_eq!(pre_tool_use["matcher"], "*");
+        let session_end = &value["SessionEnd"][0];
+        assert_eq!(session_end["hooks"][0]["timeout"], 3);
+    }
+
+    #[test]
+    fn droid_install_preserves_unrelated_top_level_content() {
+        let (manager, base) = manager();
+        let hooks_path = base.join("factory").join("hooks.json");
+        fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        fs::write(
+            &hooks_path,
+            serde_json::json!({
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.factory/hooks/user/lint.sh", "timeout": 5}]}
+                ],
+                "someFutureTopLevelKey": {"kept": true}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let status = manager.install(Agent::Droid).unwrap();
+        assert_eq!(status.state, HookState::Installed);
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert_eq!(value["someFutureTopLevelKey"]["kept"], true);
+        let pre_tool_use = value["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 2);
+        assert_eq!(pre_tool_use[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn a_second_droid_install_is_byte_for_byte_idempotent() {
+        let (manager, base) = manager();
+        manager.install(Agent::Droid).unwrap();
+        let path = base.join("factory").join("hooks.json");
+        let first = fs::read(&path).unwrap();
+
+        manager.install(Agent::Droid).unwrap();
+        let second = fs::read(&path).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn droid_status_reports_missing_installed_and_drifted() {
+        let (manager, base) = manager();
+        assert_eq!(
+            manager.status(Agent::Droid).unwrap().state,
+            HookState::Missing
+        );
+
+        manager.install(Agent::Droid).unwrap();
+        assert_eq!(
+            manager.status(Agent::Droid).unwrap().state,
+            HookState::Installed
+        );
+
+        let path = base.join("factory").join("hooks.json");
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["SessionStart"] = serde_json::json!([]);
+        fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(
+            manager.status(Agent::Droid).unwrap().state,
+            HookState::Drifted
+        );
+    }
+
+    #[test]
+    fn droid_status_reports_unsupported_for_a_non_array_value_under_a_managed_event_key() {
+        let (manager, base) = manager();
+        let path = base.join("factory").join("hooks.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::json!({"SessionStart": {"unexpected": "shape"}}).to_string();
+        fs::write(&path, &original).unwrap();
+
+        assert_eq!(
+            manager.status(Agent::Droid).unwrap().state,
+            HookState::Unsupported
+        );
+        let install_result = manager.install(Agent::Droid).unwrap();
+        assert_eq!(install_result.state, HookState::Unsupported);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn droid_uninstall_removes_only_hooklinesinker_groups() {
+        let (manager, base) = manager();
+        manager.install(Agent::Droid).unwrap();
+        let path = base.join("factory").join("hooks.json");
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["PreToolUse"].as_array_mut().unwrap().push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "~/.factory/hooks/user/lint.sh", "timeout": 5}]
+        }));
+        fs::write(&path, value.to_string()).unwrap();
+
+        let status = manager.uninstall(Agent::Droid).unwrap();
+        assert_eq!(status.state, HookState::Missing);
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let pre_tool_use = value["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(pre_tool_use[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn qwen_install_creates_all_thirteen_events_with_millisecond_timeouts() {
+        let (manager, base) = manager();
+        let status = manager.install(Agent::Qwen).unwrap();
+        assert_eq!(status.state, HookState::Installed);
+        assert_eq!(status.entries.len(), 13);
+
+        let path = base.join("qwen").join("settings.json");
+        let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let session_start = &value["hooks"]["SessionStart"][0];
+        assert_eq!(
+            session_start["hooks"][0]["command"],
+            format!(
+                "{} ingest --agent qwen --event SessionStart",
+                base.join("bin").join("hooklinesinker").display()
+            )
+        );
+        assert_eq!(session_start["hooks"][0]["timeout"], 5000);
+        let session_end = &value["hooks"]["SessionEnd"][0];
+        assert_eq!(session_end["hooks"][0]["timeout"], 3000);
+        let pre_tool_use = &value["hooks"]["PreToolUse"][0];
+        assert_eq!(pre_tool_use["matcher"], "*");
+    }
+
+    #[test]
+    fn qwen_install_preserves_unrelated_top_level_keys_and_matcher_groups() {
+        let (manager, base) = manager();
+        let settings_path = base.join("qwen").join("settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.qwen/hooks/user/lint.sh", "timeout": 5000}]}
+                    ]
+                },
+                "disableAllHooks": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let status = manager.install(Agent::Qwen).unwrap();
+        assert_eq!(status.state, HookState::Installed);
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(value["disableAllHooks"], false);
+        let pre_tool_use = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 2);
+        assert_eq!(pre_tool_use[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn a_second_qwen_install_is_byte_for_byte_idempotent() {
+        let (manager, base) = manager();
+        manager.install(Agent::Qwen).unwrap();
+        let path = base.join("qwen").join("settings.json");
+        let first = fs::read(&path).unwrap();
+
+        manager.install(Agent::Qwen).unwrap();
+        let second = fs::read(&path).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn qwen_status_reports_missing_installed_and_drifted() {
+        let (manager, base) = manager();
+        assert_eq!(
+            manager.status(Agent::Qwen).unwrap().state,
+            HookState::Missing
+        );
+
+        manager.install(Agent::Qwen).unwrap();
+        assert_eq!(
+            manager.status(Agent::Qwen).unwrap().state,
+            HookState::Installed
+        );
+
+        let path = base.join("qwen").join("settings.json");
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["hooks"]["SessionStart"] = serde_json::json!([]);
+        fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(
+            manager.status(Agent::Qwen).unwrap().state,
+            HookState::Drifted
+        );
+    }
+
+    #[test]
+    fn qwen_uninstall_removes_only_hooklinesinker_groups() {
+        let (manager, base) = manager();
+        manager.install(Agent::Qwen).unwrap();
+        let path = base.join("qwen").join("settings.json");
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": "~/.qwen/hooks/user/lint.sh", "timeout": 5000}]
+            }));
+        fs::write(&path, value.to_string()).unwrap();
+
+        let status = manager.uninstall(Agent::Qwen).unwrap();
+        assert_eq!(status.state, HookState::Missing);
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let pre_tool_use = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(pre_tool_use[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn kimi_install_creates_fourteen_entries_with_the_strict_three_field_shape() {
+        let (manager, base) = manager();
+        let status = manager.install(Agent::Kimi).unwrap();
+        assert_eq!(status.state, HookState::Installed);
+        assert_eq!(status.entries.len(), 14);
+
+        let path = base.join("kimi-code").join("config.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        let doc: DocumentMut = text.parse().unwrap();
+        let array = doc["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(array.iter().count(), 14);
+        for table in array.iter() {
+            let mut keys: Vec<&str> = table.iter().map(|(k, _)| k).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["command", "event", "timeout"]);
+        }
+        let session_end = array
+            .iter()
+            .find(|t| t.get("event").and_then(Item::as_str) == Some("SessionEnd"))
+            .unwrap();
+        assert_eq!(
+            session_end.get("timeout").and_then(Item::as_integer),
+            Some(3)
+        );
+        let session_start = array
+            .iter()
+            .find(|t| t.get("event").and_then(Item::as_str) == Some("SessionStart"))
+            .unwrap();
+        assert_eq!(
+            session_start.get("timeout").and_then(Item::as_integer),
+            Some(5)
+        );
+        assert_eq!(
+            session_start.get("command").and_then(Item::as_str),
+            Some(
+                format!(
+                    "{} ingest --agent kimi --event SessionStart",
+                    base.join("bin").join("hooklinesinker").display()
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn kimi_install_preserves_unrelated_toml_content_byte_for_byte() {
+        let (manager, base) = manager();
+        let path = base.join("kimi-code").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# a user comment\n[oauth]\nprovider = \"default\" # inline comment\n\n[[hooks]]\nevent = \"Stop\"\nmatcher = \"exit\"\ncommand = \"~/bin/notify Stop\"\n";
+        fs::write(&path, original).unwrap();
+
+        let status = manager.install(Agent::Kimi).unwrap();
+        assert_eq!(status.state, HookState::Installed);
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# a user comment\n[oauth]\nprovider = \"default\" # inline comment")
+        );
+        assert!(
+            text.contains("event = \"Stop\"\nmatcher = \"exit\"\ncommand = \"~/bin/notify Stop\"")
+        );
+
+        let doc: DocumentMut = text.parse().unwrap();
+        let array = doc["hooks"].as_array_of_tables().unwrap();
+        // Our 14 managed entries plus the one foreign "notify Stop" entry.
+        assert_eq!(array.iter().count(), 15);
+    }
+
+    #[test]
+    fn a_second_kimi_install_is_byte_for_byte_idempotent() {
+        let (manager, base) = manager();
+        let path = base.join("kimi-code").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "# kept\n[[hooks]]\nevent = \"Stop\"\ncommand = \"~/bin/notify Stop\"\n",
+        )
+        .unwrap();
+
+        manager.install(Agent::Kimi).unwrap();
+        let first = fs::read(&path).unwrap();
+
+        manager.install(Agent::Kimi).unwrap();
+        let second = fs::read(&path).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn kimi_status_reports_missing_installed_and_drifted() {
+        let (manager, base) = manager();
+        assert_eq!(
+            manager.status(Agent::Kimi).unwrap().state,
+            HookState::Missing
+        );
+
+        manager.install(Agent::Kimi).unwrap();
+        assert_eq!(
+            manager.status(Agent::Kimi).unwrap().state,
+            HookState::Installed
+        );
+
+        let path = base.join("kimi-code").join("config.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        let mut doc: DocumentMut = text.parse().unwrap();
+        {
+            let array = doc["hooks"].as_array_of_tables_mut().unwrap();
+            let removed = array.remove(0);
+            assert!(removed.contains_key("event"));
+        }
+        fs::write(&path, doc.to_string()).unwrap();
+        assert_eq!(
+            manager.status(Agent::Kimi).unwrap().state,
+            HookState::Drifted
+        );
+    }
+
+    #[test]
+    fn kimi_status_reports_unsupported_when_hooks_is_not_an_array_of_tables() {
+        let (manager, base) = manager();
+        let path = base.join("kimi-code").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "[hooks]\nevent = \"nope\"\n";
+        fs::write(&path, original).unwrap();
+
+        assert_eq!(
+            manager.status(Agent::Kimi).unwrap().state,
+            HookState::Unsupported
+        );
+        let install_result = manager.install(Agent::Kimi).unwrap();
+        assert_eq!(install_result.state, HookState::Unsupported);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn kimi_uninstall_removes_only_exact_canonical_matches_and_keeps_foreign_entries() {
+        let (manager, base) = manager();
+        let path = base.join("kimi-code").join("config.toml");
+        manager.install(Agent::Kimi).unwrap();
+        let mut value = fs::read_to_string(&path).unwrap();
+        value.push_str("\n[[hooks]]\nevent = \"Stop\"\ncommand = \"~/bin/notify Stop\"\n");
+        fs::write(&path, value).unwrap();
+
+        let status = manager.uninstall(Agent::Kimi).unwrap();
+        assert_eq!(status.state, HookState::Missing);
+
+        let text = fs::read_to_string(&path).unwrap();
+        let doc: DocumentMut = text.parse().unwrap();
+        let array = doc["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(array.iter().count(), 1);
+        assert_eq!(
+            array
+                .iter()
+                .next()
+                .unwrap()
+                .get("command")
+                .and_then(Item::as_str),
+            Some("~/bin/notify Stop")
+        );
+    }
+
+    #[test]
     fn opencode_install_writes_a_marked_file_and_is_idempotent() {
         let (manager, base) = manager();
         let status = manager.install(Agent::Opencode).unwrap();
@@ -1180,10 +2096,19 @@ mod tests {
     #[test]
     fn last_consumer_uninstall_removes_hooks_for_every_agent() {
         let (manager, base) = manager();
-        for agent in [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi] {
+        let agents = [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Opencode,
+            Agent::Pi,
+            Agent::Droid,
+            Agent::Qwen,
+            Agent::Kimi,
+        ];
+        for agent in agents {
             manager.install(agent).unwrap();
         }
-        for agent in [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi] {
+        for agent in agents {
             manager.uninstall(agent).unwrap();
             assert_eq!(manager.status(agent).unwrap().state, HookState::Missing);
         }

@@ -356,7 +356,15 @@ fn run_doctor(json: bool) {
             let hooks = hook_manager(&installer);
             let mut summaries = Vec::new();
             let mut problems = Vec::new();
-            for agent in [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Pi] {
+            for agent in [
+                Agent::Claude,
+                Agent::Codex,
+                Agent::Opencode,
+                Agent::Pi,
+                Agent::Droid,
+                Agent::Qwen,
+                Agent::Kimi,
+            ] {
                 match hooks.status(agent) {
                     Ok(status) => {
                         summaries.push(format!("{agent:?}={:?}", status.state));

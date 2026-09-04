@@ -10,6 +10,9 @@ pub enum Agent {
     Codex,
     Opencode,
     Pi,
+    Droid,
+    Qwen,
+    Kimi,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -89,6 +92,9 @@ mod tests {
         assert_eq!(serde_json::to_value(Agent::Codex).unwrap(), "codex");
         assert_eq!(serde_json::to_value(Agent::Opencode).unwrap(), "opencode");
         assert_eq!(serde_json::to_value(Agent::Pi).unwrap(), "pi");
+        assert_eq!(serde_json::to_value(Agent::Droid).unwrap(), "droid");
+        assert_eq!(serde_json::to_value(Agent::Qwen).unwrap(), "qwen");
+        assert_eq!(serde_json::to_value(Agent::Kimi).unwrap(), "kimi");
     }
 
     #[test]

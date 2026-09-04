@@ -1,7 +1,8 @@
 # hooklinesinker
 
-One binary that owns the status hooks for Claude Code, Codex, OpenCode and Pi, keeps a ledger
-of which agent sessions are live right now, and hands that answer to every tool that asks.
+One binary that owns the status hooks for Claude Code, Codex, OpenCode, Pi, Factory Droid, Qwen
+Code and Kimi Code CLI, keeps a ledger of which agent sessions are live right now, and hands that
+answer to every tool that asks.
 
 Before this existed, each tool that wanted to know "is this session still running?" shipped its
 own copy of four hook scripts and fought the others for the same config files. Here the hooks are
@@ -40,7 +41,7 @@ hooklinesinker consumers --json                  # who is registered
 hooklinesinker doctor [--json]                   # every self-check; nonzero on a real fault
 hooklinesinker install --consumer NAME [--sink URL]
 hooklinesinker uninstall --consumer NAME
-hooklinesinker hooks install|status|uninstall --agent claude|codex|opencode|pi
+hooklinesinker hooks install|status|uninstall --agent claude|codex|opencode|pi|droid|qwen|kimi
 hooklinesinker ingest --agent AGENT --event EVENT   # what the installed hooks call
 ```
 
@@ -76,9 +77,9 @@ envelope whose `protocol` is not one they speak, and skip individual records who
 }
 ```
 
-Keys are camelCase. `agent` is kebab-case (`claude`, `codex`, `opencode`, `pi`). `phase` is
-snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`) — an unrecognized phase
-decodes as `unknown` rather than failing the record.
+Keys are camelCase. `agent` is kebab-case (`claude`, `codex`, `opencode`, `pi`, `droid`, `qwen`,
+`kimi`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`) — an
+unrecognized phase decodes as `unknown` rather than failing the record.
 
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which additionally separates two terminals driving the same native session.
@@ -107,15 +108,24 @@ hang, and never block the hook.
 | `$XDG_STATE_HOME/hooklinesinker/status/` | one JSON record per live binding |
 | `$XDG_STATE_HOME/hooklinesinker/consumers/` | one JSON record per consumer |
 | `$XDG_STATE_HOME/hooklinesinker/health.json` | recent problems |
+| `~/.factory/hooks.json` | Factory Droid hooks (top-level event map, no `hooks` wrapper) |
+| `$QWEN_HOME/settings.json` (default `~/.qwen`) | Qwen Code hooks |
+| `$KIMI_CODE_HOME/config.toml` (default `~/.kimi-code`) | Kimi Code CLI hooks (`[[hooks]]`) |
 
 Without `XDG_*` set these fall back to `~/.local/share` and `~/.local/state`. Both roots are
 created `0700`.
 
 Hooks are written into each agent's own configuration, and nowhere else:
 `~/.claude/settings.json`, `~/.codex/hooks.json`,
-`$OPENCODE_CONFIG_DIR/plugins/hooklinesinker-opencode.ts`, and
-`$PI_CODING_AGENT_DIR/extensions/hooklinesinker-pi.ts`. Entries this tool wrote carry a generated
-marker, so an install reconciles its own group and leaves everyone else's alone.
+`$OPENCODE_CONFIG_DIR/plugins/hooklinesinker-opencode.ts`,
+`$PI_CODING_AGENT_DIR/extensions/hooklinesinker-pi.ts`, `~/.factory/hooks.json`,
+`$QWEN_HOME/settings.json`, and `$KIMI_CODE_HOME/config.toml`. Entries this tool wrote carry a
+generated marker (or, for Kimi's strict `[[hooks]]` schema, an exact canonical `command` match),
+so an install reconciles its own group and leaves everyone else's alone.
+
+Kimi's hook events (`TurnStarted`, `SessionHeartbeat`, etc.) require Kimi Code CLI **0.32.0** or
+later; `hooks install --agent kimi` writes hooks regardless, but they only fire on a new-enough
+CLI.
 
 Codex's `config.toml` — including its `trusted_hash` machinery — is **not** touched. Trusting a
 hook is the host application's business.

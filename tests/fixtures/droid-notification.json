@@ -1,0 +1,8 @@
+{
+  "session_id": "droid-session",
+  "transcript_path": "/Users/example/.factory/sessions/droid-session.jsonl",
+  "cwd": "/Users/example/project",
+  "permission_mode": "default",
+  "hook_event_name": "Notification",
+  "notification_type": "permission_prompt"
+}

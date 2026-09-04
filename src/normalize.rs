@@ -23,6 +23,7 @@ struct NativeEvent {
     transcript_path: Option<String>,
     tool_name: Option<String>,
     cwd: Option<String>,
+    notification_type: Option<String>,
 }
 
 enum MappedAction {
@@ -31,7 +32,12 @@ enum MappedAction {
     Ignore,
 }
 
-fn map_event(agent: Agent, event: &str, tool_name: Option<&str>) -> MappedAction {
+fn map_event(
+    agent: Agent,
+    event: &str,
+    tool_name: Option<&str>,
+    notification_type: Option<&str>,
+) -> MappedAction {
     use MappedAction::{Ignore, Remove, Update};
     match agent {
         Agent::Claude => match event {
@@ -75,6 +81,43 @@ fn map_event(agent: Agent, event: &str, tool_name: Option<&str>) -> MappedAction
             "session.deleted" | "server.instance.disposed" => Remove,
             _ => Ignore,
         },
+        Agent::Droid => match event {
+            "SessionStart" | "Stop" => Update(Phase::Idle),
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Update(Phase::Working),
+            "Notification" => match notification_type {
+                Some("permission_prompt") | Some("elicitation_dialog") => Update(Phase::Permission),
+                Some("idle_prompt") => Update(Phase::Idle),
+                _ => Ignore,
+            },
+            "PreCompact" => Update(Phase::Compacting),
+            "SessionEnd" => Remove,
+            "SubagentStop" => Ignore,
+            _ => Ignore,
+        },
+        Agent::Qwen => match event {
+            "SessionStart" | "Stop" | "StopFailure" => Update(Phase::Idle),
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+            | "PermissionDenied" | "PostCompact" => Update(Phase::Working),
+            "PermissionRequest" => Update(Phase::Permission),
+            "Notification" => match notification_type {
+                Some("permission_prompt") => Update(Phase::Permission),
+                Some("idle_prompt") => Update(Phase::Idle),
+                _ => Ignore,
+            },
+            "PreCompact" => Update(Phase::Compacting),
+            "SessionEnd" => Remove,
+            "SessionDelete" => Ignore,
+            _ => Ignore,
+        },
+        Agent::Kimi => match event {
+            "SessionStart" | "Stop" | "StopFailure" | "Interrupt" => Update(Phase::Idle),
+            "TurnStarted" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
+            | "PostToolUseFailure" | "PermissionResult" | "PostCompact" => Update(Phase::Working),
+            "PermissionRequest" => Update(Phase::Permission),
+            "PreCompact" => Update(Phase::Compacting),
+            "SessionEnd" => Remove,
+            _ => Ignore,
+        },
     }
 }
 
@@ -96,7 +139,12 @@ pub fn normalize(
         )
     })?;
 
-    let (phase, running) = match map_event(agent, event, native.tool_name.as_deref()) {
+    let (phase, running) = match map_event(
+        agent,
+        event,
+        native.tool_name.as_deref(),
+        native.notification_type.as_deref(),
+    ) {
         MappedAction::Ignore => return Ok(None),
         MappedAction::Update(phase) => (phase, true),
         MappedAction::Remove => (Phase::Idle, false),
@@ -137,6 +185,9 @@ fn agent_wire_name(agent: Agent) -> &'static str {
         Agent::Codex => "codex",
         Agent::Opencode => "opencode",
         Agent::Pi => "pi",
+        Agent::Droid => "droid",
+        Agent::Qwen => "qwen",
+        Agent::Kimi => "kimi",
     }
 }
 

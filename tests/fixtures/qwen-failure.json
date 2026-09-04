@@ -1,0 +1,7 @@
+{
+  "session_id": "qwen-session",
+  "transcript_path": "/Users/example/.qwen/sessions/qwen-session.jsonl",
+  "cwd": "/Users/example/project",
+  "hook_event_name": "PostToolUseFailure",
+  "timestamp": "2026-09-04T00:00:00Z"
+}
