@@ -2,19 +2,47 @@ import { spawn } from "node:child_process";
 
 const HOOKLINESINKER_BIN = "__HOOKLINESINKER_BIN__";
 
+const HOOK_TIMEOUT_MS = 2000;
+
 function runHook(event: string, sessionId?: string): Promise<void> {
   return new Promise((resolve) => {
-    const native: Record<string, string> = {};
-    if (sessionId) native.session_id = sessionId;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
 
-    const child = spawn(
-      HOOKLINESINKER_BIN,
-      ["ingest", "--agent", "pi", "--event", event],
-      { stdio: ["pipe", "ignore", "ignore"] }
-    );
-    child.on("error", () => resolve());
-    child.on("close", () => resolve());
-    child.stdin.end(JSON.stringify(native));
+    try {
+      const child = spawn(
+        HOOKLINESINKER_BIN,
+        ["ingest", "--agent", "pi", "--event", event],
+        { stdio: ["pipe", "ignore", "ignore"] }
+      );
+
+      const timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          // already exited
+        }
+        finish();
+      }, HOOK_TIMEOUT_MS);
+      timer.unref?.();
+
+      child.on("error", finish);
+      child.on("close", () => {
+        clearTimeout(timer);
+        finish();
+      });
+      child.stdin.on("error", () => {});
+
+      const native: Record<string, string> = {};
+      if (sessionId) native.session_id = sessionId;
+      child.stdin.end(JSON.stringify(native));
+    } catch {
+      finish();
+    }
   });
 }
 

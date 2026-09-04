@@ -13,20 +13,48 @@ const TRACKED_EVENTS = new Set([
   "server.instance.disposed",
 ]);
 
+const HOOK_TIMEOUT_MS = 2000;
+
 function runHook(event: string, sessionId?: string, cwd?: string): Promise<void> {
   return new Promise((resolve) => {
-    const native: Record<string, string> = {};
-    if (sessionId) native.session_id = sessionId;
-    if (cwd) native.cwd = cwd;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
 
-    const child = spawn(
-      HOOKLINESINKER_BIN,
-      ["ingest", "--agent", "opencode", "--event", event],
-      { stdio: ["pipe", "ignore", "ignore"] }
-    );
-    child.on("error", () => resolve());
-    child.on("close", () => resolve());
-    child.stdin.end(JSON.stringify(native));
+    try {
+      const child = spawn(
+        HOOKLINESINKER_BIN,
+        ["ingest", "--agent", "opencode", "--event", event],
+        { stdio: ["pipe", "ignore", "ignore"] }
+      );
+
+      const timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          // already exited
+        }
+        finish();
+      }, HOOK_TIMEOUT_MS);
+      timer.unref?.();
+
+      child.on("error", finish);
+      child.on("close", () => {
+        clearTimeout(timer);
+        finish();
+      });
+      child.stdin.on("error", () => {});
+
+      const native: Record<string, string> = {};
+      if (sessionId) native.session_id = sessionId;
+      if (cwd) native.cwd = cwd;
+      child.stdin.end(JSON.stringify(native));
+    } catch {
+      finish();
+    }
   });
 }
 

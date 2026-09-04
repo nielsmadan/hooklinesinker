@@ -335,6 +335,16 @@ impl HookManager {
             }
         };
 
+        if managed_event_shape_is_unsupported(&hooks, events) {
+            root.insert("hooks".to_string(), Value::Object(hooks));
+            return Ok(HookStatus {
+                agent,
+                state: HookState::Unsupported,
+                path: path.to_path_buf(),
+                entries: Vec::new(),
+            });
+        }
+
         let keys: Vec<String> = hooks.keys().cloned().collect();
         for key in &keys {
             if let Some(Value::Array(arr)) = hooks.get(key) {
@@ -353,7 +363,7 @@ impl HookManager {
                 .remove(spec.name)
                 .unwrap_or_else(|| Value::Array(Vec::new()));
             let Value::Array(arr) = existing else {
-                continue;
+                unreachable!("non-array managed event values are rejected above");
             };
             let mut filtered: Vec<Value> = arr
                 .into_iter()
@@ -421,6 +431,15 @@ impl HookManager {
                 });
             }
         };
+
+        if managed_event_shape_is_unsupported(hooks, events) {
+            return Ok(HookStatus {
+                agent,
+                state: HookState::Unsupported,
+                path: path.to_path_buf(),
+                entries: Vec::new(),
+            });
+        }
 
         let mut entries = Vec::new();
         let mut installed_events: HashSet<&str> = HashSet::new();
@@ -600,6 +619,12 @@ fn group_is_legacy(group: &Value) -> bool {
     group_handler_commands(group)
         .iter()
         .any(|c| is_legacy_command(c))
+}
+
+fn managed_event_shape_is_unsupported(hooks: &Map<String, Value>, events: &[EventSpec]) -> bool {
+    events.iter().any(
+        |spec| matches!(hooks.get(spec.name), Some(value) if !matches!(value, Value::Array(_))),
+    )
 }
 
 fn classify_group(group: &Value, canonical: &str, agent: Agent, event: &str) -> GroupOwnership {
@@ -869,6 +894,70 @@ mod tests {
         assert_eq!(install_result.state, HookState::Unsupported);
         let untouched = fs::read_to_string(&settings_path).unwrap();
         assert_eq!(untouched, r#"{"hooks": "not an object"}"#);
+    }
+
+    #[test]
+    fn claude_install_never_drops_a_non_array_value_under_a_managed_event_key() {
+        let (manager, base) = manager();
+        let settings_path = base.join("claude").join("settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": {"unexpected": "shape"},
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.claude/hooks/user/lint.sh PreToolUse", "timeout": 5}]}
+                ]
+            }
+        })
+        .to_string();
+        fs::write(&settings_path, &original).unwrap();
+
+        let result = manager.install(Agent::Claude).unwrap();
+        assert_eq!(result.state, HookState::Unsupported);
+        assert_eq!(
+            fs::read_to_string(&settings_path).unwrap(),
+            original,
+            "a non-array value under a managed event key must block every write, not just that key"
+        );
+    }
+
+    #[test]
+    fn claude_uninstall_never_drops_a_non_array_value_under_a_managed_event_key() {
+        let (manager, base) = manager();
+        let settings_path = base.join("claude").join("settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": {"unexpected": "shape"}
+            }
+        })
+        .to_string();
+        fs::write(&settings_path, &original).unwrap();
+
+        let result = manager.uninstall(Agent::Claude).unwrap();
+        assert_eq!(result.state, HookState::Unsupported);
+        assert_eq!(
+            fs::read_to_string(&settings_path).unwrap(),
+            original,
+            "uninstall must never silently drop foreign-shaped data either"
+        );
+    }
+
+    #[test]
+    fn claude_status_reports_unsupported_for_a_non_array_value_under_a_managed_event_key() {
+        let (manager, base) = manager();
+        let settings_path = base.join("claude").join("settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::json!({"hooks": {"SessionStart": {"unexpected": "shape"}}}).to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.status(Agent::Claude).unwrap().state,
+            HookState::Unsupported
+        );
     }
 
     #[test]
