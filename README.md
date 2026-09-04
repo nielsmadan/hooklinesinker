@@ -83,6 +83,11 @@ decodes as `unknown` rather than failing the record.
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which additionally separates two terminals driving the same native session.
 
+`sessions --json` and `doctor` never mutate the ledger. A record whose process is gone is
+filtered out of both, and removed by the next `ingest`, which fans out one `running:false`
+event as it goes — so a poll landing between the kill and the next hook event cannot swallow
+that notification.
+
 `problems` is never dropped on the floor: a consumer that cannot answer must say so rather than
 report an empty, healthy-looking result.
 
@@ -144,8 +149,8 @@ hooklinesinker consumers --json
 ```
 
 `doctor` exits nonzero on a real fault (unparseable records, drifted or unsupported hooks, a
-state root with the wrong permissions) and zero otherwise. It also sweeps records whose process
-is gone.
+state root with the wrong permissions) and zero otherwise. Its `dead_records` check counts
+records whose process is gone; it does not remove them.
 
 ## Development
 

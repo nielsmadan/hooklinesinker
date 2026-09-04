@@ -82,28 +82,32 @@ impl StatusStore {
         Ok(out)
     }
 
+    // Reads never delete: only ingest's sweep removes a dead binding, so it can
+    // always fan the synthetic running:false event out to sinks.
     pub fn running(&self, liveness: &dyn ProcessLookup) -> io::Result<Vec<StatusEvent>> {
         let _guard = self.lock()?;
-        let mut alive = Vec::new();
-        for (path, event) in self.read_all()? {
-            match &event.process {
-                Some(identity) if liveness.is_alive(identity) => alive.push(event),
-                Some(_) => {
-                    fs::remove_file(&path)?;
-                }
-                None => {}
-            }
-        }
-        Ok(alive)
+        Ok(self
+            .read_all()?
+            .into_iter()
+            .filter(|(_, event)| is_live(event, liveness))
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    pub fn dead_records(&self, liveness: &dyn ProcessLookup) -> io::Result<usize> {
+        let _guard = self.lock()?;
+        Ok(self
+            .read_all()?
+            .iter()
+            .filter(|(_, event)| is_dead(event, liveness))
+            .count())
     }
 
     pub fn sweep(&self, liveness: &dyn ProcessLookup) -> io::Result<Vec<StatusEvent>> {
         let _guard = self.lock()?;
         let mut swept = Vec::new();
         for (path, mut event) in self.read_all()? {
-            if let Some(identity) = &event.process
-                && !liveness.is_alive(identity)
-            {
+            if is_dead(&event, liveness) {
                 fs::remove_file(&path)?;
                 event.running = false;
                 swept.push(event);
@@ -194,6 +198,22 @@ impl StatusStore {
 pub struct SessionsEnvelope {
     pub sessions: Vec<StatusEvent>,
     pub problems: Vec<HealthProblem>,
+}
+
+// A record without a process identity is unverifiable: neither live nor dead,
+// so no read reports it and no sweep removes it.
+fn is_live(event: &StatusEvent, liveness: &dyn ProcessLookup) -> bool {
+    event
+        .process
+        .as_ref()
+        .is_some_and(|identity| liveness.is_alive(identity))
+}
+
+fn is_dead(event: &StatusEvent, liveness: &dyn ProcessLookup) -> bool {
+    event
+        .process
+        .as_ref()
+        .is_some_and(|identity| !liveness.is_alive(identity))
 }
 
 pub(crate) struct LockGuard {

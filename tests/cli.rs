@@ -371,7 +371,7 @@ fn doctor_json_reports_ok_for_a_fresh_state_dir() {
             "consumer_parse_problems",
             "hook_status",
             "status_parse_problems",
-            "dead_records_removed",
+            "dead_records",
             "last_sink_error",
         ]
     );
@@ -462,6 +462,70 @@ fn doctor_fails_when_a_status_record_is_unparseable() {
         .find(|c| c["name"] == "status_parse_problems")
         .unwrap();
     assert_eq!(status_check["ok"], false);
+}
+
+fn dead_ledger_record(session_id: &str) -> String {
+    serde_json::json!({
+        "protocol": 1,
+        "bindingId": session_id,
+        "agent": "claude",
+        "event": "SessionStart",
+        "phase": "idle",
+        "running": true,
+        "observedAt": "2026-09-04T00:00:00Z",
+        "session": {"id": session_id, "cwd": "/tmp", "transcriptPath": null},
+        "process": {"pid": u32::MAX, "startedAt": "1970-01-01T00:00:00Z", "host": "test-host"},
+        "terminal": null,
+        "tmux": null,
+        "git": null,
+        "remoteHost": null,
+    })
+    .to_string()
+}
+
+#[test]
+fn doctor_counts_a_dead_record_without_removing_it() {
+    let temp = unique_temp_dir("doctor-dead-record");
+    let status_dir = temp.join("hooklinesinker/status");
+    std::fs::create_dir_all(&status_dir).unwrap();
+    let record_path = status_dir.join("dead.json");
+    std::fs::write(&record_path, dead_ledger_record("dead-session")).unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["exitCode"], 0);
+    let checks = value["checks"].as_array().unwrap();
+    let dead_records = checks.iter().find(|c| c["name"] == "dead_records").unwrap();
+    assert_eq!(dead_records["ok"], true);
+    assert_eq!(dead_records["detail"], "1");
+    assert!(
+        record_path.exists(),
+        "doctor must leave the dead record for ingest to sweep and fan out"
+    );
+}
+
+#[test]
+fn sessions_json_omits_a_dead_record_without_removing_it() {
+    let temp = unique_temp_dir("sessions-dead-record");
+    let status_dir = temp.join("hooklinesinker/status");
+    std::fs::create_dir_all(&status_dir).unwrap();
+    let record_path = status_dir.join("dead.json");
+    std::fs::write(&record_path, dead_ledger_record("dead-session")).unwrap();
+
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .env("XDG_STATE_HOME", &temp)
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["sessions"], serde_json::json!([]));
+    assert!(record_path.exists());
 }
 
 #[test]

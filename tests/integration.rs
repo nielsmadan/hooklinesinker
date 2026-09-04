@@ -32,6 +32,17 @@ fn store() -> StatusStore {
     StatusStore::open(temp_home()).unwrap()
 }
 
+fn ledger_files(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root.join("status"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn consumer_store() -> ConsumerStore {
     ConsumerStore::open(temp_home()).unwrap()
 }
@@ -480,12 +491,19 @@ fn concurrent_writes_to_the_same_binding_never_produce_a_torn_file() {
 }
 
 #[test]
-fn running_excludes_and_removes_dead_bindings() {
-    let store = store();
+fn running_excludes_dead_bindings_without_deleting_them() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
     store.record(&status("dead-session", 301, 31)).unwrap();
     let liveness = FakeProcessLookup::new();
+
     assert!(store.running(&liveness).unwrap().is_empty());
-    assert!(store.running(&all_alive()).unwrap().is_empty());
+    assert_eq!(store.dead_records(&liveness).unwrap(), 1);
+    assert_eq!(
+        ledger_files(&root),
+        1,
+        "a read must leave the dead binding on disk for ingest to sweep and fan out"
+    );
 }
 
 #[test]
@@ -526,13 +544,16 @@ fn pid_reuse_is_treated_as_a_dead_binding() {
 
 #[test]
 fn records_without_process_identity_are_diagnostics_not_running() {
-    let store = store();
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
     let mut event = status("orphan-session", 500, 50);
     event.process = None;
     store.record(&event).unwrap();
     assert!(store.running(&all_alive()).unwrap().is_empty());
+    assert_eq!(store.dead_records(&all_alive()).unwrap(), 0);
     assert!(store.sweep(&all_alive()).unwrap().is_empty());
     assert!(store.running(&all_alive()).unwrap().is_empty());
+    assert_eq!(ledger_files(&root), 1);
 }
 
 #[test]
@@ -836,33 +857,43 @@ fn a_populated_environment_lands_on_the_normalized_status_event() {
     assert_eq!(event.remote_host.as_deref(), Some("alice@build"));
 }
 
+#[cfg(unix)]
 #[test]
-fn sessions_envelope_reports_a_problem_when_a_dead_record_cannot_be_removed() {
+fn sessions_envelope_reports_a_problem_when_records_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt;
     let root = temp_home();
     let store = StatusStore::open(root.clone()).unwrap();
-    store.record(&status("stuck-session", 999, 99)).unwrap();
+    store
+        .record(&status("unreadable-session", 999, 99))
+        .unwrap();
 
     let status_dir = root.join("status");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-    }
+    std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let liveness = FakeProcessLookup::new();
     let envelope = store.sessions_envelope(&liveness);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     assert!(envelope.sessions.is_empty());
     assert!(
         !envelope.problems.is_empty(),
-        "expected a diagnostic when a dead record could not be removed"
+        "expected a diagnostic when the ledger could not be read"
     );
+}
+
+#[test]
+fn sessions_envelope_omits_a_dead_binding_but_leaves_it_for_the_sweep() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    store.record(&status("polled-session", 998, 98)).unwrap();
+
+    let liveness = FakeProcessLookup::new();
+    let envelope = store.sessions_envelope(&liveness);
+
+    assert!(envelope.sessions.is_empty());
+    assert!(envelope.problems.is_empty());
+    assert_eq!(ledger_files(&root), 1);
 }
 
 #[test]
@@ -999,6 +1030,75 @@ fn a_dead_binding_swept_during_an_unrelated_ingest_produces_a_running_false_post
         .iter()
         .find(|b| b["session"]["id"] == "dying-session" && b["event"] == "swept")
         .expect("expected a synthetic swept POST for the dead binding");
+    assert_eq!(swept_body["running"], false);
+}
+
+#[test]
+fn a_read_between_the_kill_and_the_next_ingest_still_lets_the_sweep_fan_out() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let consumers = consumer_store();
+    consumers
+        .register(consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+
+    let dying_process = ProcessIdentity {
+        pid: 730,
+        started_at: "75".into(),
+        host: "host-a".into(),
+    };
+    let dying_liveness = FakeProcessLookup::with_owner(dying_process);
+    dying_liveness.set_alive(730, "75");
+    ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &dying_liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        },
+        Agent::Claude,
+        "SessionStart",
+        r#"{"session_id":"killed-session"}"#,
+        730,
+    );
+
+    let other_process = ProcessIdentity {
+        pid: 731,
+        started_at: "76".into(),
+        host: "host-a".into(),
+    };
+    let other_liveness = FakeProcessLookup::with_owner(other_process);
+    other_liveness.set_alive(731, "76");
+    // The `sessions --json` / `doctor` poll that lands between the kill and the
+    // next hook event: it must not consume the dead binding.
+    let envelope = store.sessions_envelope(&other_liveness);
+    assert!(envelope.sessions.is_empty());
+    assert_eq!(store.dead_records(&other_liveness).unwrap(), 1);
+    assert_eq!(ledger_files(&root), 1);
+
+    ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &other_liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        },
+        Agent::Codex,
+        "SessionStart",
+        r#"{"session_id":"surviving-session"}"#,
+        731,
+    );
+
+    let swept_body = client
+        .bodies()
+        .into_iter()
+        .find(|b| b["session"]["id"] == "killed-session" && b["event"] == "swept")
+        .expect("the poll must not swallow the swept binding's running:false fan-out");
     assert_eq!(swept_body["running"], false);
 }
 

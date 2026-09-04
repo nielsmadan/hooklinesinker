@@ -400,21 +400,24 @@ fn run_doctor(json: bool) {
     match &status_store {
         Ok(store) => {
             let liveness = SystemProcessLookup::new();
-            match store.sweep(&liveness) {
-                Ok(swept) => checks.push(DoctorCheck {
-                    name: "dead_records_removed",
+            match store.dead_records(&liveness) {
+                Ok(count) => checks.push(DoctorCheck {
+                    name: "dead_records",
                     ok: true,
-                    detail: swept.len().to_string(),
+                    detail: count.to_string(),
                 }),
-                Err(e) => checks.push(DoctorCheck {
-                    name: "dead_records_removed",
-                    ok: true,
-                    detail: format!("sweep failed: {e}"),
-                }),
+                Err(e) => {
+                    fatal = true;
+                    checks.push(DoctorCheck {
+                        name: "dead_records",
+                        ok: false,
+                        detail: format!("failed to count dead records: {e}"),
+                    });
+                }
             }
         }
         Err(_) => checks.push(DoctorCheck {
-            name: "dead_records_removed",
+            name: "dead_records",
             ok: true,
             detail: "unavailable".to_string(),
         }),

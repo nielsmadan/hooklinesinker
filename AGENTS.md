@@ -38,6 +38,10 @@ optional fields are safe; anything else needs a protocol bump and both consumers
 - **Reconcile, never overwrite.** Installers rewrite only the group carrying this tool's
   generated marker, and preserve foreign entries and unknown shapes verbatim
   (`HookState::Unsupported` exists so an unfamiliar config is left alone rather than rewritten).
+- **Only `ingest` deletes from the ledger.** `running()`, `sessions --json` and `doctor`
+  filter dead bindings out of their results but leave the files alone; the sweep inside
+  `ingest` removes them and fans out the `running:false` event push consumers depend on. A
+  read that deleted would swallow that event, and Juggler has no re-hydration timer.
 - **State is private.** `$XDG_STATE_HOME/hooklinesinker` is read through the CLI's JSON
   commands, never by a consumer opening files. Keep the JSON envelopes stable and complete —
   in particular, `problems` must reach the caller rather than being swallowed.
