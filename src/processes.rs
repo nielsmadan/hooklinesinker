@@ -57,17 +57,19 @@ impl SystemProcessLookup {
     }
 
     // Kimi's own CLI renames its process via `process.title = "kimi-code"` at
-    // startup (confirmed from the shipped @moonshot-ai/kimi-code bundle), so the
-    // OS-visible name is "kimi-code" rather than the "kimi" command users type.
-    fn expected_executable(agent: Agent) -> &'static str {
+    // startup (confirmed from the shipped @moonshot-ai/kimi-code bundle), but
+    // that rename reaching sysinfo's name()/cmd() has not been verified
+    // against a live process on either documented install path (npm shim,
+    // curl-installed native binary — both named "kimi"), so accept both.
+    fn expected_executables(agent: Agent) -> &'static [&'static str] {
         match agent {
-            Agent::Claude => "claude",
-            Agent::Codex => "codex",
-            Agent::Opencode => "opencode",
-            Agent::Pi => "pi",
-            Agent::Droid => "droid",
-            Agent::Qwen => "qwen",
-            Agent::Kimi => "kimi-code",
+            Agent::Claude => &["claude"],
+            Agent::Codex => &["codex"],
+            Agent::Opencode => &["opencode"],
+            Agent::Pi => &["pi"],
+            Agent::Droid => &["droid"],
+            Agent::Qwen => &["qwen"],
+            Agent::Kimi => &["kimi", "kimi-code"],
         }
     }
 }
@@ -83,8 +85,8 @@ fn is_script_runtime(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "node" | "bun" | "deno")
 }
 
-fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &str) -> bool {
-    if name.eq_ignore_ascii_case(expected) {
+fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &[&str]) -> bool {
+    if expected.iter().any(|e| name.eq_ignore_ascii_case(e)) {
         return true;
     }
     if !is_script_runtime(name) {
@@ -94,7 +96,7 @@ fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &str) -> 
         Path::new(arg)
             .file_name()
             .map(|f| f.to_string_lossy())
-            .is_some_and(|f| f.eq_ignore_ascii_case(expected))
+            .is_some_and(|f| expected.iter().any(|e| f.eq_ignore_ascii_case(e)))
     })
 }
 
@@ -106,7 +108,7 @@ impl Default for SystemProcessLookup {
 
 impl ProcessLookup for SystemProcessLookup {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity> {
-        let expected = Self::expected_executable(agent);
+        let expected = Self::expected_executables(agent);
         let mut current = Some(Pid::from(hook_pid as usize));
         let mut depth = 0;
         while let Some(pid) = current {
@@ -155,26 +157,47 @@ mod tests {
 
     #[test]
     fn exact_process_name_matches_without_inspecting_argv() {
-        assert!(is_owning_process("droid", &[], "droid"));
-        assert!(is_owning_process("kimi-code", &[], "kimi-code"));
+        assert!(is_owning_process("droid", &[], &["droid"]));
+        assert!(is_owning_process("kimi-code", &[], &["kimi-code"]));
+    }
+
+    #[test]
+    fn kimi_matches_both_the_documented_command_name_and_its_renamed_title() {
+        // The curl-installed native binary and the npm shim are both
+        // documented as "kimi"; process.title = "kimi-code" is only
+        // confirmed for the shipped JS bundle's main() path, never verified
+        // against a live process. Matching "kimi-code" alone would make
+        // every Kimi session permanently unverifiable if that rename does
+        // not reach sysinfo's name()/cmd() on some install path.
+        let candidates = SystemProcessLookup::expected_executables(Agent::Kimi);
+        assert!(is_owning_process("kimi", &[], candidates));
+        assert!(is_owning_process("kimi-code", &[], candidates));
+        assert!(!is_owning_process("kimi-cli", &[], candidates));
+    }
+
+    #[test]
+    fn kimi_node_shim_matches_by_the_documented_kimi_argv_basename() {
+        let candidates = SystemProcessLookup::expected_executables(Agent::Kimi);
+        let argv = os_string_argv(&["node", "/usr/local/bin/kimi"]);
+        assert!(is_owning_process("node", &argv, candidates));
     }
 
     #[test]
     fn node_shim_matches_by_the_invoked_scripts_file_name() {
         let argv = os_string_argv(&["node", "/usr/local/bin/qwen", "--flag"]);
-        assert!(is_owning_process("node", &argv, "qwen"));
+        assert!(is_owning_process("node", &argv, &["qwen"]));
     }
 
     #[test]
     fn node_process_without_a_matching_argv_entry_does_not_match() {
         let argv = os_string_argv(&["node", "/usr/local/bin/some-other-cli"]);
-        assert!(!is_owning_process("node", &argv, "qwen"));
+        assert!(!is_owning_process("node", &argv, &["qwen"]));
     }
 
     #[test]
     fn a_non_runtime_process_never_matches_via_the_argv_fallback() {
         let argv = os_string_argv(&["bash", "-c", "qwen"]);
-        assert!(!is_owning_process("bash", &argv, "qwen"));
+        assert!(!is_owning_process("bash", &argv, &["qwen"]));
     }
 
     #[test]
