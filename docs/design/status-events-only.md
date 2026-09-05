@@ -27,7 +27,7 @@ change is mechanism that exists, not mechanism to invent.
 
 With no resident process there is nowhere to hold events. Either they are persisted — which for
 raw events collides with the privacy boundary (raw native input is never persisted, logged, or
-forwarded, enforced structurally today: extraction reads a four-field allowlist and tool
+forwarded, enforced structurally today: extraction reads a five-field allowlist and tool
 payloads never materialize in memory) — or they are relayed synchronously to sinks with a 200 ms
 budget and no retry, and loss is accepted.
 
