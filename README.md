@@ -191,6 +191,10 @@ Kimi's hook events (`TurnStarted`, `SessionHeartbeat`, etc.) require Kimi Code C
 later; `hooks install --agent kimi` writes hooks regardless, but they only fire on a new-enough
 CLI.
 
+Droid reads its hooks at startup, so a `droid` session that was already running when the hooks
+were installed will not report anything until it is restarted (it warns about the change in its
+`/hooks` UI).
+
 Codex's `config.toml` (including its `trusted_hash` machinery) is **not** touched. Trusting a
 hook is the host application's business.
 
