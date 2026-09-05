@@ -4,14 +4,14 @@ I am working on an app ([Juggler](https://github.com/nielsmadan/juggler)) and a 
 ([ringleader](https://github.com/nielsmadan/ringleader)) that both consume agent status hook
 events for multiple agents. I did not want to register both the app and the CLI in every hook
 config of every agent. Every problem can be solved with another layer of abstraction, so I built
-this little plumbing CLI tool. Hook events from any supported agent — Claude Code, Codex,
-OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI — get sent to hooklinesinker, which keeps
+this little plumbing CLI tool. Hook events from any supported agent (Claude Code, Codex,
+OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI) get sent to hooklinesinker, which keeps
 its own queryable state on session status and forwards normalized events. Other apps can register
 with hooklinesinker to receive the forwarded events.
 
 This is just a little piece of plumbing, but if you're building anything that needs agent status
 hook events, it might save you some time. It can be installed standalone or integrated into your
-own app — see [Integrating](#integrating).
+own app; see [Integrating](#integrating).
 
 In the future it might support more than status events
 ([why only status events for now](docs/design/status-events-only.md)). Let me know if you have a
@@ -89,18 +89,18 @@ envelope whose `protocol` is not one they speak, and skip individual records who
 ```
 
 Keys are camelCase. `agent` is kebab-case (`claude`, `codex`, `opencode`, `pi`, `droid`, `qwen`,
-`kimi`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`) — an
+`kimi`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`); an
 unrecognized phase decodes as `unknown` rather than failing the record.
 
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
-`bindingId`, which additionally separates two terminals driving the same native session.
+`bindingId`, which also separates two terminals driving the same native session.
 
 An event whose `session.id` is empty (an agent announcing itself before its session id exists)
 is delivered to sinks but never stored, so it can never appear in `sessions --json`.
 
 `sessions --json` and `doctor` never mutate the ledger. A record whose process is gone is
 filtered out of both, and removed by the next `ingest`, which fans out one `running:false`
-event as it goes — so a poll landing between the kill and the next hook event cannot swallow
+event as it goes, so a poll landing between the kill and the next hook event cannot swallow
 that notification.
 
 `problems` is never dropped on the floor: a consumer that cannot answer must say so rather than
@@ -122,8 +122,8 @@ Do not register a sink; ask when you care.
 1. Locate or ship the binary (see *Bundling* below) and run
    `hooklinesinker install --consumer yourname` once (`yourname` must start with a lowercase
    letter or digit, and contain only lowercase letters, digits, `_` or `-`). It is idempotent
-   and cooperative — safe to run on every startup.
-2. Run `hooklinesinker hooks install --agent <agent>` for the agents your users approve — it
+   and cooperative, so running it on every startup is safe.
+2. Run `hooklinesinker hooks install --agent <agent>` for the agents your users approve. It
    edits their agent config, so ask first.
 3. When you need state, run `hooklinesinker sessions --json` and parse the envelope: refuse a
    `protocol` you do not speak, skip records you do not understand, key on `(agent, session.id)`
@@ -136,7 +136,7 @@ This is ringleader's model (`ringleader/presence.py`).
 Register a sink and receive every event as it happens.
 
 1. Start a localhost HTTP server. Each event arrives as one `POST` with a `StatusEvent` JSON
-   body. Answer 2xx fast — the sender's budget is 200 ms and it never retries; do your real work
+   body. Answer 2xx fast: the sender's budget is 200 ms and it never retries. Do your real work
    after responding.
 2. Register: `hooklinesinker install --consumer yourname --sink http://127.0.0.1:PORT/hook`.
 3. Hydrate: after your server is listening, run `sessions --json` once, applying the same
@@ -157,9 +157,9 @@ This is Juggler's model (`juggler/Services/HooklinesinkerClient.swift`, `HookSer
 - **Tauri / Rust**: ship it as a sidecar (`externalBin`) or spawn via `std::process::Command`;
   any small HTTP listener works for the sink.
 - **Native macOS (Swift)**: bundle as an auxiliary executable under `Contents/MacOS`, spawn via
-  `Process` with argument arrays, and mind code signing/notarization if you distribute — the
+  `Process` with argument arrays, and mind code signing/notarization if you distribute: the
   nested binary is signed as part of your app. Juggler is the worked example.
-- **Everywhere**: talk to it only through its CLI JSON — never read the state files directly —
+- **Everywhere**: talk to it only through its CLI JSON (never read the state files directly),
   and verify a downloaded release artifact against `SHA256SUMS` before executing it.
 
 ## Paths
@@ -184,14 +184,14 @@ Hooks are written into each agent's own configuration, and nowhere else:
 `$PI_CODING_AGENT_DIR/extensions/hooklinesinker-pi.ts`, `~/.factory/hooks.json`,
 `$QWEN_HOME/settings.json`, and `$KIMI_CODE_HOME/config.toml`. Entries this tool wrote are
 identified by their exact canonical `command` (and the generated OpenCode/Pi plugin files
-additionally carry an ownership marker), so an install reconciles its own entries and leaves
+also carry an ownership marker), so an install reconciles its own entries and leaves
 everyone else's alone.
 
 Kimi's hook events (`TurnStarted`, `SessionHeartbeat`, etc.) require Kimi Code CLI **0.32.0** or
 later; `hooks install --agent kimi` writes hooks regardless, but they only fire on a new-enough
 CLI.
 
-Codex's `config.toml` — including its `trusted_hash` machinery — is **not** touched. Trusting a
+Codex's `config.toml` (including its `trusted_hash` machinery) is **not** touched. Trusting a
 hook is the host application's business.
 
 ## Consumer ownership
@@ -212,7 +212,7 @@ leaves.
 ## The privacy boundary
 
 The state above is private to this binary. Consumers read it **only** through the CLI's JSON
-commands — never by opening the files — so the protocol is the whole contract and the on-disk
+commands, never by opening the files, so the protocol is the whole contract and the on-disk
 shape stays free to change. Nothing is sent anywhere except to a sink URL a consumer explicitly
 registered.
 
