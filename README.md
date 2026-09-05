@@ -1,12 +1,23 @@
 # hooklinesinker
 
-One binary that owns the status hooks for Claude Code, Codex, OpenCode, Pi, Factory Droid, Qwen
-Code and Kimi Code CLI, keeps a ledger of which agent sessions are live right now, and hands that
-answer to every tool that asks.
+I am working on an app ([Juggler](https://github.com/nielsmadan/juggler)) and a CLI
+([ringleader](https://github.com/nielsmadan/ringleader)) that both consume agent status hook
+events for multiple agents. I did not want to register both the app and the CLI in every hook
+config of every agent. Every problem can be solved with another layer of abstraction, so I built
+this little plumbing CLI tool. Hook events from any supported agent — Claude Code, Codex,
+OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI — get sent to hooklinesinker, which keeps
+its own queryable state on session status and forwards normalized events. Other apps can register
+with hooklinesinker to receive the forwarded events.
 
-Before this existed, each tool that wanted to know "is this session still running?" shipped its
-own copy of four hook scripts and fought the others for the same config files. Here the hooks are
-installed once, the ledger is written once, and tools register as **consumers** of it.
+This is just a little piece of plumbing, but if you're building anything that needs agent status
+hook events, it might save you some time. It can be installed standalone or integrated into your
+own app — see [Integrating](#integrating).
+
+In the future it might support more than status events
+([why only status events for now](docs/design/status-events-only.md)). Let me know if you have a
+use case and which events you would be interested in.
+
+Today's consumers:
 
 - **[Juggler](https://github.com/nielsmadan/juggler)** bundles it and subscribes to a sink.
 - **[ringleader](https://github.com/nielsmadan/ringleader)** bundles it and polls `sessions --json`.
@@ -99,6 +110,56 @@ report an empty, healthy-looking result.
 as it happens, instead of polling. Sink failures are recorded as problems, never retried into a
 hang, and never block the hook.
 
+## Integrating
+
+Two models, matching the two consumers above. Runnable, integration-tested examples live in
+[`examples/`](examples/).
+
+### Pull — CLIs, scripts, anything short-lived
+
+Do not register a sink; ask when you care.
+
+1. Locate or ship the binary (see *Bundling* below) and run
+   `hooklinesinker install --consumer yourname` once. It is idempotent and cooperative — safe to
+   run on every startup.
+2. Run `hooklinesinker hooks install --agent <agent>` for the agents your users approve — it
+   edits their agent config, so ask first.
+3. When you need state, run `hooklinesinker sessions --json` and parse the envelope: refuse a
+   `protocol` you do not speak, skip records you do not understand, key on `(agent, session.id)`
+   or `bindingId`, and surface `problems` instead of treating them as an empty result.
+
+This is ringleader's model (`ringleader/presence.py`).
+
+### Push — long-running apps (menu bar, Electron, Tauri, native)
+
+Register a sink and receive every event as it happens.
+
+1. Start a localhost HTTP server. Each event arrives as one `POST` with a `StatusEvent` JSON
+   body. Answer 2xx fast — the sender's budget is 200 ms and it never retries; do your real work
+   after responding.
+2. Register: `hooklinesinker install --consumer yourname --sink http://127.0.0.1:PORT/hook`.
+3. Hydrate: after your server is listening, run `sessions --json` once and feed the records
+   through the same code path as live events, deduplicating by `bindingId` — a live event racing
+   your hydration must not create two rows.
+4. A `running:false` event removes the binding it names. Missed events are recoverable by
+   re-running `sessions --json`; sink delivery is best-effort by design.
+
+This is Juggler's model (`juggler/Services/HooklinesinkerClient.swift`, `HookServer.swift`).
+
+### Bundling
+
+- **Node / Electron**: ship per-platform binaries (e.g. `extraResources`), spawn with
+  `child_process.execFile` (argument arrays, never a shell string); the sink server is a plain
+  `http.createServer` in the main process. `examples/sink-server/` is exactly this pattern as a
+  single dependency-free script.
+- **Tauri / Rust**: ship it as a sidecar (`externalBin`) or spawn via `std::process::Command`;
+  any small HTTP listener works for the sink.
+- **Native macOS (Swift)**: bundle as an auxiliary executable under `Contents/MacOS`, spawn via
+  `Process` with argument arrays, and mind code signing/notarization if you distribute — the
+  nested binary is signed as part of your app. Juggler is the worked example.
+- **Everywhere**: talk to it only through its CLI JSON — never read the state files directly —
+  and verify a downloaded release artifact against `SHA256SUMS` before executing it.
+
 ## Paths
 
 | Path | Holds |
@@ -119,9 +180,10 @@ Hooks are written into each agent's own configuration, and nowhere else:
 `~/.claude/settings.json`, `~/.codex/hooks.json`,
 `$OPENCODE_CONFIG_DIR/plugins/hooklinesinker-opencode.ts`,
 `$PI_CODING_AGENT_DIR/extensions/hooklinesinker-pi.ts`, `~/.factory/hooks.json`,
-`$QWEN_HOME/settings.json`, and `$KIMI_CODE_HOME/config.toml`. Entries this tool wrote carry a
-generated marker (or, for Kimi's strict `[[hooks]]` schema, an exact canonical `command` match),
-so an install reconciles its own group and leaves everyone else's alone.
+`$QWEN_HOME/settings.json`, and `$KIMI_CODE_HOME/config.toml`. Entries this tool wrote are
+identified by their exact canonical `command` (and the generated OpenCode/Pi plugin files
+additionally carry an ownership marker), so an install reconciles its own entries and leaves
+everyone else's alone.
 
 Kimi's hook events (`TurnStarted`, `SessionHeartbeat`, etc.) require Kimi Code CLI **0.32.0** or
 later; `hooks install --agent kimi` writes hooks regardless, but they only fire on a new-enough
@@ -139,7 +201,7 @@ additive and removal is scoped:
   tool adds only that tool's registration.
 - `uninstall --consumer X` removes X. Hooks and the active binary stay as long as **any** other
   consumer is registered.
-- Removing the last consumer uninstalls the hooks for all four agents and drops the active
+- Removing the last consumer uninstalls the hooks for every agent and drops the active
   binary symlink.
 
 So no tool can pull the rug out from under another, and nothing is left behind once the last one
