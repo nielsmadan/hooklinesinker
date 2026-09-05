@@ -120,8 +120,9 @@ Two models, matching the two consumers above. Runnable, integration-tested examp
 Do not register a sink; ask when you care.
 
 1. Locate or ship the binary (see *Bundling* below) and run
-   `hooklinesinker install --consumer yourname` once. It is idempotent and cooperative — safe to
-   run on every startup.
+   `hooklinesinker install --consumer yourname` once (`yourname` must start with a lowercase
+   letter or digit, and contain only lowercase letters, digits, `_` or `-`). It is idempotent
+   and cooperative — safe to run on every startup.
 2. Run `hooklinesinker hooks install --agent <agent>` for the agents your users approve — it
    edits their agent config, so ask first.
 3. When you need state, run `hooklinesinker sessions --json` and parse the envelope: refuse a
@@ -138,9 +139,10 @@ Register a sink and receive every event as it happens.
    body. Answer 2xx fast — the sender's budget is 200 ms and it never retries; do your real work
    after responding.
 2. Register: `hooklinesinker install --consumer yourname --sink http://127.0.0.1:PORT/hook`.
-3. Hydrate: after your server is listening, run `sessions --json` once and feed the records
-   through the same code path as live events, deduplicating by `bindingId` — a live event racing
-   your hydration must not create two rows.
+3. Hydrate: after your server is listening, run `sessions --json` once, applying the same
+   protocol refusal, per-record skip, and `problems` handling as the Pull model, and feed the
+   records through the same code path as live events, deduplicating by `bindingId` — a live
+   event racing your hydration must not create two rows.
 4. A `running:false` event removes the binding it names. Missed events are recoverable by
    re-running `sessions --json`; sink delivery is best-effort by design.
 
