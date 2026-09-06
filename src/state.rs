@@ -1,6 +1,6 @@
 use crate::consumers::ConsumerStore;
 use crate::normalize::{HookEnvironment, normalize};
-use crate::processes::{ProcessLookup, now_rfc3339};
+use crate::processes::{ProcessLookup, epoch_now, now_rfc3339, parse_epoch_seconds};
 use crate::protocol::{Agent, StatusEvent};
 use crate::sinks::{HttpClient, SinkFanout};
 use fs2::FileExt;
@@ -10,6 +10,16 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_HEALTH_PROBLEMS: usize = 50;
+// Problems are transient diagnostics (a consumer's sink briefly down, a one-off parse fault).
+// Past this age they are stale history, not a current fault, and must not replay on every read.
+const HEALTH_PROBLEM_TTL_SECS: u64 = 600;
+
+fn is_recent_problem(problem: &HealthProblem, now: u64) -> bool {
+    match parse_epoch_seconds(&problem.observed_at) {
+        Some(observed) => now.saturating_sub(observed) <= HEALTH_PROBLEM_TTL_SECS,
+        None => true,
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,8 +194,14 @@ impl StatusStore {
                 Vec::new()
             }
         };
+        // Only surface recent problems here: `sessions --json` is polled routinely, so replaying
+        // the whole accumulated health log turns a past transient into permanent noise. Doctor's
+        // last-sink-error check still reads the full log for its single "last known" diagnostic.
+        let now = epoch_now();
         match self.health_problems() {
-            Ok(recorded) => problems.extend(recorded),
+            Ok(recorded) => {
+                problems.extend(recorded.into_iter().filter(|p| is_recent_problem(p, now)))
+            }
             Err(e) => problems.push(HealthProblem {
                 observed_at: now_rfc3339(),
                 message: format!("failed to read health problems: {e}"),

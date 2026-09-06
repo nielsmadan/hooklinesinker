@@ -1090,6 +1090,35 @@ fn sessions_envelope_includes_recorded_health_problems() {
 }
 
 #[test]
+fn sessions_envelope_omits_stale_problems_but_keeps_recent_ones() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let recent = hooklinesinker::processes::now_rfc3339();
+    let health = format!(
+        "[{{\"observedAt\":\"2020-01-01T00:00:00Z\",\"message\":\"ancient sink failure\"}},\
+          {{\"observedAt\":\"{recent}\",\"message\":\"just now\"}}]"
+    );
+    std::fs::write(root.join("health.json"), health).unwrap();
+
+    let envelope = store.sessions_envelope(&all_alive());
+    let messages: Vec<&str> = envelope
+        .problems
+        .iter()
+        .map(|p| p.message.as_str())
+        .collect();
+    assert_eq!(messages, ["just now"]);
+
+    // The replay is filtered, but the health log itself is untouched, so doctor's last-sink-error
+    // diagnostic still sees the older entry.
+    assert_eq!(store.health_problems().unwrap().len(), 2);
+    assert!(
+        std::fs::read_to_string(root.join("health.json"))
+            .unwrap()
+            .contains("ancient sink failure")
+    );
+}
+
+#[test]
 fn fanout_sends_only_to_status_consumers() {
     let client = RecordingHttpClient::default();
     let consumers = vec![

@@ -12,11 +12,40 @@ pub fn local_hostname() -> String {
 }
 
 pub fn now_rfc3339() -> String {
-    let seconds = std::time::SystemTime::now()
+    format_epoch_seconds(epoch_now())
+}
+
+pub fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_epoch_seconds(seconds)
+        .unwrap_or(0)
+}
+
+// Inverse of `format_epoch_seconds` for the exact `YYYY-MM-DDTHH:MM:SSZ` shape it emits.
+// Returns None for anything not in that shape rather than guessing.
+pub fn parse_epoch_seconds(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+    let mut t = time.split(':');
+    let hour: u64 = t.next()?.parse().ok()?;
+    let minute: u64 = t.next()?.parse().ok()?;
+    let second: u64 = t.next()?.parse().ok()?;
+    if d.next().is_some() || t.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86400 + hour * 3600 + minute * 60 + second)
 }
 
 pub fn format_epoch_seconds(seconds: u64) -> String {
@@ -43,6 +72,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d)
+}
+
+// Howard Hinnant's days_from_civil; the exact inverse of civil_from_days.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let d = day as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 pub struct SystemProcessLookup {
@@ -149,6 +190,34 @@ mod tests {
     #[test]
     fn a_known_timestamp_formats_correctly() {
         assert_eq!(format_epoch_seconds(1_798_761_296), "2026-12-31T23:54:56Z");
+    }
+
+    #[test]
+    fn parse_epoch_seconds_inverts_format() {
+        for secs in [
+            0u64,
+            1,
+            86_399,
+            86_400,
+            1_000_000_000,
+            1_798_761_296,
+            4_102_444_800,
+        ] {
+            assert_eq!(parse_epoch_seconds(&format_epoch_seconds(secs)), Some(secs));
+        }
+    }
+
+    #[test]
+    fn parse_epoch_seconds_rejects_malformed() {
+        for bad in [
+            "",
+            "not-a-date",
+            "2026-12-31 23:54:56Z",
+            "2026-13-01T00:00:00Z",
+            "2026-12-31T23:54:56",
+        ] {
+            assert_eq!(parse_epoch_seconds(bad), None);
+        }
     }
 
     fn os_string_argv(args: &[&str]) -> Vec<std::ffi::OsString> {
