@@ -1,0 +1,77 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - if: matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+      - run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hooklinesinker
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          path: binaries
+      - name: Assemble dist
+        run: |
+          set -euo pipefail
+          mkdir dist
+          lipo -create \
+            binaries/binary-aarch64-apple-darwin/hooklinesinker \
+            binaries/binary-x86_64-apple-darwin/hooklinesinker \
+            -output dist/hooklinesinker-macos-universal
+          cp binaries/binary-aarch64-unknown-linux-gnu/hooklinesinker dist/hooklinesinker-linux-aarch64
+          cp binaries/binary-x86_64-unknown-linux-gnu/hooklinesinker dist/hooklinesinker-linux-x86_64
+          chmod +x dist/*
+          (cd dist && shasum -a 256 hooklinesinker-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
+          binary_version="$(./dist/hooklinesinker-macos-universal version --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$binary_version" != "$tag_version" ]; then
+            echo "Cargo.toml version $binary_version does not match tag $tag_version" >&2
+            exit 1
+          fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "hooklinesinker $GITHUB_REF_NAME" --draft --verify-tag
