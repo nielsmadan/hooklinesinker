@@ -10,6 +10,8 @@ consumers (Juggler, ringleader).
 ```sh
 just setup      # fetch dependencies, install Git hooks, and verify the checkout
 just doctor     # check Rust tools, Python, Node, and Git hooks
+just install    # install or replace the current-source CLI snapshot through Cargo
+just uninstall  # remove the Cargo-installed CLI
 just check      # formatting, Clippy, Rust tests, and development/release-tool tests
 just test       # cargo test: unit + cli + integration + the node-backed adapter tests
 just lint       # cargo clippy --all-targets --all-features -- -D warnings
@@ -30,6 +32,10 @@ After checks and confirmation, preparation updates `Cargo.toml` and `Cargo.lock`
 and atomically pushes the branch and tag. The command waits for the existing workflow's draft
 release and reports its URL. Publishing the draft is manual; never replace a public tag.
 The README documents prerequisites and failure recovery.
+
+The Justfile installation commands manage the Cargo-installed command on `PATH`.
+Consumer registration and shared hook activation use `hooklinesinker install --consumer NAME`;
+remove a consumer with `hooklinesinker uninstall --consumer NAME`.
 
 ## Protocol
 

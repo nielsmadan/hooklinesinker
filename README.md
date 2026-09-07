@@ -33,14 +33,19 @@ the binary into `~/.local/share/hooklinesinker/versions/<version>/`, points
 ### Standalone install
 
 ```sh
-cargo install --path .                     # or grab a release binary
+just install                              # build and install the current checkout via Cargo
 hooklinesinker install --consumer me       # activate + register
 hooklinesinker hooks install --agent claude
 hooklinesinker sessions --json
 ```
 
-`install` is idempotent and cooperative: a newer protocol-compatible binary that is already
-active is reused rather than downgraded, and existing hook groups are reconciled in place rather
+Re-running `just install` replaces the Cargo-installed command with the current source build.
+`just uninstall` removes that Cargo installation. Consumer registration and the shared active
+binary have their own lifecycle: `hooklinesinker uninstall --consumer me` removes your consumer,
+and the hooks and active binary are removed when the last consumer leaves.
+
+`hooklinesinker install --consumer NAME` is idempotent and cooperative: a newer protocol-compatible
+binary that is already active is reused rather than downgraded, and existing hook groups are reconciled in place rather
 than duplicated. So it does not matter whether Juggler, ringleader or you go first.
 
 ## Commands

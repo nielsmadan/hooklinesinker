@@ -10,6 +10,12 @@ setup:
 doctor:
     @bash scripts/doctor.sh
 
+install:
+    @cargo install --path . --locked --force
+
+uninstall:
+    @cargo uninstall hooklinesinker
+
 test:
     @cargo test
 
