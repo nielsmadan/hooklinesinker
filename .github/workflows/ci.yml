@@ -18,7 +18,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # the bundled OpenCode/Pi adapters are exercised by a node harness; without node
       # those tests skip themselves, which would quietly halve the suite
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
       - name: Test development and release tooling
