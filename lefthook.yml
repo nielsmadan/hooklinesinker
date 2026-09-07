@@ -1,7 +1,7 @@
 pre-commit:
   parallel: true
   commands:
-    fmt:
+    format:
       glob: "*.rs"
       run: cargo fmt -- --check {staged_files}
     clippy:
@@ -10,5 +10,5 @@ pre-commit:
 
 pre-push:
   commands:
-    tests:
-      run: cargo test
+    check:
+      run: just check

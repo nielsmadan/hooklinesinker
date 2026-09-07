@@ -8,16 +8,28 @@ consumers (Juggler, ringleader).
 ## Commands
 
 ```sh
-just check      # everything CI runs: cargo fmt --check + clippy -D warnings + cargo test
+just setup      # fetch dependencies, install Git hooks, and verify the checkout
+just doctor     # check Rust tools, Python, Node, and Git hooks
+just check      # formatting, Clippy, Rust tests, and development/release-tool tests
 just test       # cargo test: unit + cli + integration + the node-backed adapter tests
 just lint       # cargo clippy --all-targets --all-features -- -D warnings
-just fmt
-just hooks      # install the git hooks (lefthook)
-just release    # dist/ artifacts for all four targets + SHA256SUMS
+just format
+just build-release  # dist/ artifacts for all four targets + SHA256SUMS
+just release        # propose/confirm a version, then create a draft GitHub release
+just release --dry-run  # preview without checks, edits, or publication
 ```
 
 `cargo test --test ts_adapters` needs node 22.6+ for type stripping; without it those tests
 print a SKIP line and pass, so a green run on a node-less machine proves less than it looks.
+`just doctor` checks this requirement. Development tooling also requires Python 3.9+.
+The pre-push hook runs `just check`; CI additionally builds all four platform targets.
+
+`just release minor`, `just release patch`, and exact versions use the same confirmation flow.
+Release from a clean, current `main` checkout with complete history and matching origin tags.
+After checks and confirmation, preparation updates `Cargo.toml` and `Cargo.lock`, commits them,
+and atomically pushes the branch and tag. The command waits for the existing workflow's draft
+release and reports its URL. Publishing the draft is manual; never replace a public tag.
+The README documents prerequisites and failure recovery.
 
 ## Protocol
 

@@ -1,0 +1,19 @@
+{
+  "name": "Hooklinesinker",
+  "branch": "main",
+  "components": 3,
+  "initial_version": "1.0.0",
+  "checks": [["just", "check"]],
+  "tools": ["git", "python3", "just", "cargo", "node", "gh"],
+  "stages": [
+    {
+      "files": ["Cargo.toml", "Cargo.lock"],
+      "commands": [["python3", "scripts/prepare_release.py", "{version}"]],
+      "message": "chore: release {version}"
+    }
+  ],
+  "repository": "nielsmadan/hooklinesinker",
+  "workflow": "release.yml",
+  "draft": true,
+  "publication": "Draft GitHub release with macOS/Linux binaries and SHA256SUMS; publish the draft manually"
+}

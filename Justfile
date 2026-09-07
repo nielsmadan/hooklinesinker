@@ -2,28 +2,37 @@
 default:
     @just --list
 
+setup:
+    @cargo fetch --locked
+    @lefthook install
+    @just doctor
+
+doctor:
+    @bash scripts/doctor.sh
+
 test:
     @cargo test
 
 lint:
     @cargo clippy --all-targets --all-features -- -D warnings
 
-fmt:
+format:
     @cargo fmt
 
-# Everything CI runs.
+# Formatting, lint, Rust tests, and release-tool tests.
 check:
+    @python3 -B -m unittest discover -s scripts -p 'test_*.py'
     @cargo fmt --check
     @cargo clippy --all-targets --all-features -- -D warnings
     @cargo test
 
-# Install git hooks (lefthook).
-hooks:
-    @lefthook install
-
 # Release artifacts + SHA256SUMS in dist/. Pass targets to build a subset.
-release *TARGETS:
+build-release *TARGETS:
     @bash scripts/build-release.sh {{TARGETS}}
+
+[positional-arguments]
+release *args:
+    python3 scripts/release.py "$@"
 
 # Build and drop a fresh binary straight onto the active install, bypassing version
 # promotion (which reuses an equal version and would ignore a rebuilt one). For local

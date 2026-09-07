@@ -236,12 +236,18 @@ records whose process is gone; it does not remove them.
 ## Development
 
 ```sh
-just check      # everything CI runs: cargo fmt --check + clippy -D warnings + cargo test
+just setup      # fetch dependencies, install Git hooks, and verify the checkout
+just doctor     # check development tools and Git hooks
+just check      # formatting, Clippy, Rust tests, and development/release-tool tests
 just test
 just lint
-just hooks      # install the git hooks (lefthook)
-just release    # dist/ artifacts for all four targets + SHA256SUMS
+just format
+just build-release    # local dist/ artifacts for all four targets + SHA256SUMS
 ```
+
+Install Rust with rustfmt and Clippy, Lefthook, Python 3.9+, and Node 22.6+ before running
+`just setup`. `just doctor` reports missing tools and hooks without installing anything or
+running tests. The pre-push hook runs `just check`; CI also builds all four platform targets.
 
 The OpenCode and Pi adapters in `assets/` are exercised by a node harness
 (`tests/assets_harness.mjs`, driven from `tests/ts_adapters.rs`); those tests skip themselves
@@ -250,3 +256,35 @@ when node 22.6+ is not on `PATH`, so CI installs node.
 Releases build `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu` and
 `x86_64-unknown-linux-gnu`, combine the two macOS binaries with `lipo`, and write a SHA-256
 manifest. Consumers verify a staged artifact against that manifest before ever executing it.
+
+## Releasing
+
+Run `just release` from a clean, current `main` checkout with complete Git history, matching
+local/origin version tags, and authenticated `gh` with repository, Actions, and release access.
+The command proposes a version, runs `just check`, and asks for confirmation. Enter `y` to
+proceed, enter a version or `patch`/`minor`/`major` to revise the proposal, or press Enter to cancel.
+
+```sh
+just release
+just release minor
+just release 1.2.0
+just release --dry-run
+just release patch --yes
+```
+
+Features propose a minor bump, fixes a patch, and breaking changes a major bump (minor during
+`0.x`). Maintenance-only changes require an explicit bump. The initial release is `1.0.0`.
+`--dry-run` reads local/origin state and previews without checks, edits, or publication.
+`--yes` explicitly confirms unattended use; other nonterminal invocations fail.
+
+After confirmation, preparation updates the package version in `Cargo.toml` and regenerates
+`Cargo.lock` offline using Cargo's existing dependency resolution. It commits those two files
+and atomically pushes `main` and an annotated tag, including local commits counted in the preview.
+The existing workflow builds the macOS/Linux artifacts, verifies their version against the tag,
+and creates a **draft GitHub release** with `SHA256SUMS`. The command waits for completion,
+verifies that the release is a draft, and prints its URL. Review and publish the draft manually.
+
+`scripts/release.json` declares this policy; the release helper and its tests are shared with
+the other versioned workspace projects. Failed preparation or push leaves local changes,
+commits, or tags available for inspection. A failed workflow leaves the remote tag in place;
+inspect the reported Actions URL and fix or rerun the workflow. Never replace a public tag.
