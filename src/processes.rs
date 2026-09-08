@@ -117,8 +117,8 @@ impl SystemProcessLookup {
 
 // Some agent CLIs are `#!/usr/bin/env node` shims (confirmed for Qwen's shipped
 // @qwen-code/qwen-code bundle, which never renames its process on non-Windows
-// platforms): the OS-visible process name is the interpreter's ("node", "bun",
-// "deno"), not the agent's own command name. npm's bin-shimming still invokes
+// platforms): the OS-visible process name is the interpreter's, not the agent's
+// own command name. npm's bin-shimming still invokes
 // the interpreter with the original command-named script path in argv, so fall
 // back to matching that path's file name when the direct name check misses and
 // the process is a known script runtime.
@@ -126,11 +126,24 @@ fn is_script_runtime(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "node" | "bun" | "deno")
 }
 
+// On Linux the reported process name is the main thread's (/proc/<pid>/comm), and
+// node >= 24 names that thread "MainThread"; argv[0] still carries the interpreter's path.
+fn runs_a_script_runtime(name: &str, cmd: &[std::ffi::OsString]) -> bool {
+    if is_script_runtime(name) {
+        return true;
+    }
+    cmd.first().is_some_and(|argv0| {
+        Path::new(argv0)
+            .file_name()
+            .is_some_and(|f| is_script_runtime(&f.to_string_lossy()))
+    })
+}
+
 fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &[&str]) -> bool {
     if expected.iter().any(|e| name.eq_ignore_ascii_case(e)) {
         return true;
     }
-    if !is_script_runtime(name) {
+    if !runs_a_script_runtime(name, cmd) {
         return false;
     }
     cmd.iter().any(|arg| {
@@ -255,6 +268,33 @@ mod tests {
     fn node_shim_matches_by_the_invoked_scripts_file_name() {
         let argv = os_string_argv(&["node", "/usr/local/bin/qwen", "--flag"]);
         assert!(is_owning_process("node", &argv, &["qwen"]));
+    }
+
+    #[test]
+    fn a_runtime_reporting_its_thread_name_matches_by_the_invoked_scripts_file_name() {
+        let argv = os_string_argv(&["/usr/local/bin/node", "/usr/local/bin/qwen"]);
+        assert!(is_owning_process("MainThread", &argv, &["qwen"]));
+    }
+
+    #[test]
+    fn a_thread_named_process_that_is_not_a_runtime_never_matches() {
+        // Fails if "MainThread" is ever added to is_script_runtime instead.
+        let argv = os_string_argv(&["bash", "-c", "qwen"]);
+        assert!(!is_owning_process("MainThread", &argv, &["qwen"]));
+    }
+
+    #[test]
+    fn a_renamed_runtime_without_a_matching_argv_entry_does_not_match() {
+        let argv = os_string_argv(&["node", "/usr/local/bin/some-other-cli"]);
+        assert!(!is_owning_process("MainThread", &argv, &["qwen"]));
+    }
+
+    // Only argv[0] names the running interpreter: `sudo` forks rather than execs, so an
+    // ancestor that merely passes a runtime path along must not be read as that runtime.
+    #[test]
+    fn a_launcher_that_merely_mentions_a_runtime_in_its_arguments_never_matches() {
+        let argv = os_string_argv(&["sudo", "/usr/local/bin/node", "/usr/local/bin/qwen"]);
+        assert!(!is_owning_process("sudo", &argv, &["qwen"]));
     }
 
     #[test]
