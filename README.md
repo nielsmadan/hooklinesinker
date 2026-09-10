@@ -200,6 +200,10 @@ Droid reads its hooks at startup, so a `droid` session that was already running 
 were installed will not report anything until it is restarted (it warns about the change in its
 `/hooks` UI).
 
+Codex's `Interrupt` hook returns an interrupted turn to idle while keeping its session live.
+Existing installations need `hooks install --agent codex` again to register this event, then
+approval in Codex's `/hooks` or the consumer's trust UI. Codex caps `Interrupt` and `SessionEnd`
+at three seconds, including the timeout used in their trust hashes.
 Codex's `config.toml` (including its `trusted_hash` machinery) is **not** touched. Trusting a
 hook is the host application's business.
 

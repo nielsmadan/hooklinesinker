@@ -119,6 +119,11 @@ const CODEX_EVENTS: &[EventSpec] = &[
         timeout: 5,
     },
     EventSpec {
+        name: "Interrupt",
+        matcher: None,
+        timeout: 3,
+    },
+    EventSpec {
         name: "SessionEnd",
         matcher: None,
         timeout: 3,
@@ -1497,11 +1502,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_install_has_no_matcher_and_clamps_session_end_timeout() {
+    fn codex_install_has_no_matcher_and_clamps_terminal_hook_timeouts() {
         let (manager, base) = manager();
         let status = manager.install(Agent::Codex).unwrap();
         assert_eq!(status.state, HookState::Installed);
-        assert_eq!(status.entries.len(), 9);
+        assert_eq!(status.entries.len(), 10);
 
         let path = base.join("codex").join("hooks.json");
         let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
@@ -1510,6 +1515,14 @@ mod tests {
         assert_eq!(session_start["hooks"][0]["timeout"], 5);
         let session_end = &value["hooks"]["SessionEnd"][0];
         assert_eq!(session_end["hooks"][0]["timeout"], 3);
+        assert_eq!(
+            value["hooks"]["Interrupt"][0],
+            serde_json::json!({"hooks": [{
+                "type": "command",
+                "command": format!("{} ingest --agent codex --event Interrupt", base.join("bin/hooklinesinker").display()),
+                "timeout": 3
+            }]})
+        );
     }
 
     #[test]

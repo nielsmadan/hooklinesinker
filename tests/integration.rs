@@ -310,6 +310,57 @@ fn codex_stop_fixture_normalizes_to_idle_and_running() {
 }
 
 #[test]
+fn codex_interrupt_keeps_the_session_live_and_pushes_idle_to_consumers() {
+    let store = store();
+    let consumers = consumer_store();
+    consumers
+        .register(consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let process = test_process().unwrap();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let client = RecordingHttpClient::default();
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    let input = include_str!("fixtures/codex-interrupt.json");
+
+    ingest(&ctx, Agent::Codex, "UserPromptSubmit", input, 1);
+    let working = store.sessions_envelope(&liveness).sessions;
+    assert_eq!(working.len(), 1);
+    assert_eq!(working[0].phase, Phase::Working);
+
+    ingest(&ctx, Agent::Codex, "Interrupt", input, 1);
+    let interrupted = store.sessions_envelope(&liveness).sessions;
+    assert_eq!(interrupted.len(), 1);
+    assert_eq!(interrupted[0].binding_id, working[0].binding_id);
+    assert_eq!(interrupted[0].phase, Phase::Idle);
+    assert_eq!(interrupted[0].event, "Interrupt");
+    assert!(interrupted[0].running);
+    assert_eq!(interrupted[0].session.id, "codex-session");
+
+    let bodies = client.bodies();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[1]["phase"], "idle");
+    assert_eq!(bodies[1]["event"], "Interrupt");
+    assert_eq!(bodies[1]["running"], true);
+    assert_eq!(bodies[1]["bindingId"], working[0].binding_id);
+
+    ingest(&ctx, Agent::Codex, "UserPromptSubmit", input, 1);
+    let resumed = store.sessions_envelope(&liveness).sessions;
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].binding_id, working[0].binding_id);
+    assert_eq!(resumed[0].phase, Phase::Working);
+}
+
+#[test]
 fn opencode_busy_fixture_normalizes_to_working() {
     let native = include_str!("fixtures/opencode-busy.json");
     let event = normalize_for_test(Agent::Opencode, "session.status.busy", native);

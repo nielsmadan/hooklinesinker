@@ -51,7 +51,7 @@ fn map_event(
             _ => Ignore,
         },
         Agent::Codex => match event {
-            "SessionStart" | "Stop" => Update(Phase::Idle),
+            "SessionStart" | "Stop" | "Interrupt" => Update(Phase::Idle),
             "PreToolUse" if tool_name == Some("request_user_input") => Update(Phase::Idle),
             "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostCompact" => {
                 Update(Phase::Working)
