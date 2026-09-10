@@ -171,6 +171,45 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--format=%s"), "chore: release 1.4.2")
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_github_release_pushes_with_git_without_gh(self):
+        policy = json.loads(SCRIPT.with_suffix(".json").read_text())
+        for key in ("tools", "repository", "workflow", "publication"):
+            self.config[key] = policy[key]
+        self.save_config()
+        self.commit("chore: configure release workflow")
+        run = release.run
+        which = shutil.which
+
+        def run_with_local_github_origin(root, *args, **kwargs):
+            if args[:3] == ("git", "remote", "get-url"):
+                return f"https://github.com/{policy['repository']}.git"
+            if args[0] == "gh":
+                raise FileNotFoundError("gh is not installed")
+            return run(root, *args, **kwargs)
+
+        with (
+            patch.dict(os.environ, self.env),
+            patch.object(release, "__file__", str(self.root / "scripts/release.py")),
+            patch.object(release, "run", side_effect=run_with_local_github_origin),
+            patch.object(
+                shutil, "which", side_effect=lambda tool: None if tool == "gh" else which(tool)
+            ),
+            patch.object(sys, "argv", ["release.py", "--yes"]),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            release.main()
+
+        revision = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.git("show", "v1.2.1:VERSION"), "1.2.1")
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/main").split()[0], revision)
+        self.assertEqual(self.git("ls-remote", "origin", "refs/tags/v1.2.1^{}").split()[0], revision)
+        self.assertIn("Pushed v1.2.1.", output.getvalue())
+        self.assertIn(
+            f"Actions: https://github.com/{policy['repository']}/actions/workflows/"
+            f"{policy['workflow']}?query=branch%3Av1.2.1",
+            output.getvalue(),
+        )
+
     def test_invalid_or_old_versions_preserve_release(self):
         for version in ["1.2.0", "1.1.9", "v1.02.1", "1.3", "1.3.0;touch bad"]:
             with self.subTest(version=version):
@@ -335,75 +374,6 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         remote_tags = self.command("git", "--git-dir", str(self.remote), "tag", "--list")
         self.assertEqual(remote_tags.splitlines(), ["v1.2.0", "v1.2.1"])
-
-    def test_publication_waits_for_matching_tag_and_reports_success(self):
-        config = {"workflow": "release.yml", "repository": "owner/repo"}
-        responses = [
-            json.dumps(
-                [
-                    {"databaseId": 1, "headBranch": "other", "url": "other"},
-                    {"databaseId": 2, "headBranch": "v1.2.1", "url": "workflow-url"},
-                ]
-            ),
-            json.dumps({"status": "completed", "conclusion": "success"}),
-            json.dumps({"url": "release-url", "isDraft": False}),
-        ]
-        with (
-            patch.object(release, "run", side_effect=responses) as runner,
-            patch("sys.stdout", new_callable=io.StringIO) as output,
-        ):
-            release.publication(self.root, config, "v1.2.1", "revision")
-        self.assertIn("Released: release-url", output.getvalue())
-        self.assertIn("2", runner.call_args_list[1].args)
-
-    def test_draft_release_is_reported_without_publication(self):
-        config = {"workflow": "release.yml", "repository": "owner/repo", "draft": True}
-        responses = [
-            json.dumps([{"databaseId": 2, "headBranch": "v1.2.1", "url": "workflow-url"}]),
-            json.dumps({"status": "completed", "conclusion": "success"}),
-            json.dumps({"url": "draft-url", "isDraft": True}),
-        ]
-        with (
-            patch.object(release, "run", side_effect=responses) as runner,
-            patch("sys.stdout", new_callable=io.StringIO) as output,
-        ):
-            release.publication(self.root, config, "v1.2.1", "revision")
-        self.assertIn("Draft release ready: draft-url", output.getvalue())
-        self.assertEqual(runner.call_args_list[-1].args[1:4], ("gh", "release", "view"))
-        self.assertEqual(runner.call_count, 3)
-
-    def test_release_state_must_match_the_configured_policy(self):
-        for expected_draft in [True, False]:
-            with self.subTest(expected_draft=expected_draft):
-                config = {
-                    "workflow": "release.yml",
-                    "repository": "owner/repo",
-                    "draft": expected_draft,
-                }
-                responses = [
-                    json.dumps([{"databaseId": 2, "headBranch": "v1.2.1", "url": "workflow-url"}]),
-                    json.dumps({"status": "completed", "conclusion": "success"}),
-                    json.dumps({"url": "release-url", "isDraft": not expected_draft}),
-                ]
-                with (
-                    patch.object(release, "run", side_effect=responses),
-                    self.assertRaisesRegex(
-                        release.ReleaseError, "Expected a .* release: release-url"
-                    ),
-                ):
-                    release.publication(self.root, config, "v1.2.1", "revision")
-
-    def test_publication_failure_is_an_error(self):
-        config = {"workflow": "release.yml", "repository": "owner/repo"}
-        responses = [
-            json.dumps([{"databaseId": 2, "headBranch": "v1.2.1", "url": "workflow-url"}]),
-            json.dumps({"status": "completed", "conclusion": "failure"}),
-        ]
-        with (
-            patch.object(release, "run", side_effect=responses),
-            self.assertRaisesRegex(release.ReleaseError, "failure: workflow-url"),
-        ):
-            release.publication(self.root, config, "v1.2.1", "revision")
 
 
 if __name__ == "__main__":

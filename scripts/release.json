@@ -4,7 +4,7 @@
   "components": 3,
   "initial_version": "1.0.0",
   "checks": [["just", "check"]],
-  "tools": ["git", "python3", "just", "cargo", "node", "gh"],
+  "tools": ["git", "python3", "just", "cargo", "node"],
   "stages": [
     {
       "files": ["Cargo.toml", "Cargo.lock"],
@@ -14,6 +14,5 @@
   ],
   "repository": "nielsmadan/hooklinesinker",
   "workflow": "release.yml",
-  "draft": true,
   "publication": "Draft GitHub release with macOS/Linux binaries and SHA256SUMS; publish the draft manually"
 }

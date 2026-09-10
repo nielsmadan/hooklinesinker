@@ -17,7 +17,7 @@ just test       # cargo test: unit + cli + integration + the node-backed adapter
 just lint       # cargo clippy --all-targets --all-features -- -D warnings
 just format
 just build-release  # dist/ artifacts for all four targets + SHA256SUMS
-just release        # propose/confirm a version, then create a draft GitHub release
+just release        # propose/confirm a version, then push the tag that triggers the release workflow
 just release --dry-run  # preview without checks, edits, or publication
 ```
 
@@ -29,8 +29,8 @@ The pre-push hook runs `just check`; CI additionally builds all four platform ta
 `just release minor`, `just release patch`, and exact versions use the same confirmation flow.
 Release from a clean, current `main` checkout with complete history and matching origin tags.
 After checks and confirmation, preparation updates `Cargo.toml` and `Cargo.lock`, commits them,
-and atomically pushes the branch and tag. The command waits for the existing workflow's draft
-release and reports its URL. Publishing the draft is manual; never replace a public tag.
+and atomically pushes the branch and tag using Git credentials, then prints the Actions link.
+Check CI's result and publish its draft release manually; never replace a public tag.
 The README documents prerequisites and failure recovery.
 
 The Justfile installation commands manage the Cargo-installed command on `PATH`.

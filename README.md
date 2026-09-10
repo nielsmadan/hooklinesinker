@@ -269,7 +269,7 @@ manifest. Consumers verify a staged artifact against that manifest before ever e
 ## Releasing
 
 Run `just release` from a clean, current `main` checkout with complete Git history, matching
-local/origin version tags, and authenticated `gh` with repository, Actions, and release access.
+local/origin version tags, and Git credentials that can push to `origin`.
 The command proposes a version, runs `just check`, and asks for confirmation. Enter `y` to
 proceed, enter a version or `patch`/`minor`/`major` to revise the proposal, or press Enter to cancel.
 
@@ -290,8 +290,10 @@ After confirmation, preparation updates the package version in `Cargo.toml` and 
 `Cargo.lock` offline using Cargo's existing dependency resolution. It commits those two files
 and atomically pushes `main` and an annotated tag, including local commits counted in the preview.
 The existing workflow builds the macOS/Linux artifacts, verifies their version against the tag,
-and creates a **draft GitHub release** with `SHA256SUMS`. The command waits for completion,
-verifies that the release is a draft, and prints its URL. Review and publish the draft manually.
+and creates a **draft GitHub release** with `SHA256SUMS`, using CI's GitHub token.
+The command returns after the push and prints an Actions link filtered to the release tag.
+Check that workflow's result, then review and publish the draft manually. Local success confirms
+the Git push; artifact creation continues in CI. GitHub CLI authentication is only used inside CI.
 
 `scripts/release.json` declares this policy; the release helper and its tests are shared with
 the other versioned workspace projects. Failed preparation or push leaves local changes,
