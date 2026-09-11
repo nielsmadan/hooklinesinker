@@ -173,12 +173,12 @@ class ReleaseTests(unittest.TestCase):
 
     def test_github_release_pushes_with_git_without_gh(self):
         policy = json.loads(SCRIPT.with_suffix(".json").read_text())
+        self.assertNotIn("gh", policy["tools"])
         for key in ("tools", "repository", "workflow", "publication"):
             self.config[key] = policy[key]
         self.save_config()
         self.commit("chore: configure release workflow")
         run = release.run
-        which = shutil.which
 
         def run_with_local_github_origin(root, *args, **kwargs):
             if args[:3] == ("git", "remote", "get-url"):
@@ -192,7 +192,9 @@ class ReleaseTests(unittest.TestCase):
             patch.object(release, "__file__", str(self.root / "scripts/release.py")),
             patch.object(release, "run", side_effect=run_with_local_github_origin),
             patch.object(
-                shutil, "which", side_effect=lambda tool: None if tool == "gh" else which(tool)
+                shutil,
+                "which",
+                side_effect=lambda tool: None if tool == "gh" else f"/usr/bin/{tool}",
             ),
             patch.object(sys, "argv", ["release.py", "--yes"]),
             patch("sys.stdout", new_callable=io.StringIO) as output,
