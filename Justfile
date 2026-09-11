@@ -4,6 +4,7 @@ default:
 
 setup:
     @cargo fetch --locked
+    @npm ci
     @lefthook install
     @just doctor
 
@@ -21,12 +22,17 @@ test:
 
 lint:
     @cargo clippy --all-targets --all-features -- -D warnings
+    @npm run lint
+
+check-adapters:
+    @npm run check
 
 format:
     @cargo fmt
 
-# Formatting, lint, Rust tests, and release-tool tests.
+# Formatting, lint, adapter type checks, Rust tests, and release-tool tests.
 check:
+    @just check-adapters
     @python3 -B -m unittest discover -s scripts -p 'test_*.py'
     @cargo fmt --check
     @cargo clippy --all-targets --all-features -- -D warnings

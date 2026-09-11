@@ -4,7 +4,7 @@
   "components": 3,
   "initial_version": "1.0.0",
   "checks": [["just", "check"]],
-  "tools": ["git", "python3", "just", "cargo", "node"],
+  "tools": ["git", "python3", "just", "cargo", "node", "npm"],
   "stages": [
     {
       "files": ["Cargo.toml", "Cargo.lock"],

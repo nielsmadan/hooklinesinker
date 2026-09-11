@@ -1,7 +1,7 @@
-// Executes the bundled agent adapters (assets/*.ts) against a stubbed host and a fake
+// Executes the bundled agent adapters (adapters/*.ts) against a stubbed host and a fake
 // hooklinesinker binary, then prints what each adapter tried to ingest.
 //
-//   node --experimental-strip-types assets_harness.mjs <repo-root> <workdir>
+//   node --experimental-strip-types adapters_harness.mjs <repo-root> <workdir>
 //
 // Every scenario runs in this one process, sequentially. That is deliberate: the adapters kill
 // a hook that outlives HOOK_TIMEOUT_MS, so a scenario racing a dozen sibling node boots would
@@ -17,7 +17,7 @@ import { pathToFileURL } from "node:url";
 
 const [repoRoot, workdir] = process.argv.slice(2);
 if (!repoRoot || !workdir) {
-  throw new Error("usage: assets_harness.mjs <repo-root> <workdir>");
+  throw new Error("usage: adapters_harness.mjs <repo-root> <workdir>");
 }
 
 // An adapter whose hook never resolves would otherwise hang the caller forever; fail loudly
@@ -27,8 +27,8 @@ setTimeout(() => {
   process.exit(3);
 }, 60_000);
 
-const PI_ASSET = join(repoRoot, "assets/pi-hooklinesinker.ts");
-const OPENCODE_ASSET = join(repoRoot, "assets/opencode-hooklinesinker.ts");
+const PI_ADAPTER = join(repoRoot, "adapters/pi-hooklinesinker.ts");
+const OPENCODE_ADAPTER = join(repoRoot, "adapters/opencode-hooklinesinker.ts");
 
 /// Stages a scenario: a fake binary that records its argv and stdin, and a copy of the adapter
 /// pointed at it. A scenario suffixed with ":hang" gets a binary that records and then blocks,
@@ -108,6 +108,19 @@ async function runPi(scenario, adapterPath, invocations) {
     case "pi:permission_lifecycle":
       await start();
       prompt("prompt-1");
+      decide("user_denied");
+      await shutdown("reload");
+      break;
+
+    case "pi:malformed_permission_payloads":
+      await start();
+      for (const event of [null, 1, "prompt", [], { requestId: 42 }]) {
+        events.get("permissions:ui_prompt")(event);
+      }
+      prompt("prompt-1");
+      for (const event of [null, 1, "decision", [], { resolution: true }]) {
+        events.get("permissions:decision")(event);
+      }
       decide("user_denied");
       await shutdown("reload");
       break;
@@ -201,6 +214,31 @@ async function runOpenCode(scenario, adapterPath) {
       });
       break;
 
+    case "opencode:malformed_events_are_dropped":
+      for (const event of [
+        null,
+        42,
+        "session.status",
+        [],
+        { type: 42 },
+        { type: "session.status", properties: null },
+        { type: "session.status", properties: { status: { type: 42 } } },
+      ]) {
+        await plugin.event({ event });
+      }
+      break;
+
+    case "opencode:session_id_fallbacks":
+      for (const event of [
+        { type: "session.created", properties: { sessionID: 42, info: { id: "from-info" } } },
+        { type: "session.idle", properties: { info: [] }, session_id: "from-snake" },
+        { type: "session.deleted", properties: null, sessionID: "from-camel" },
+        { type: "session.idle", properties: { sessionID: 42 } },
+      ]) {
+        await plugin.event({ event });
+      }
+      break;
+
     default:
       throw new Error(`unknown opencode scenario ${scenario}`);
   }
@@ -209,21 +247,24 @@ async function runOpenCode(scenario, adapterPath) {
 }
 
 const SCENARIOS = [
-  [PI_ASSET, "pi:permission_lifecycle"],
-  [PI_ASSET, "pi:silent_and_orphan_decisions"],
-  [PI_ASSET, "pi:settled_discards_prompts"],
-  [PI_ASSET, "pi:child_session_silent"],
-  [PI_ASSET, "pi:shutdown_quit"],
-  [PI_ASSET, "pi:shutdown_reload"],
-  [PI_ASSET, "pi:shutdown_new"],
-  [PI_ASSET, "pi:shutdown_resume"],
-  [PI_ASSET, "pi:shutdown_fork"],
-  [PI_ASSET, "pi:hanging_binary:hang"],
-  [OPENCODE_ASSET, "opencode:load_posts_created"],
-  [OPENCODE_ASSET, "opencode:status_becomes_event_suffix"],
-  [OPENCODE_ASSET, "opencode:status_without_type_is_dropped"],
-  [OPENCODE_ASSET, "opencode:untracked_event_is_dropped"],
-  [OPENCODE_ASSET, "opencode:hanging_binary:hang"],
+  [PI_ADAPTER, "pi:permission_lifecycle"],
+  [PI_ADAPTER, "pi:malformed_permission_payloads"],
+  [PI_ADAPTER, "pi:silent_and_orphan_decisions"],
+  [PI_ADAPTER, "pi:settled_discards_prompts"],
+  [PI_ADAPTER, "pi:child_session_silent"],
+  [PI_ADAPTER, "pi:shutdown_quit"],
+  [PI_ADAPTER, "pi:shutdown_reload"],
+  [PI_ADAPTER, "pi:shutdown_new"],
+  [PI_ADAPTER, "pi:shutdown_resume"],
+  [PI_ADAPTER, "pi:shutdown_fork"],
+  [PI_ADAPTER, "pi:hanging_binary:hang"],
+  [OPENCODE_ADAPTER, "opencode:load_posts_created"],
+  [OPENCODE_ADAPTER, "opencode:status_becomes_event_suffix"],
+  [OPENCODE_ADAPTER, "opencode:status_without_type_is_dropped"],
+  [OPENCODE_ADAPTER, "opencode:untracked_event_is_dropped"],
+  [OPENCODE_ADAPTER, "opencode:malformed_events_are_dropped"],
+  [OPENCODE_ADAPTER, "opencode:session_id_fallbacks"],
+  [OPENCODE_ADAPTER, "opencode:hanging_binary:hang"],
 ];
 
 const report = {};

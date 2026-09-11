@@ -1519,8 +1519,8 @@ fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
     );
 }
 
-// The OpenCode and Pi TypeScript adapters (assets/opencode-hooklinesinker.ts,
-// assets/pi-hooklinesinker.ts) pipe a bare `{"session_id": ..., "cwd": ...}`
+// The OpenCode and Pi TypeScript adapters (adapters/opencode-hooklinesinker.ts,
+// adapters/pi-hooklinesinker.ts) pipe a bare `{"session_id": ..., "cwd": ...}`
 // object to `ingest` on stdin — never terminal/tmux/git/remote fields, which
 // normalize.rs sources from the hook environment instead. These tests pin
 // that exact stdin contract against normalize()'s NativeEvent expectations.

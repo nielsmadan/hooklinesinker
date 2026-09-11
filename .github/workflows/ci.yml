@@ -21,6 +21,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Check adapter types and lint
+        run: npm run check
       - name: Test development and release tooling
         run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo fmt --check

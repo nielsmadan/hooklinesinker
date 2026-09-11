@@ -9,12 +9,13 @@ consumers (Juggler, ringleader).
 
 ```sh
 just setup      # fetch dependencies, install Git hooks, and verify the checkout
-just doctor     # check Rust tools, Python, Node, and Git hooks
+just doctor     # check Rust tools, Python, Node, npm, and Git hooks
 just install    # install or replace the current-source CLI snapshot through Cargo
 just uninstall  # remove the Cargo-installed CLI
-just check      # formatting, Clippy, Rust tests, and development/release-tool tests
+just check      # formatting, lint, adapter types, Rust tests, and development/release-tool tests
+just check-adapters  # strict TypeScript checks and explicit-any lint
 just test       # cargo test: unit + cli + integration + the node-backed adapter tests
-just lint       # cargo clippy --all-targets --all-features -- -D warnings
+just lint       # Clippy and adapter lint
 just format
 just build-release  # dist/ artifacts for all four targets + SHA256SUMS
 just release        # propose/confirm a version, then push the tag that triggers the release workflow
@@ -23,7 +24,8 @@ just release --dry-run  # preview without checks, edits, or publication
 
 `cargo test --test ts_adapters` needs node 22.6+ for type stripping; without it those tests
 print a SKIP line and pass, so a green run on a node-less machine proves less than it looks.
-`just doctor` checks this requirement. Development tooling also requires Python 3.9+.
+Development tooling requires Python 3.9+, Node 22.12+ with npm, and `npm ci` (also in `just setup`).
+`just doctor` checks the tool versions; `just check-adapters` runs TypeScript and Oxlint.
 The pre-push hook runs `just check`; CI additionally builds all four platform targets.
 
 `just release minor`, `just release patch`, and exact versions use the same confirmation flow.
@@ -31,7 +33,8 @@ Release from a clean, current `main` checkout with complete history and matching
 After checks and confirmation, preparation updates `Cargo.toml` and `Cargo.lock`, commits them,
 and atomically pushes the branch and tag using Git credentials, then prints the Actions link.
 Check CI's result and publish its draft release manually; never replace a public tag.
-The README documents prerequisites and failure recovery.
+The [development and release guide](docs/development-and-releases.md) documents prerequisites
+and failure recovery.
 
 The Justfile installation commands manage the Cargo-installed command on `PATH`.
 Consumer registration and shared hook activation use `hooklinesinker install --consumer NAME`;
@@ -86,5 +89,12 @@ optional fields are safe; anything else needs a protocol bump and both consumers
 | `src/consumers.rs` | consumer registration and validation |
 | `src/install.rs` | versioned self-install, activation, scoped uninstall |
 | `src/sinks.rs` | POST-per-event fanout to consumer sinks |
-| `assets/*.ts` | the OpenCode plugin and Pi extension, with `__HOOKLINESINKER_BIN__` |
-| `tests/assets_harness.mjs` | node harness the adapter tests drive |
+| `adapters/*.ts` | the OpenCode plugin and Pi extension, with `__HOOKLINESINKER_BIN__` |
+| `tests/adapters_harness.mjs` | node harness the adapter tests drive |
+
+## Documentation
+
+Project docs live in `docs/`; start at [docs/overview.md](docs/overview.md).
+After completing a feature, run `doc --update` to keep the flow documents current.
+Decision records and manual-test results preserve history; add new records rather than
+rewriting their findings.

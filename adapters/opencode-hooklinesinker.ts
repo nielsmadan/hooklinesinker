@@ -15,6 +15,10 @@ const TRACKED_EVENTS = new Set([
 
 const HOOK_TIMEOUT_MS = 2000;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function runHook(event: string, sessionId?: string, cwd?: string): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
@@ -61,11 +65,7 @@ function runHook(event: string, sessionId?: string, cwd?: string): Promise<void>
 export const HooklinesinkerPlugin = async ({
   directory,
 }: {
-  project: any;
-  client: any;
-  $: any;
   directory: string;
-  worktree: string;
 }) => {
   // Post session.created on plugin load so status is seen immediately, even
   // when OpenCode resumes a previous session (which skips session.created).
@@ -75,20 +75,20 @@ export const HooklinesinkerPlugin = async ({
     event: async ({
       event,
     }: {
-      event: { type: string; [key: string]: any };
+      event: unknown;
     }) => {
+      if (!isRecord(event) || typeof event.type !== "string") return;
       if (!TRACKED_EVENTS.has(event.type)) return;
 
-      const sessionId =
-        (event as any).properties?.sessionID ||
-        (event as any).properties?.info?.id ||
-        (event as any).session_id ||
-        (event as any).sessionID;
+      const properties = isRecord(event.properties) ? event.properties : undefined;
+      const info = isRecord(properties?.info) ? properties.info : undefined;
+      const sessionId = [properties?.sessionID, info?.id, event.session_id, event.sessionID]
+        .find((id): id is string => typeof id === "string" && id.length > 0);
 
       let eventName = event.type;
       if (event.type === "session.status") {
-        const status = (event as any).properties?.status?.type;
-        if (!status) return;
+        const status = isRecord(properties?.status) ? properties.status.type : undefined;
+        if (typeof status !== "string" || !status) return;
         eventName = `session.status.${status}`;
       }
 

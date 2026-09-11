@@ -10,8 +10,8 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value as toml_value};
 const MARKER_PREFIX: &str = "// hooklinesinker-generated protocol=";
 const BIN_PLACEHOLDER: &str = "__HOOKLINESINKER_BIN__";
 
-const OPENCODE_TEMPLATE: &str = include_str!("../assets/opencode-hooklinesinker.ts");
-const PI_TEMPLATE: &str = include_str!("../assets/pi-hooklinesinker.ts");
+const OPENCODE_TEMPLATE: &str = include_str!("../adapters/opencode-hooklinesinker.ts");
+const PI_TEMPLATE: &str = include_str!("../adapters/pi-hooklinesinker.ts");
 
 struct EventSpec {
     name: &'static str,

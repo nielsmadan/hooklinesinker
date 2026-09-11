@@ -1,8 +1,8 @@
-//! Behavioural coverage for the bundled TypeScript adapters in `assets/`.
+//! Behavioural coverage for the bundled TypeScript adapters in `adapters/`.
 //!
 //! `hooks install` writes these verbatim (bar the binary path), so the events an agent produces
 //! are decided entirely by this TypeScript — Rust never sees the difference between a correct
-//! adapter and one that ingests the wrong event. `tests/assets_harness.mjs` runs each adapter
+//! adapter and one that ingests the wrong event. `tests/adapters_harness.mjs` runs each adapter
 //! against a stubbed host and a fake binary that records what it was asked to ingest.
 //!
 //! Skips with a message when node is missing or too old for type stripping, so `cargo test`
@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `--experimental-strip-types` landed in 22.6; the adapters are `.ts`.
 const MIN_NODE: (u32, u32) = (22, 6);
 
-const PI_ASSET: &str = "assets/pi-hooklinesinker.ts";
-const OPENCODE_ASSET: &str = "assets/opencode-hooklinesinker.ts";
+const PI_ADAPTER: &str = "adapters/pi-hooklinesinker.ts";
+const OPENCODE_ADAPTER: &str = "adapters/opencode-hooklinesinker.ts";
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -133,7 +133,7 @@ fn run_harness() -> Option<HashMap<String, Run>> {
     let workdir = unique_temp_dir("adapters");
     let output = Command::new("node")
         .arg("--experimental-strip-types")
-        .arg(root.join("tests/assets_harness.mjs"))
+        .arg(root.join("tests/adapters_harness.mjs"))
         .arg(&root)
         .arg(&workdir)
         .env("NODE_NO_WARNINGS", "1")
@@ -190,8 +190,8 @@ fn string_list(value: &Value) -> Vec<String> {
 }
 
 #[test]
-fn adapter_assets_carry_the_binary_placeholder() {
-    for asset in [PI_ASSET, OPENCODE_ASSET] {
+fn adapters_carry_the_binary_placeholder() {
+    for asset in [PI_ADAPTER, OPENCODE_ADAPTER] {
         let source = std::fs::read_to_string(repo_root().join(asset)).unwrap();
         assert!(
             source.contains("__HOOKLINESINKER_BIN__"),
@@ -219,6 +219,17 @@ fn pi_prompt_and_decision_produce_the_permission_lifecycle() {
     );
     // Shutdown unsubscribes both channels, so a later prompt cannot reach a dead session.
     assert!(run.subscribed_channels.is_empty());
+}
+
+#[test]
+fn pi_handles_malformed_permission_payloads() {
+    let Some(run) = run("pi:malformed_permission_payloads") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "permission_prompt", "permission_resolved"]
+    );
 }
 
 #[test]
@@ -323,6 +334,7 @@ fn opencode_untracked_and_typeless_events_are_dropped() {
     for scenario in [
         "opencode:untracked_event_is_dropped",
         "opencode:status_without_type_is_dropped",
+        "opencode:malformed_events_are_dropped",
     ] {
         let Some(run) = run(scenario) else {
             return;
@@ -333,6 +345,27 @@ fn opencode_untracked_and_typeless_events_are_dropped() {
             "{scenario} ingested more than the load-time event"
         );
     }
+}
+
+#[test]
+fn opencode_session_ids_use_the_first_valid_string() {
+    let Some(run) = run("opencode:session_id_fallbacks") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session.created",
+            "session.created",
+            "session.idle",
+            "session.deleted",
+            "session.idle"
+        ]
+    );
+    for (index, id) in ["from-info", "from-snake", "from-camel"].iter().enumerate() {
+        assert_eq!(run.stdin(index + 1)["session_id"], *id);
+    }
+    assert_eq!(run.stdin(4), &serde_json::json!({ "cwd": "/work/repo" }));
 }
 
 #[test]
@@ -350,8 +383,8 @@ fn opencode_a_hanging_binary_cannot_block_the_adapter() {
 
 /// Guards the harness itself: a stale `Path` here would make every assertion above vacuous.
 #[test]
-fn harness_and_assets_exist() {
-    for path in ["tests/assets_harness.mjs", PI_ASSET, OPENCODE_ASSET] {
+fn harness_and_adapters_exist() {
+    for path in ["tests/adapters_harness.mjs", PI_ADAPTER, OPENCODE_ADAPTER] {
         let full: &Path = &repo_root().join(path);
         assert!(full.exists(), "missing {}", full.display());
     }

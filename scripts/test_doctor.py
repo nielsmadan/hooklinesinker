@@ -24,7 +24,7 @@ class DoctorTests(unittest.TestCase):
             DOCTOR_TEST_NODE="24.0.0",
             DOCTOR_TEST_HOOKS="0",
         )
-        for name in ["cargo", "rustc", "python3", "node", "lefthook"]:
+        for name in ["cargo", "rustc", "python3", "node", "npm", "lefthook"]:
             path = self.root / name
             path.write_text(
                 f"#!{sys.executable}\n"
@@ -60,7 +60,8 @@ class DoctorTests(unittest.TestCase):
             "rustfmt",
             "clippy",
             "Python 3.9+",
-            "Node 22.6+",
+            "Node 22.12+",
+            "npm",
             "lefthook",
             "Git hooks",
         ]:
@@ -76,16 +77,22 @@ class DoctorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(calls[-2:], [["lefthook", "version"], ["lefthook", "check-install"]])
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), 9)
 
-    def test_checks_node_version_at_the_adapter_boundary(self):
-        for version, expected in [("20.20.0", 1), ("22.5.0", 1), ("22.6.0", 0), ("24.0.0", 0)]:
+    def test_checks_node_version_at_the_adapter_tooling_boundary(self):
+        for version, expected in [
+            ("20.20.0", 1),
+            ("22.6.0", 1),
+            ("22.11.0", 1),
+            ("22.12.0", 0),
+            ("24.0.0", 0),
+        ]:
             with self.subTest(version=version):
                 self.env["DOCTOR_TEST_NODE"] = version
                 result = self.invoke()
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 if expected:
-                    self.assertIn("MISSING  Node 22.6+", result.stdout)
+                    self.assertIn("MISSING  Node 22.12+", result.stdout)
 
     def test_missing_hooks_report_setup_instruction(self):
         self.env["DOCTOR_TEST_HOOKS"] = "1"

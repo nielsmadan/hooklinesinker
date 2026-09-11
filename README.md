@@ -14,7 +14,7 @@ hook events, it might save you some time. It can be installed standalone or inte
 own app; see [Integrating](#integrating).
 
 In the future it might support more than status events
-([why only status events for now](docs/design/status-events-only.md)). Let me know if you have a
+([why only status events for now](docs/decisions/0001-status-events-only.md)). Let me know if you have a
 use case and which events you would be interested in.
 
 Today's consumers:
@@ -22,6 +22,13 @@ Today's consumers:
 - **[Juggler](https://github.com/nielsmadan/juggler)** bundles it and subscribes to a sink.
 - **[ringleader](https://github.com/nielsmadan/ringleader)** bundles it and polls `sessions --json`.
 - You can also install it on its own — see *Standalone install*.
+
+[Install](#install) · [Commands](#commands) · [Protocol](#protocol-1) ·
+[Integrating](#integrating) · [Paths](#paths) · [Diagnostics](#diagnostics) ·
+[Development](#development) · [Releasing](#releasing)
+
+For implementation flows, design decisions, and manual check procedures, start at the
+[documentation index](docs/overview.md).
 
 ## Install
 
@@ -45,8 +52,9 @@ binary have their own lifecycle: `hooklinesinker uninstall --consumer me` remove
 and the hooks and active binary are removed when the last consumer leaves.
 
 `hooklinesinker install --consumer NAME` is idempotent and cooperative: a newer protocol-compatible
-binary that is already active is reused rather than downgraded, and existing hook groups are reconciled in place rather
-than duplicated. So it does not matter whether Juggler, ringleader or you go first.
+binary that is already active is reused rather than downgraded. Hook configuration is updated
+separately with `hooks install --agent AGENT`, which reconciles owned entries in place.
+See [installation](docs/installation.md) for the three installation lifecycles.
 
 ## Commands
 
@@ -94,8 +102,9 @@ envelope whose `protocol` is not one they speak, and skip individual records who
 ```
 
 Keys are camelCase. `agent` is kebab-case (`claude`, `codex`, `opencode`, `pi`, `droid`, `qwen`,
-`kimi`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`); an
-unrecognized phase decodes as `unknown` rather than failing the record.
+`kimi`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`).
+Consumers should map unfamiliar phase values to `unknown` when the rest of the record can be
+decoded; the Rust enum itself does not provide that fallback.
 
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which also separates two terminals driving the same native session.
@@ -112,8 +121,8 @@ that notification.
 report an empty, healthy-looking result.
 
 **Sinks.** A consumer that registers with `--sink URL` gets each event POSTed as JSON to that URL
-as it happens, instead of polling. Sink failures are recorded as problems, never retried into a
-hang, and never block the hook.
+as it happens, instead of polling. Sink failures are recorded as problems and are not retried.
+Network timeouts bound each delivery phase; handled delivery failures do not fail the agent hook.
 
 ## Integrating
 
@@ -141,8 +150,8 @@ This is ringleader's model (`ringleader/presence.py`).
 Register a sink and receive every event as it happens.
 
 1. Start a localhost HTTP server. Each event arrives as one `POST` with a `StatusEvent` JSON
-   body. Answer 2xx fast: the sender's budget is 200 ms and it never retries. Do your real work
-   after responding.
+   body. Answer 2xx fast: the sender has separate 200 ms connection, response and body timeouts
+   and never retries. Do your real work after responding.
 2. Register: `hooklinesinker install --consumer yourname --sink http://127.0.0.1:PORT/hook`.
 3. Hydrate: after your server is listening, run `sessions --json` once, applying the same
    protocol refusal, per-record skip, and `problems` handling as the Pull model, and feed the
@@ -173,7 +182,7 @@ This is Juggler's model (`juggler/Services/HooklinesinkerClient.swift`, `HookSer
 |---|---|
 | `$XDG_DATA_HOME/hooklinesinker/versions/<v>/hooklinesinker` | each installed version |
 | `$XDG_DATA_HOME/hooklinesinker/bin/hooklinesinker` | symlink to the active version |
-| `$XDG_STATE_HOME/hooklinesinker/status/` | one JSON record per live binding |
+| `$XDG_STATE_HOME/hooklinesinker/status/` | latest recorded status per binding; dead records await ingest sweeping |
 | `$XDG_STATE_HOME/hooklinesinker/consumers/` | one JSON record per consumer |
 | `$XDG_STATE_HOME/hooklinesinker/health.json` | recent problems |
 | `~/.factory/hooks.json` | Factory Droid hooks (top-level event map, no `hooks` wrapper) |
@@ -219,8 +228,8 @@ additive and removal is scoped:
 - Removing the last consumer uninstalls the hooks for every agent and drops the active
   binary symlink.
 
-So no tool can pull the rug out from under another, and nothing is left behind once the last one
-leaves.
+Removing one consumer preserves the installation used by the others. After the last consumer
+leaves, old version directories and stored state remain; see [removal](docs/installation.md#remove-a-consumer).
 
 ## The privacy boundary
 
@@ -244,58 +253,31 @@ records whose process is gone; it does not remove them.
 
 ## Development
 
+Install Rust with rustfmt and Clippy, Just, Lefthook, Python 3.9+, and Node 22.12+ with npm
+(Node 24 recommended), then run:
+
 ```sh
-just setup      # fetch dependencies, install Git hooks, and verify the checkout
-just doctor     # check development tools and Git hooks
-just check      # formatting, Clippy, Rust tests, and development/release-tool tests
-just test
-just lint
-just format
-just build-release    # local dist/ artifacts for all four targets + SHA256SUMS
+just setup
+just check
 ```
 
-Install Rust with rustfmt and Clippy, Lefthook, Python 3.9+, and Node 22.6+ before running
-`just setup`. `just doctor` reports missing tools and hooks without installing anything or
-running tests. The pre-push hook runs `just check`; CI also builds all four platform targets.
-
-The OpenCode and Pi adapters in `assets/` are exercised by a node harness
-(`tests/assets_harness.mjs`, driven from `tests/ts_adapters.rs`); those tests skip themselves
-when node 22.6+ is not on `PATH`, so CI installs node.
-
-Releases build `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu` and
-`x86_64-unknown-linux-gnu`, combine the two macOS binaries with `lipo`, and write a SHA-256
-manifest. Consumers verify a staged artifact against that manifest before ever executing it.
+`just setup` installs the pinned adapter tools and Git hooks. `just check` runs TypeScript,
+explicit-`any` lint, Python tooling tests, Rust formatting, Clippy, and Cargo tests.
+For focused checks, adapter development, and local shared-binary iteration, see
+[development and releases](docs/development-and-releases.md).
 
 ## Releasing
 
-Run `just release` from a clean, current `main` checkout with complete Git history, matching
-local/origin version tags, and Git credentials that can push to `origin`.
-The command proposes a version, runs `just check`, and asks for confirmation. Enter `y` to
-proceed, enter a version or `patch`/`minor`/`major` to revise the proposal, or press Enter to cancel.
-
 ```sh
-just release
-just release minor
-just release 1.2.0
 just release --dry-run
-just release patch --yes
+just release
 ```
 
-Features propose a minor bump, fixes a patch, and breaking changes a major bump (minor during
-`0.x`). Maintenance-only changes require an explicit bump. The initial release is `1.0.0`.
-`--dry-run` reads local/origin state and previews without checks, edits, or publication.
-`--yes` explicitly confirms unattended use; other nonterminal invocations fail.
+Run from a clean, current `main` checkout. The helper proposes a version from Git tags, runs
+checks, and asks for confirmation before preparing and pushing the release commit and tag.
+It needs Git credentials; GitHub CLI authentication is used only inside Actions.
 
-After confirmation, preparation updates the package version in `Cargo.toml` and regenerates
-`Cargo.lock` offline using Cargo's existing dependency resolution. It commits those two files
-and atomically pushes `main` and an annotated tag, including local commits counted in the preview.
-The existing workflow builds the macOS/Linux artifacts, verifies their version against the tag,
-and creates a **draft GitHub release** with `SHA256SUMS`, using CI's GitHub token.
-The command returns after the push and prints an Actions link filtered to the release tag.
-Check that workflow's result, then review and publish the draft manually. Local success confirms
-the Git push; artifact creation continues in CI. GitHub CLI authentication is only used inside CI.
-
-`scripts/release.json` declares this policy; the release helper and its tests are shared with
-the other versioned workspace projects. Failed preparation or push leaves local changes,
-commits, or tags available for inspection. A failed workflow leaves the remote tag in place;
-inspect the reported Actions URL and fix or rerun the workflow. Never replace a public tag.
+The tag workflow creates a draft release with macOS/Linux binaries and `SHA256SUMS`.
+Check both CI and the release workflow, then publish the draft manually. See
+[the release procedure](docs/development-and-releases.md#prepare-and-publish-a-release)
+for overrides, artifact verification, consumer updates, and failure recovery.

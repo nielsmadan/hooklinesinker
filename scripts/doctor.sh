@@ -16,7 +16,8 @@ probe rustc 'install Rust: https://rustup.rs' rustc --version
 probe rustfmt 'run: rustup component add rustfmt' cargo fmt --version
 probe clippy 'run: rustup component add clippy' cargo clippy --version
 probe 'Python 3.9+' 'install Python 3.9 or newer' python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))'
-probe 'Node 22.6+' 'install Node 24 LTS for the adapter tests' node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || major === 22 && minor >= 6 ? 0 : 1)'
+probe 'Node 22.12+' 'install Node 24 LTS for the adapter checks' node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || major === 22 && minor >= 12 ? 0 : 1)'
+probe npm 'install npm with Node.js' npm --version
 probe lefthook 'run: brew install lefthook' lefthook version
 probe 'Git hooks' 'run: just setup' lefthook check-install
 exit "$failed"
