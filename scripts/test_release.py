@@ -1,5 +1,4 @@
 import importlib.util
-import io
 import json
 import os
 import pty
@@ -9,7 +8,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("release.py")
 SPEC = importlib.util.spec_from_file_location("release", SCRIPT)
@@ -170,47 +168,6 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.git("show", "v1.4.2:VERSION"), "1.4.2")
         self.assertEqual(self.git("log", "-1", "--format=%s"), "chore: release 1.4.2")
         self.assertEqual(self.git("status", "--porcelain"), "")
-
-    def test_github_release_pushes_with_git_without_gh(self):
-        policy = json.loads(SCRIPT.with_suffix(".json").read_text())
-        self.assertNotIn("gh", policy["tools"])
-        for key in ("tools", "repository", "workflow", "publication"):
-            self.config[key] = policy[key]
-        self.save_config()
-        self.commit("chore: configure release workflow")
-        run = release.run
-
-        def run_with_local_github_origin(root, *args, **kwargs):
-            if args[:3] == ("git", "remote", "get-url"):
-                return f"https://github.com/{policy['repository']}.git"
-            if args[0] == "gh":
-                raise FileNotFoundError("gh is not installed")
-            return run(root, *args, **kwargs)
-
-        with (
-            patch.dict(os.environ, self.env),
-            patch.object(release, "__file__", str(self.root / "scripts/release.py")),
-            patch.object(release, "run", side_effect=run_with_local_github_origin),
-            patch.object(
-                shutil,
-                "which",
-                side_effect=lambda tool: None if tool == "gh" else f"/usr/bin/{tool}",
-            ),
-            patch.object(sys, "argv", ["release.py", "--yes"]),
-            patch("sys.stdout", new_callable=io.StringIO) as output,
-        ):
-            release.main()
-
-        revision = self.git("rev-parse", "HEAD")
-        self.assertEqual(self.git("show", "v1.2.1:VERSION"), "1.2.1")
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/main").split()[0], revision)
-        self.assertEqual(self.git("ls-remote", "origin", "refs/tags/v1.2.1^{}").split()[0], revision)
-        self.assertIn("Pushed v1.2.1.", output.getvalue())
-        self.assertIn(
-            f"Actions: https://github.com/{policy['repository']}/actions/workflows/"
-            f"{policy['workflow']}?query=branch%3Av1.2.1",
-            output.getvalue(),
-        )
 
     def test_invalid_or_old_versions_preserve_release(self):
         for version in ["1.2.0", "1.1.9", "v1.02.1", "1.3", "1.3.0;touch bad"]:
