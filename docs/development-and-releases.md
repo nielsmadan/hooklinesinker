@@ -87,11 +87,11 @@ changed release files, creates an annotated tag and atomically pushes `main` and
 It prints a tag-filtered Actions URL and returns after the push.
 The [tag workflow](../.github/workflows/release.yml) builds all four targets, assembles the
 three artifacts and checksum manifest, verifies the macOS binary's compiled version matches
-the tag, then uses `gh release create --draft --verify-tag` with CI's GitHub token. This
+the tag, then automatically publishes with `gh release create --verify-tag` using CI's GitHub token. This
 workflow does not run the full test/lint suite; local release checks and the separate
 main/PR workflow provide those checks. Local success confirms the push, not finished artifacts.
 
-Check the Actions result, review the assets, then publish the draft manually. Consumers
+Wait for both CI and the release workflow to succeed, then verify the published assets. Consumers
 must separately update their helper version/source pins and verify release artifacts in their
 own repositories; publishing does not update Juggler or ringleader automatically.
 

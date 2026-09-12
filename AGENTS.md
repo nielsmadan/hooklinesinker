@@ -32,7 +32,8 @@ The pre-push hook runs `just check`; CI additionally builds all four platform ta
 Release from a clean, current `main` checkout with complete history and matching origin tags.
 After checks and confirmation, preparation updates `Cargo.toml` and `Cargo.lock`, commits them,
 and atomically pushes the branch and tag using Git credentials, then prints the Actions link.
-Check CI's result and publish its draft release manually; never replace a public tag.
+The tag workflow publishes automatically after its builds and version check pass.
+Check both CI and the release workflow; never replace a public tag.
 The [development and release guide](docs/development-and-releases.md) documents prerequisites
 and failure recovery.
 

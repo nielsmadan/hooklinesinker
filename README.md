@@ -277,7 +277,7 @@ Run from a clean, current `main` checkout. The helper proposes a version from Gi
 checks, and asks for confirmation before preparing and pushing the release commit and tag.
 It needs Git credentials; GitHub CLI authentication is used only inside Actions.
 
-The tag workflow creates a draft release with macOS/Linux binaries and `SHA256SUMS`.
-Check both CI and the release workflow, then publish the draft manually. See
+The tag workflow builds and automatically publishes the release with macOS/Linux binaries
+and `SHA256SUMS`. Wait for both CI and the release workflow to succeed. See
 [the release procedure](docs/development-and-releases.md#prepare-and-publish-a-release)
 for overrides, artifact verification, consumer updates, and failure recovery.

@@ -14,5 +14,5 @@
   ],
   "repository": "nielsmadan/hooklinesinker",
   "workflow": "release.yml",
-  "publication": "Draft GitHub release with macOS/Linux binaries and SHA256SUMS; publish the draft manually"
+  "publication": "GitHub Actions will build and automatically publish the release with macOS/Linux binaries and SHA256SUMS"
 }
