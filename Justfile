@@ -25,7 +25,7 @@ lint:
     @npm run lint
 
 check-adapters:
-    @npm run check
+    @npm run check-all
 
 format:
     @cargo fmt
@@ -49,7 +49,7 @@ release *args:
 # Build and drop a fresh binary straight onto the active install, bypassing version
 # promotion (which reuses an equal version and would ignore a rebuilt one). For local
 # iteration only — a real change ships as a version bump + release.
-dev-install:
+refresh-active:
     #!/usr/bin/env bash
     set -euo pipefail
     data="${XDG_DATA_HOME:-$HOME/.local/share}/hooklinesinker"

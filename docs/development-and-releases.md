@@ -35,7 +35,7 @@ such a machine does not verify adapter behavior; the development-tool requiremen
 
 `just install` refreshes Cargo's command; `install --consumer NAME` separately promotes it
 into the shared installation. Promotion reuses equal versions. For local iteration,
-`just dev-install` builds release mode and atomically replaces the binary targeted by the
+`just refresh-active` builds release mode and atomically replaces the binary targeted by the
 existing active symlink. It affects all consumers and requires an existing activation.
 It neither advances the version nor refreshes hook configuration or TypeScript adapter files;
 run hook installation separately when those change. See [installation](installation.md).

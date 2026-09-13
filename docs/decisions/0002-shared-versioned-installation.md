@@ -26,7 +26,7 @@ leaves, remove owned hooks and the active symlink, while retaining version direc
 - Installation order cannot downgrade a compatible active helper. A consumer must support the
   protocol it registers for even when another consumer supplies the active version.
 - Rebuilding a binary with the same version does not upgrade an active installation. Release
-  changed binaries under a new version; use `just dev-install` only for local iteration.
+  changed binaries under a new version; use `just refresh-active` only for local iteration.
 - Updating the active executable does not install new hook entries or refresh copied adapters.
   Hook reconciliation and host trust remain explicit steps.
 - Deactivation does not erase all stored data. Old binaries, ledger/health data, and directories
