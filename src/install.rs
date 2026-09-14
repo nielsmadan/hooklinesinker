@@ -1,7 +1,7 @@
 use crate::consumers::{Consumer, ConsumerStore};
 use crate::hooks::HookManager;
 use crate::protocol::Agent;
-use crate::state::write_private_atomic;
+use crate::state::{LockGuard, write_private_atomic};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -147,9 +147,18 @@ impl Installer {
         }))
     }
 
-    pub fn install_candidate(&self, candidate: Candidate) -> io::Result<InstalledVersion> {
+    fn lock(&self) -> io::Result<LockGuard> {
+        LockGuard::acquire(&self.data_root.join("install.lock"))
+    }
+
+    pub fn install_candidate(&self, candidate: &Candidate) -> io::Result<InstalledVersion> {
+        let _guard = self.lock()?;
+        self.install_candidate_locked(candidate)
+    }
+
+    fn install_candidate_locked(&self, candidate: &Candidate) -> io::Result<InstalledVersion> {
         match self.active_version()? {
-            None => self.activate(&candidate),
+            None => self.activate(candidate),
             Some(active) => {
                 if candidate.protocol_major != active.protocol_major {
                     return Err(io::Error::new(
@@ -161,7 +170,7 @@ impl Installer {
                     ));
                 }
                 if candidate.version > active.version {
-                    self.activate(&candidate)
+                    self.activate(candidate)
                 } else {
                     Ok(InstalledVersion {
                         active_version: active.version_str,
@@ -212,11 +221,12 @@ impl Installer {
     pub fn install_current(
         &self,
         consumers: &ConsumerStore,
-        consumer: Consumer,
+        consumer: &Consumer,
     ) -> io::Result<InstalledVersion> {
         let current_exe = std::env::current_exe()?;
         let candidate = Candidate::current(current_exe)?;
-        let installed = self.install_candidate(candidate)?;
+        let _guard = self.lock()?;
+        let installed = self.install_candidate_locked(&candidate)?;
         consumers.register(consumer)?;
         Ok(installed)
     }
@@ -227,6 +237,7 @@ impl Installer {
         hooks: &HookManager,
         name: &str,
     ) -> io::Result<UninstallOutcome> {
+        let _guard = self.lock()?;
         consumers.remove(name)?;
         let remaining = consumers.list()?;
         if !remaining.is_empty() {
@@ -336,7 +347,7 @@ mod tests {
     fn installation_with_active(version: &str, protocol_major: u16) -> Installer {
         let install = installation();
         install
-            .install_candidate(candidate(version, protocol_major))
+            .install_candidate(&candidate(version, protocol_major))
             .unwrap();
         install
     }
@@ -358,7 +369,7 @@ mod tests {
     #[test]
     fn missing_install_activates_the_candidate() {
         let install = installation();
-        let result = install.install_candidate(candidate("0.1.0", 1)).unwrap();
+        let result = install.install_candidate(&candidate("0.1.0", 1)).unwrap();
         assert_eq!(result.active_version, "0.1.0");
         assert_eq!(result.protocol_major, 1);
         assert!(install.binary_path().exists());
@@ -367,30 +378,30 @@ mod tests {
     #[test]
     fn installing_the_same_version_again_is_a_no_op() {
         let install = installation_with_active("0.2.0", 1);
-        let result = install.install_candidate(candidate("0.2.0", 1)).unwrap();
+        let result = install.install_candidate(&candidate("0.2.0", 1)).unwrap();
         assert_eq!(result.active_version, "0.2.0");
     }
 
     #[test]
     fn older_bundled_binary_never_downgrades_compatible_active_version() {
         let install = installation_with_active("0.2.0", 1);
-        let result = install.install_candidate(candidate("0.1.0", 1)).unwrap();
+        let result = install.install_candidate(&candidate("0.1.0", 1)).unwrap();
         assert_eq!(result.active_version, "0.2.0");
     }
 
     #[test]
     fn newer_compatible_candidate_replaces_the_active_version() {
         let install = installation_with_active("0.2.0", 1);
-        let result = install.install_candidate(candidate("0.3.0", 1)).unwrap();
+        let result = install.install_candidate(&candidate("0.3.0", 1)).unwrap();
         assert_eq!(result.active_version, "0.3.0");
     }
 
     #[test]
     fn incompatible_protocol_major_is_rejected() {
         let install = installation_with_active("0.2.0", 1);
-        let result = install.install_candidate(candidate("0.3.0", 2));
+        let result = install.install_candidate(&candidate("0.3.0", 2));
         assert!(result.is_err());
-        let active = install.install_candidate(candidate("0.2.0", 1)).unwrap();
+        let active = install.install_candidate(&candidate("0.2.0", 1)).unwrap();
         assert_eq!(active.active_version, "0.2.0");
     }
 
@@ -409,7 +420,7 @@ mod tests {
                 .join("hooklinesinker")
         );
 
-        install.install_candidate(candidate("0.5.0", 1)).unwrap();
+        install.install_candidate(&candidate("0.5.0", 1)).unwrap();
         let target = fs::read_link(install.binary_path()).unwrap();
         assert_eq!(
             target,
@@ -438,7 +449,7 @@ mod tests {
             capabilities: vec!["status".to_string()],
             sink: None,
         };
-        install.install_current(&consumers, consumer).unwrap();
+        install.install_current(&consumers, &consumer).unwrap();
         assert!(install.binary_path().exists());
         assert_eq!(consumers.list().unwrap().len(), 1);
     }
@@ -450,7 +461,7 @@ mod tests {
         install
             .install_current(
                 &consumers,
-                Consumer {
+                &Consumer {
                     name: "juggler".to_string(),
                     protocol: crate::protocol::PROTOCOL_VERSION,
                     capabilities: vec!["status".to_string()],
@@ -461,7 +472,7 @@ mod tests {
         install
             .install_current(
                 &consumers,
-                Consumer {
+                &Consumer {
                     name: "ringleader".to_string(),
                     protocol: crate::protocol::PROTOCOL_VERSION,
                     capabilities: vec!["status".to_string()],
@@ -477,7 +488,7 @@ mod tests {
         let install = installation_with_active("0.6.0", 1);
         let consumers = ConsumerStore::open(temp_root("consumers-uninstall-one")).unwrap();
         consumers
-            .register(Consumer {
+            .register(&Consumer {
                 name: "juggler".to_string(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities: vec!["status".to_string()],
@@ -485,7 +496,7 @@ mod tests {
             })
             .unwrap();
         consumers
-            .register(Consumer {
+            .register(&Consumer {
                 name: "ringleader".to_string(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities: vec!["status".to_string()],
@@ -506,7 +517,7 @@ mod tests {
         let install = installation_with_active("0.7.0", 1);
         let consumers = ConsumerStore::open(temp_root("consumers-last")).unwrap();
         consumers
-            .register(Consumer {
+            .register(&Consumer {
                 name: "juggler".to_string(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities: vec!["status".to_string()],
@@ -531,5 +542,207 @@ mod tests {
         );
         let status = hooks.status(Agent::Claude).unwrap();
         assert_eq!(status.state, crate::hooks::HookState::Missing);
+    }
+    #[test]
+    fn damaged_remaining_registration_preserves_shared_installation() {
+        for unreadable in [false, true] {
+            let install = installation_with_active("0.7.0", 1);
+            let root = temp_root("damaged-consumer");
+            let consumers = ConsumerStore::open(root.clone()).unwrap();
+            consumers
+                .register(&Consumer {
+                    name: "one".into(),
+                    protocol: 1,
+                    capabilities: vec!["status".into()],
+                    sink: None,
+                })
+                .unwrap();
+            let remaining = root.join("consumers/two.json");
+            if unreadable {
+                fs::create_dir(&remaining).unwrap();
+            } else {
+                fs::write(&remaining, "{").unwrap();
+            }
+            let hooks = hook_manager_for(&install);
+            hooks.install(Agent::Claude).unwrap();
+            let error = install
+                .uninstall_consumer(&consumers, &hooks, "one")
+                .unwrap_err();
+            assert!(error.to_string().contains("two.json"));
+            assert!(remaining.exists());
+            assert_eq!(
+                install
+                    .active_version_summary()
+                    .unwrap()
+                    .unwrap()
+                    .active_version,
+                "0.7.0"
+            );
+            assert_eq!(
+                hooks.status(Agent::Claude).unwrap().state,
+                crate::hooks::HookState::Installed
+            );
+        }
+    }
+
+    #[test]
+    fn waiting_installer_rechecks_the_version_after_acquiring_the_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let install = installation_with_active("1.0.2", 1);
+        let older = candidate("1.0.3", 1);
+        let newer = candidate("1.0.4", 1);
+        let guard = install.lock().unwrap();
+        let root = install.data_root.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let installer = Installer::open(root).unwrap();
+            started_tx.send(()).unwrap();
+            let result = installer.install_candidate(&older);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(100));
+        install.install_candidate_locked(&newer).unwrap();
+        drop(guard);
+        worker.join().unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(done_rx.recv().unwrap().unwrap().active_version, "1.0.4");
+        assert_eq!(
+            fs::read(install.binary_path()).unwrap(),
+            fs::read(&newer.binary_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn install_current_keeps_registration_inside_the_uninstall_transaction() {
+        use fs2::FileExt;
+        use std::time::{Duration, Instant};
+
+        let install = installation_with_active("0.0.1", crate::protocol::PROTOCOL_VERSION);
+        let state_root = temp_root("blocked-registration");
+        let consumers = ConsumerStore::open(&state_root).unwrap();
+        let existing = Consumer {
+            name: "existing".into(),
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            capabilities: vec!["status".into()],
+            sink: None,
+        };
+        consumers.register(&existing).unwrap();
+        let registering = Consumer {
+            name: "registering".into(),
+            ..existing
+        };
+        let hooks = hook_manager_for(&install);
+        hooks.install(Agent::Claude).unwrap();
+        let registration_guard = LockGuard::acquire(&state_root.join("consumers.lock")).unwrap();
+        let root = install.data_root.clone();
+        let registering_store = ConsumerStore::open(&state_root).unwrap();
+        let installer = std::thread::spawn(move || {
+            Installer::open(root)
+                .unwrap()
+                .install_current(&registering_store, &registering)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while install
+            .active_version_summary()
+            .unwrap()
+            .unwrap()
+            .active_version
+            != env!("CARGO_PKG_VERSION")
+        {
+            assert!(Instant::now() < deadline, "installation did not activate");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let lock = File::open(install.data_root.join("install.lock")).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            match lock.try_lock_exclusive() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("failed to inspect installation lock: {e}"),
+                Ok(()) => {
+                    FileExt::unlock(&lock).unwrap();
+                    panic!("installation lock released before consumer registration");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let root = install.data_root.clone();
+        let removing_store = ConsumerStore::open(&state_root).unwrap();
+        let uninstaller = std::thread::spawn(move || {
+            let outcome = Installer::open(root).unwrap().uninstall_consumer(
+                &removing_store,
+                &hooks,
+                "existing",
+            );
+            (outcome, hooks)
+        });
+        drop(registration_guard);
+        assert_eq!(
+            installer.join().unwrap().unwrap().active_version,
+            env!("CARGO_PKG_VERSION")
+        );
+        let (outcome, hooks) = uninstaller.join().unwrap();
+        assert!(!outcome.unwrap().was_last_consumer);
+        assert!(install.binary_path().exists());
+        assert_eq!(consumers.list().unwrap()[0].name, "registering");
+        assert_eq!(
+            hooks.status(Agent::Claude).unwrap().state,
+            crate::hooks::HookState::Installed
+        );
+    }
+
+    #[test]
+    fn uninstall_rechecks_consumers_after_acquiring_the_installation_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let install = installation_with_active("1.0.2", 1);
+        let state_root = temp_root("waiting-uninstall");
+        let consumers = ConsumerStore::open(state_root.clone()).unwrap();
+        consumers
+            .register(&Consumer {
+                name: "one".into(),
+                protocol: 1,
+                capabilities: vec!["status".into()],
+                sink: None,
+            })
+            .unwrap();
+        let hooks = hook_manager_for(&install);
+        hooks.install(Agent::Claude).unwrap();
+        let guard = install.lock().unwrap();
+        let root = install.data_root.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let installer = Installer::open(root).unwrap();
+            let store = ConsumerStore::open(state_root).unwrap();
+            started_tx.send(()).unwrap();
+            let result = installer.uninstall_consumer(&store, &hooks, "one");
+            done_tx.send((result, hooks)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(100));
+        consumers
+            .register(&Consumer {
+                name: "two".into(),
+                protocol: 1,
+                capabilities: vec!["status".into()],
+                sink: None,
+            })
+            .unwrap();
+        drop(guard);
+        worker.join().unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        let (result, hooks) = done_rx.recv().unwrap();
+        assert!(!result.unwrap().was_last_consumer);
+        assert!(install.binary_path().exists());
+        assert_eq!(
+            hooks.status(Agent::Claude).unwrap().state,
+            crate::hooks::HookState::Installed
+        );
+        assert_eq!(consumers.list().unwrap()[0].name, "two");
     }
 }

@@ -48,7 +48,7 @@ pub enum Command {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Clone, Copy, Subcommand)]
 pub enum HooksCommand {
     Install {
         #[arg(long)]

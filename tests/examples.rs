@@ -7,7 +7,7 @@
 //! instead lean on the same script-runtime argv fallback the adapters rely on: a node process
 //! whose script file is literally named after the agent (e.g. `claude`) satisfies
 //! `is_owning_process` without needing a renamed system binary. That means the live-session
-//! tests need node, same as tests/ts_adapters.rs, and skip themselves when it is missing.
+//! tests need node, same as `tests/ts_adapters.rs`, and skip themselves when it is missing.
 
 #![cfg(unix)]
 
@@ -51,8 +51,6 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// `Some(())`-shaped guard: prints a SKIP line and returns false when node is missing, same
-/// convention as tests/ts_adapters.rs.
 fn usable_node() -> bool {
     match Command::new("node").arg("--version").output() {
         Ok(output) if output.status.success() => true,
@@ -146,11 +144,7 @@ fn wait_for_log_contains(path: &Path, needle: &str, timeout: Duration) -> bool {
     wait_for(|| read_log(path).contains(needle), timeout)
 }
 
-/// A node script file literally named after the agent so `is_owning_process`'s script-runtime
-/// fallback (src/processes.rs) matches it as the owning "claude" process. It ingests the given
-/// fixture once, signals readiness, waits to be told to continue, ingests a second event under
-/// the same still-alive process (so `ingest`'s ancestry walk yields the same pid/started_at and
-/// therefore the same bindingId), then idles until killed.
+// Both events use one live process so they share a bindingId.
 fn fake_claude_agent_script(fixture: &Path, ready1: &Path, cont: &Path, ready2: &Path) -> String {
     format!(
         r#"const {{ execFileSync }} = require("node:child_process");
@@ -347,36 +341,11 @@ fn poll_and_sink_server_track_a_live_session_end_to_end() {
         "fake claude agent never completed its first ingest"
     );
 
-    // Sanity check the fixture, independent of either example: the real binary must already
-    // see one live claude session before we ask the examples to find it.
-    let (code, stdout, stderr) = run_bin(&home, &["sessions", "--json"]);
-    assert_eq!(code, 0, "{stderr}");
-    let envelope: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(envelope["protocol"], 1);
-    let sessions = envelope["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1, "{stdout}");
-    assert_eq!(sessions[0]["session"]["id"], "claude-session");
+    assert_live_session_visible(&home);
 
-    // 1. Pull model: poll.sh must show that session.
-    let mut poll_cmd = Command::new(poll_script());
-    home.apply(&mut poll_cmd);
-    poll_cmd.env("HOOKLINESINKER_BIN", bin_path());
-    let poll_output = poll_cmd.output().unwrap();
-    assert!(
-        poll_output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&poll_output.stderr)
-    );
-    let poll_stdout = String::from_utf8_lossy(&poll_output.stdout);
-    assert!(poll_stdout.contains("claude"), "{poll_stdout}");
-    assert!(poll_stdout.contains("idle"), "{poll_stdout}");
-    assert!(poll_stdout.contains("claude-session"), "{poll_stdout}");
-    assert!(
-        poll_stdout.contains("/Users/example/project"),
-        "{poll_stdout}"
-    );
+    assert_poll_shows_live_session(&home);
 
-    // 2. Push model: sink-server.mjs must hydrate the same session on startup.
+    // The sink must hydrate the session created before it started.
     let sink_log = home.root.join("sink.log");
     let mut sink_cmd = Command::new("node");
     sink_cmd.arg(sink_server_script());
@@ -408,8 +377,7 @@ fn poll_and_sink_server_track_a_live_session_end_to_end() {
         "{log_after_hydrate}"
     );
 
-    // 3. A live event for the same bindingId (same still-alive fake agent process) must update
-    // the hydrated row, never add a second one — the dedupe the README calls for.
+    // An event for the hydrated binding must update its row without duplicating it.
     std::fs::write(&cont, "go").unwrap();
     assert!(
         wait_for_file(&ready2, Duration::from_secs(10)),
@@ -430,8 +398,7 @@ fn poll_and_sink_server_track_a_live_session_end_to_end() {
         "{log_after_update}"
     );
 
-    // 4. Killing the agent process, then any unrelated ingest, must sweep the dead binding and
-    // fan out a running:false event that removes the sink's row.
+    // An unrelated ingest must sweep the dead binding and remove the sink's row.
     wrapper.kill().expect("failed to kill fake claude agent");
     wrapper.wait().expect("failed to reap fake claude agent");
 
@@ -454,4 +421,34 @@ fn poll_and_sink_server_track_a_live_session_end_to_end() {
 
     sink.kill().ok();
     let _ = sink.wait();
+}
+
+fn assert_poll_shows_live_session(home: &IsolatedHome) {
+    let mut poll_cmd = Command::new(poll_script());
+    home.apply(&mut poll_cmd);
+    poll_cmd.env("HOOKLINESINKER_BIN", bin_path());
+    let poll_output = poll_cmd.output().unwrap();
+    assert!(
+        poll_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&poll_output.stderr)
+    );
+    let poll_stdout = String::from_utf8_lossy(&poll_output.stdout);
+    assert!(poll_stdout.contains("claude"), "{poll_stdout}");
+    assert!(poll_stdout.contains("idle"), "{poll_stdout}");
+    assert!(poll_stdout.contains("claude-session"), "{poll_stdout}");
+    assert!(
+        poll_stdout.contains("/Users/example/project"),
+        "{poll_stdout}"
+    );
+}
+
+fn assert_live_session_visible(home: &IsolatedHome) {
+    let (code, stdout, stderr) = run_bin(home, &["sessions", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let envelope: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["protocol"], 1);
+    let sessions = envelope["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{stdout}");
+    assert_eq!(sessions[0]["session"]["id"], "claude-session");
 }

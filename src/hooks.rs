@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value as toml_value};
 
 const MARKER_PREFIX: &str = "// hooklinesinker-generated protocol=";
@@ -16,64 +17,64 @@ const PI_TEMPLATE: &str = include_str!("../adapters/pi-hooklinesinker.ts");
 struct EventSpec {
     name: &'static str,
     matcher: Option<&'static str>,
-    timeout: u64,
+    timeout: Duration,
 }
 
 const CLAUDE_EVENTS: &[EventSpec] = &[
     EventSpec {
         name: "SessionStart",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "SessionEnd",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "UserPromptSubmit",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreToolUse",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUse",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUseFailure",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PermissionRequest",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "SubagentStart",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Stop",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "StopFailure",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreCompact",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
 ];
 
@@ -81,52 +82,52 @@ const CODEX_EVENTS: &[EventSpec] = &[
     EventSpec {
         name: "SessionStart",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "UserPromptSubmit",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreToolUse",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUse",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreCompact",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostCompact",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PermissionRequest",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Stop",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Interrupt",
         matcher: None,
-        timeout: 3,
+        timeout: Duration::from_secs(3),
     },
     EventSpec {
         name: "SessionEnd",
         matcher: None,
-        timeout: 3,
+        timeout: Duration::from_secs(3),
     },
 ];
 
@@ -134,111 +135,110 @@ const DROID_EVENTS: &[EventSpec] = &[
     EventSpec {
         name: "SessionStart",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "UserPromptSubmit",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreToolUse",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUse",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Stop",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Notification",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreCompact",
         matcher: Some("*"),
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "SessionEnd",
         matcher: None,
-        timeout: 3,
+        timeout: Duration::from_secs(3),
     },
 ];
 
-// Qwen's settings.json timeout is milliseconds, unlike Claude/Codex's seconds.
 const QWEN_EVENTS: &[EventSpec] = &[
     EventSpec {
         name: "SessionStart",
         matcher: None,
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "UserPromptSubmit",
         matcher: None,
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreToolUse",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUse",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUseFailure",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PermissionRequest",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PermissionDenied",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Stop",
         matcher: None,
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "StopFailure",
         matcher: None,
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Notification",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreCompact",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostCompact",
         matcher: Some("*"),
-        timeout: 5000,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "SessionEnd",
         matcher: None,
-        timeout: 3000,
+        timeout: Duration::from_secs(3),
     },
 ];
 
@@ -249,72 +249,72 @@ const KIMI_EVENTS: &[EventSpec] = &[
     EventSpec {
         name: "SessionStart",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "TurnStarted",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "UserPromptSubmit",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreToolUse",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUse",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostToolUseFailure",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PermissionRequest",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PermissionResult",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Stop",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "StopFailure",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "Interrupt",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PreCompact",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "PostCompact",
         matcher: None,
-        timeout: 5,
+        timeout: Duration::from_secs(5),
     },
     EventSpec {
         name: "SessionEnd",
         matcher: None,
-        timeout: 3,
+        timeout: Duration::from_secs(3),
     },
 ];
 
@@ -361,24 +361,23 @@ impl HookRoots {
         let home = crate::paths::home_dir().unwrap_or_else(|| ".".to_string());
         let claude_dir = PathBuf::from(&home).join(".claude");
         let codex_dir = PathBuf::from(&home).join(".codex");
-        let opencode_config_dir = nonempty_env("OPENCODE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                nonempty_env("XDG_CONFIG_HOME")
-                    .map(|dir| PathBuf::from(dir).join("opencode"))
-                    .unwrap_or_else(|| PathBuf::from(&home).join(".config/opencode"))
-            });
+        let opencode_config_dir = nonempty_env("OPENCODE_CONFIG_DIR").map_or_else(
+            || {
+                nonempty_env("XDG_CONFIG_HOME").map_or_else(
+                    || PathBuf::from(&home).join(".config/opencode"),
+                    |dir| PathBuf::from(dir).join("opencode"),
+                )
+            },
+            PathBuf::from,
+        );
         let pi_agent_dir = nonempty_env("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&home).join(".pi/agent"));
+            .map_or_else(|| PathBuf::from(&home).join(".pi/agent"), PathBuf::from);
         // Droid has no documented home-relocation env var.
         let factory_dir = PathBuf::from(&home).join(".factory");
         let qwen_config_dir = nonempty_env("QWEN_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&home).join(".qwen"));
+            .map_or_else(|| PathBuf::from(&home).join(".qwen"), PathBuf::from);
         let kimi_code_dir = nonempty_env("KIMI_CODE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&home).join(".kimi-code"));
+            .map_or_else(|| PathBuf::from(&home).join(".kimi-code"), PathBuf::from);
         Self {
             claude_dir,
             codex_dir,
@@ -401,7 +400,7 @@ pub struct HookManager {
 }
 
 impl HookManager {
-    pub fn new(roots: HookRoots) -> Self {
+    pub const fn new(roots: HookRoots) -> Self {
         Self { roots }
     }
 
@@ -645,8 +644,8 @@ impl HookManager {
             if let Some(Value::Array(arr)) = hooks.get(key) {
                 let filtered: Vec<Value> = arr
                     .iter()
-                    .filter(|g| !group_is_legacy(g))
                     .cloned()
+                    .filter_map(|g| retain_foreign_handlers(g, is_legacy_command))
                     .collect();
                 hooks.insert(key.clone(), Value::Array(filtered));
             }
@@ -662,15 +661,17 @@ impl HookManager {
             };
             let mut filtered: Vec<Value> = arr
                 .into_iter()
-                .filter(|g| {
-                    !matches!(
-                        classify_group(g, &canonical, agent, spec.name),
-                        GroupOwnership::Ours { .. }
-                    )
+                .filter_map(|g| {
+                    retain_foreign_handlers(g, |command| {
+                        matches!(
+                            classify_command(command, &canonical, agent, spec.name),
+                            GroupOwnership::Ours { .. }
+                        )
+                    })
                 })
                 .collect();
             if matches!(mode, ReconcileMode::Install) {
-                filtered.push(build_group(spec, &canonical));
+                filtered.push(build_group(spec, &canonical, agent));
             }
             hooks.insert(spec.name.to_string(), Value::Array(filtered));
         }
@@ -835,7 +836,7 @@ impl HookManager {
             let array = item
                 .as_array_of_tables()
                 .expect("non-array-of-tables shape rejected above");
-            for table in array.iter() {
+            for table in array {
                 let command = table.get("command").and_then(Item::as_str);
                 let is_ours = events.iter().any(|spec| {
                     Some(canonical_command(&self.roots.binary_path, agent, spec.name).as_str())
@@ -871,12 +872,8 @@ impl HookManager {
 
         if should_write {
             let rendered = doc.to_string();
-            // Refuse to write anything the CLI would reject: verify our own
-            // rendering re-parses before it ever reaches disk.
             parse_toml_document(path, &rendered)?;
             write_agent_config(path, rendered.as_bytes())?;
-            // And once more from the bytes that actually landed, since a
-            // malformed config.toml disables every Kimi hook, not just ours.
             let on_disk = fs::read_to_string(path)?;
             parse_toml_document(path, &on_disk)?;
         }
@@ -1048,6 +1045,7 @@ impl HookManager {
     }
 }
 
+#[derive(Clone, Copy)]
 enum ReconcileMode {
     Install,
     Uninstall,
@@ -1066,7 +1064,7 @@ enum GroupOwnership {
     Foreign,
 }
 
-fn wire_name(agent: Agent) -> &'static str {
+const fn wire_name(agent: Agent) -> &'static str {
     match agent {
         Agent::Claude => "claude",
         Agent::Codex => "codex",
@@ -1088,7 +1086,18 @@ fn canonical_command(binary_path: &Path, agent: Agent, event: &str) -> String {
 }
 
 fn is_legacy_command(command: &str) -> bool {
-    command.contains("hooks/juggler/notify.sh") || command.contains("codex/hooks/juggler/notify.sh")
+    let mut words = command.split(' ');
+    let binary = words.next().unwrap_or_default();
+    (binary == "hooks/juggler/notify.sh" || binary.ends_with("/hooks/juggler/notify.sh"))
+        && is_unquoted_shell_word(binary)
+        && words.all(is_unquoted_shell_word)
+}
+
+fn is_unquoted_shell_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~'))
 }
 
 fn group_handler_commands(group: &Value) -> Vec<String> {
@@ -1104,10 +1113,21 @@ fn group_handler_commands(group: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn group_is_legacy(group: &Value) -> bool {
-    group_handler_commands(group)
-        .iter()
-        .any(|c| is_legacy_command(c))
+fn handler_command(handler: &Value) -> Option<&str> {
+    (handler.get("type").and_then(Value::as_str) == Some("command"))
+        .then(|| handler.get("command").and_then(Value::as_str))
+        .flatten()
+}
+
+fn retain_foreign_handlers(mut group: Value, is_owned: impl Fn(&str) -> bool) -> Option<Value> {
+    if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+        let original_len = handlers.len();
+        handlers.retain(|handler| !handler_command(handler).is_some_and(&is_owned));
+        if original_len > 0 && handlers.is_empty() {
+            return None;
+        }
+    }
+    Some(group)
 }
 
 fn managed_event_shape_is_unsupported(hooks: &Map<String, Value>, events: &[EventSpec]) -> bool {
@@ -1117,27 +1137,44 @@ fn managed_event_shape_is_unsupported(hooks: &Map<String, Value>, events: &[Even
 }
 
 fn classify_group(group: &Value, canonical: &str, agent: Agent, event: &str) -> GroupOwnership {
-    let commands = group_handler_commands(group);
-    if commands.len() == 1 {
-        let command = &commands[0];
-        if command == canonical {
-            return GroupOwnership::Ours { exact: true };
-        }
-        let suffix = format!(" ingest --agent {} --event {}", wire_name(agent), event);
-        if command.ends_with(&suffix)
-            && command[..command.len() - suffix.len()].ends_with("hooklinesinker")
-        {
-            return GroupOwnership::Ours { exact: false };
-        }
+    let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
+        return GroupOwnership::Foreign;
+    };
+    let [handler] = handlers.as_slice() else {
+        return GroupOwnership::Foreign;
+    };
+    let Some(command) = handler_command(handler) else {
+        return GroupOwnership::Foreign;
+    };
+    classify_command(command, canonical, agent, event)
+}
+
+fn classify_command(command: &str, canonical: &str, agent: Agent, event: &str) -> GroupOwnership {
+    if command == canonical {
+        return GroupOwnership::Ours { exact: true };
+    }
+    let suffix = format!(" ingest --agent {} --event {}", wire_name(agent), event);
+    if command.strip_suffix(&suffix).is_some_and(|binary| {
+        (binary == "hooklinesinker" || binary.ends_with("/hooklinesinker"))
+            && is_unquoted_shell_word(binary)
+    }) {
+        return GroupOwnership::Ours { exact: false };
     }
     GroupOwnership::Foreign
 }
 
-fn build_group(spec: &EventSpec, canonical: &str) -> Value {
+fn build_group(spec: &EventSpec, canonical: &str, agent: Agent) -> Value {
     let mut handler = Map::new();
     handler.insert("type".to_string(), Value::String("command".to_string()));
     handler.insert("command".to_string(), Value::String(canonical.to_string()));
-    handler.insert("timeout".to_string(), Value::from(spec.timeout));
+    // Qwen's settings.json timeout is milliseconds, unlike Claude/Codex's seconds.
+    let timeout = match agent {
+        Agent::Qwen => {
+            u64::try_from(spec.timeout.as_millis()).expect("hook timeout fits u64 milliseconds")
+        }
+        _ => spec.timeout.as_secs(),
+    };
+    handler.insert("timeout".to_string(), Value::from(timeout));
     let mut group = Map::new();
     if let Some(matcher) = spec.matcher {
         group.insert("matcher".to_string(), Value::String(matcher.to_string()));
@@ -1156,7 +1193,10 @@ fn kimi_hook_table(binary_path: &Path, agent: Agent, spec: &EventSpec) -> Table 
         "command",
         toml_value(canonical_command(binary_path, agent, spec.name)),
     );
-    table.insert("timeout", toml_value(spec.timeout as i64));
+    table.insert(
+        "timeout",
+        toml_value(i64::try_from(spec.timeout.as_secs()).expect("hook timeout fits i64 seconds")),
+    );
     table
 }
 
@@ -1844,7 +1884,7 @@ mod tests {
         let doc: DocumentMut = text.parse().unwrap();
         let array = doc["hooks"].as_array_of_tables().unwrap();
         assert_eq!(array.iter().count(), 14);
-        for table in array.iter() {
+        for table in array {
             let mut keys: Vec<&str> = table.iter().map(|(k, _)| k).collect();
             keys.sort_unstable();
             assert_eq!(keys, vec!["command", "event", "timeout"]);
@@ -2126,5 +2166,102 @@ mod tests {
             assert_eq!(manager.status(agent).unwrap().state, HookState::Missing);
         }
         let _ = base;
+    }
+    #[test]
+    fn reconciliation_preserves_compound_commands_while_replacing_old_paths() {
+        for install in [true, false] {
+            let (manager, _) = manager();
+            let old = canonical_command(Path::new("/old/hooklinesinker"), Agent::Claude, "Stop");
+            let legacy = "~/.claude/hooks/juggler/notify.sh Stop";
+            let commands = [
+                format!("policy-check && {old}"),
+                format!("policy-check&&{old}"),
+                format!("policy-check;{old}"),
+                format!("policy-check\n{old}"),
+                format!("env FLAG=1 {old}"),
+                format!("echo {old}"),
+                format!("{old} && audit-hook"),
+                format!("{old} >audit.log"),
+                format!("policy-check && {legacy}"),
+                format!("{legacy} && audit-hook"),
+                format!("echo {legacy}"),
+                "/old/not-hooklinesinker ingest --agent claude --event Stop".to_string(),
+                "audit-hook".to_string(),
+            ];
+            let foreign: Vec<_> = commands
+                .iter()
+                .map(|command| serde_json::json!({"type": "command", "command": command}))
+                .collect();
+            let mut handlers = foreign.clone();
+            handlers.push(serde_json::json!({"type": "command", "command": old}));
+            handlers.push(serde_json::json!({"type": "command", "command": legacy}));
+            let original = serde_json::json!({"hooks": {"Stop": [{"hooks": handlers}]}});
+            let path = manager.claude_settings_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, original.to_string()).unwrap();
+
+            if install {
+                manager.install(Agent::Claude).unwrap();
+            } else {
+                manager.uninstall(Agent::Claude).unwrap();
+            }
+
+            let result: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                result["hooks"]["Stop"][0]["hooks"],
+                serde_json::json!(foreign)
+            );
+            assert_eq!(
+                result["hooks"]["Stop"].as_array().unwrap().len(),
+                if install { 2 } else { 1 }
+            );
+            if install {
+                assert_eq!(
+                    result["hooks"]["Stop"][1]["hooks"][0]["command"],
+                    canonical_command(&manager.roots.binary_path, Agent::Claude, "Stop")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_preserves_foreign_handlers_in_owned_and_legacy_groups() {
+        for install in [true, false] {
+            let (manager, _) = manager();
+            let canonical = canonical_command(&manager.roots.binary_path, Agent::Claude, "Stop");
+            let foreign = serde_json::json!([
+                {"type": "prompt", "prompt": "Keep this prompt"},
+                {"type": "agent", "prompt": "Keep this agent"},
+                {"future": "handler", "command": canonical}
+            ]);
+            let mut handlers = foreign.as_array().unwrap().clone();
+            handlers.push(serde_json::json!({"type": "command", "command": canonical}));
+            handlers.push(serde_json::json!({"type": "command", "command": "~/.claude/hooks/juggler/notify.sh Stop"}));
+            let original = serde_json::json!({"hooks": {"Stop": [{"hooks": handlers, "custom": "keep group metadata"}]}});
+            let path = manager.claude_settings_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, original.to_string()).unwrap();
+            let status = if install {
+                manager.install(Agent::Claude)
+            } else {
+                manager.uninstall(Agent::Claude)
+            }
+            .unwrap();
+            assert_eq!(
+                status.state,
+                if install {
+                    HookState::Installed
+                } else {
+                    HookState::Missing
+                }
+            );
+            let result: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(result["hooks"]["Stop"][0]["hooks"], foreign);
+            assert_eq!(result["hooks"]["Stop"][0]["custom"], "keep group metadata");
+            assert_eq!(
+                result["hooks"]["Stop"].as_array().unwrap().len(),
+                if install { 2 } else { 1 }
+            );
+        }
     }
 }

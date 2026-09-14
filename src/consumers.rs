@@ -2,7 +2,7 @@ use crate::state::{LockGuard, write_private_atomic};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const SUPPORTED_PROTOCOL_MAJOR: u16 = crate::protocol::PROTOCOL_VERSION;
 pub const SUPPORTED_CAPABILITIES: &[&str] = &["status"];
@@ -16,15 +16,21 @@ pub struct Consumer {
     pub sink: Option<String>,
 }
 
+pub struct ConsumerSnapshot {
+    pub consumers: Vec<Consumer>,
+    pub problems: Vec<String>,
+}
+
 pub struct ConsumerStore {
     consumers_dir: PathBuf,
     lock_path: PathBuf,
 }
 
 impl ConsumerStore {
-    pub fn open(root: PathBuf) -> io::Result<Self> {
+    pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref();
         let consumers_dir = root.join("consumers");
-        crate::paths::ensure_private_dir(&root)?;
+        crate::paths::ensure_private_dir(root)?;
         crate::paths::ensure_private_dir(&consumers_dir)?;
         Ok(Self {
             lock_path: root.join("consumers.lock"),
@@ -40,7 +46,7 @@ impl ConsumerStore {
         self.consumers_dir.join(format!("{name}.json"))
     }
 
-    pub fn register(&self, consumer: Consumer) -> io::Result<()> {
+    pub fn register(&self, consumer: &Consumer) -> io::Result<()> {
         validate_name(&consumer.name)?;
         validate_protocol(consumer.protocol)?;
         validate_capabilities(&consumer.capabilities)?;
@@ -48,12 +54,13 @@ impl ConsumerStore {
 
         let _guard = self.lock()?;
         let path = self.consumer_path(&consumer.name);
-        let bytes = serde_json::to_vec_pretty(&consumer)
+        let bytes = serde_json::to_vec_pretty(consumer)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         write_private_atomic(&path, &bytes)
     }
 
     pub fn remove(&self, name: &str) -> io::Result<()> {
+        validate_name(name)?;
         let _guard = self.lock()?;
         match fs::remove_file(self.consumer_path(name)) {
             Ok(()) => Ok(()),
@@ -62,54 +69,82 @@ impl ConsumerStore {
         }
     }
 
-    pub fn list(&self) -> io::Result<Vec<Consumer>> {
+    pub fn snapshot(&self) -> io::Result<ConsumerSnapshot> {
         let _guard = self.lock()?;
-        Ok(self.read_all_locked()?.0)
+        self.read_all_locked()
+    }
+
+    pub fn list(&self) -> io::Result<Vec<Consumer>> {
+        let snapshot = self.snapshot()?;
+        if !snapshot.problems.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                snapshot.problems.join("; "),
+            ));
+        }
+        Ok(snapshot.consumers)
     }
 
     pub fn requested_capabilities(&self, capability: &str) -> io::Result<Vec<Consumer>> {
-        let _guard = self.lock()?;
         Ok(self
-            .read_all_locked()?
-            .0
+            .list()?
             .into_iter()
             .filter(|c| c.capabilities.iter().any(|cap| cap == capability))
             .collect())
     }
 
     pub fn parse_problems(&self) -> io::Result<Vec<String>> {
-        let _guard = self.lock()?;
-        Ok(self.read_all_locked()?.1)
+        Ok(self.snapshot()?.problems)
     }
 
-    fn read_all_locked(&self) -> io::Result<(Vec<Consumer>, Vec<String>)> {
+    fn read_all_locked(&self) -> io::Result<ConsumerSnapshot> {
         let mut out = Vec::new();
         let mut problems = Vec::new();
         let entries = match fs::read_dir(&self.consumers_dir) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((out, problems)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(ConsumerSnapshot {
+                    consumers: out,
+                    problems,
+                });
+            }
             Err(e) => return Err(e),
         };
         for entry in entries {
-            let path = entry?.path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    problems.push(format!("failed to read consumer directory entry: {e}"));
+                    continue;
+                }
+            };
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    problems.push(format!(
+                        "failed to read consumer record {}: {e}",
+                        path.display()
+                    ));
+                    continue;
+                }
             };
             match serde_json::from_slice::<Consumer>(&bytes) {
                 Ok(consumer) => out.push(consumer),
-                Err(_) => {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("<unknown>");
-                    problems.push(format!("failed to parse consumer record {name}"));
+                Err(e) => {
+                    problems.push(format!(
+                        "failed to parse consumer record {}: {e}",
+                        path.display()
+                    ));
                 }
             }
         }
-        Ok((out, problems))
+        Ok(ConsumerSnapshot {
+            consumers: out,
+            problems,
+        })
     }
 }
 
@@ -183,8 +218,7 @@ mod tests {
     static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn temp_root() -> PathBuf {
-        // the wall clock is only microsecond-resolution here, so two parallel tests
-        // sharing a tick would otherwise share a store
+        // The counter keeps parallel tests from sharing a store within one clock tick.
         let id = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -204,7 +238,7 @@ mod tests {
         Consumer {
             name: name.to_string(),
             protocol: SUPPORTED_PROTOCOL_MAJOR,
-            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            capabilities: capabilities.iter().map(ToString::to_string).collect(),
             sink: sink.map(str::to_string),
         }
     }
@@ -214,13 +248,13 @@ mod tests {
         let store = store();
         assert!(
             store
-                .register(consumer("Juggler", &["status"], None))
+                .register(&consumer("Juggler", &["status"], None))
                 .is_err()
         );
-        assert!(store.register(consumer("", &["status"], None)).is_err());
+        assert!(store.register(&consumer("", &["status"], None)).is_err());
         assert!(
             store
-                .register(consumer("-juggler", &["status"], None))
+                .register(&consumer("-juggler", &["status"], None))
                 .is_err()
         );
         assert!(store.list().unwrap().is_empty());
@@ -231,7 +265,7 @@ mod tests {
         let store = store();
         assert!(
             store
-                .register(consumer("juggler", &["status"], Some("ftp://example.com")))
+                .register(&consumer("juggler", &["status"], Some("ftp://example.com")))
                 .is_err()
         );
     }
@@ -241,14 +275,14 @@ mod tests {
         let store = store();
         let mut future = consumer("juggler", &["status"], None);
         future.protocol = 2;
-        assert!(store.register(future).is_err());
+        assert!(store.register(&future).is_err());
     }
 
     #[test]
     fn requested_capabilities_filters_by_capability() {
         let store = store();
         store
-            .register(consumer(
+            .register(&consumer(
                 "juggler",
                 &["status"],
                 Some("http://127.0.0.1/hook"),
@@ -264,5 +298,45 @@ mod tests {
     fn remove_is_idempotent_for_a_missing_consumer() {
         let store = store();
         assert!(store.remove("never-registered").is_ok());
+    }
+    #[test]
+    fn remove_rejects_paths_and_preserves_their_targets() {
+        let root = temp_root();
+        let store = ConsumerStore::open(root.clone()).unwrap();
+        let unrelated = root.join("unrelated.json");
+        fs::write(&unrelated, "keep me").unwrap();
+        for name in [
+            "../unrelated".to_string(),
+            root.join("unrelated").display().to_string(),
+        ] {
+            assert_eq!(
+                store.remove(&name).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(fs::read_to_string(&unrelated).unwrap(), "keep me");
+        }
+    }
+
+    #[test]
+    fn snapshot_retains_valid_consumers_and_reports_failed_records() {
+        let root = temp_root();
+        let store = ConsumerStore::open(root.clone()).unwrap();
+        store
+            .register(&consumer("valid", &["status"], None))
+            .unwrap();
+        fs::write(root.join("consumers/broken.json"), "{").unwrap();
+        fs::create_dir(root.join("consumers/unreadable.json")).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.consumers.len(), 1);
+        assert_eq!(snapshot.consumers[0].name, "valid");
+        assert_eq!(snapshot.problems.len(), 2);
+        assert!(snapshot.problems.iter().any(|p| p.contains("broken.json")));
+        assert!(
+            snapshot
+                .problems
+                .iter()
+                .any(|p| p.contains("unreadable.json"))
+        );
+        assert_eq!(store.list().unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -51,7 +51,7 @@ fn consumer(name: &str, capabilities: &[&str], sink: Option<&str>) -> Consumer {
     Consumer {
         name: name.to_string(),
         protocol: PROTOCOL_VERSION,
-        capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+        capabilities: capabilities.iter().map(ToString::to_string).collect(),
         sink: sink.map(str::to_string),
     }
 }
@@ -153,7 +153,7 @@ impl ProcessLookup for AllAlive {
     }
 }
 
-fn all_alive() -> AllAlive {
+const fn all_alive() -> AllAlive {
     AllAlive
 }
 
@@ -227,7 +227,7 @@ impl FakeEnvSource {
         self.commands.insert(
             (
                 program.to_string(),
-                args.iter().map(|a| a.to_string()).collect(),
+                args.iter().map(ToString::to_string).collect(),
             ),
             output.to_string(),
         );
@@ -243,7 +243,7 @@ impl EnvSource for FakeEnvSource {
     fn command_output(&self, program: &str, args: &[&str]) -> Option<String> {
         let key = (
             program.to_string(),
-            args.iter().map(|a| a.to_string()).collect(),
+            args.iter().map(ToString::to_string).collect(),
         );
         self.commands.get(&key).cloned()
     }
@@ -261,21 +261,27 @@ fn test_environment() -> HookEnvironment {
     }
 }
 
-fn test_process() -> Option<ProcessIdentity> {
-    Some(ProcessIdentity {
+fn test_process() -> ProcessIdentity {
+    ProcessIdentity {
         pid: 4242,
         started_at: "2026-09-04T00:00:00Z".into(),
         host: "test-host".into(),
-    })
+    }
 }
 
 fn normalize_for_test(agent: Agent, event: &str, native: &str) -> StatusEvent {
-    normalize(agent, event, native, &test_environment(), test_process())
-        .expect("normalize should succeed")
-        .expect("event should not be ignored")
+    normalize(
+        agent,
+        event,
+        native,
+        &test_environment(),
+        Some(test_process()),
+    )
+    .expect("normalize should succeed")
+    .expect("event should not be ignored")
 }
 
-fn generic_native_json() -> &'static str {
+const fn generic_native_json() -> &'static str {
     r#"{"session_id":"generic-session"}"#
 }
 
@@ -314,13 +320,13 @@ fn codex_interrupt_keeps_the_session_live_and_pushes_idle_to_consumers() {
     let store = store();
     let consumers = consumer_store();
     consumers
-        .register(consumer(
+        .register(&consumer(
             "juggler",
             &["status"],
             Some("http://127.0.0.1:7483/hook"),
         ))
         .unwrap();
-    let process = test_process().unwrap();
+    let process = test_process();
     let liveness = FakeProcessLookup::with_owner(process.clone());
     liveness.set_alive(process.pid, &process.started_at);
     let client = RecordingHttpClient::default();
@@ -507,7 +513,7 @@ fn claude_subagent_stop_is_ignored_to_avoid_racing_the_parent_stop() {
         "SubagentStop",
         generic_native_json(),
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap();
     assert!(result.is_none());
@@ -535,7 +541,7 @@ fn droid_notification_auth_success_is_ignored() {
         "Notification",
         native,
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap();
     assert!(result.is_none());
@@ -548,7 +554,7 @@ fn droid_subagent_stop_is_ignored() {
         "SubagentStop",
         generic_native_json(),
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap();
     assert!(result.is_none());
@@ -575,7 +581,7 @@ fn qwen_notification_auth_success_is_ignored() {
         "Notification",
         native,
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap();
     assert!(result.is_none());
@@ -588,7 +594,7 @@ fn qwen_session_delete_is_ignored_since_it_names_a_different_sessions_id() {
         "SessionDelete",
         r#"{"deleted_session_id":"some-other-session"}"#,
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap();
     assert!(result.is_none());
@@ -609,7 +615,7 @@ fn qwen_unregistered_events_are_ignored() {
             event,
             generic_native_json(),
             &test_environment(),
-            test_process(),
+            Some(test_process()),
         )
         .unwrap();
         assert!(result.is_none(), "{event}");
@@ -632,7 +638,7 @@ fn kimi_unregistered_events_are_ignored() {
             event,
             generic_native_json(),
             &test_environment(),
-            test_process(),
+            Some(test_process()),
         )
         .unwrap();
         assert!(result.is_none(), "{event}");
@@ -646,7 +652,7 @@ fn unknown_events_are_ignored() {
         "TotallyUnknownEvent",
         generic_native_json(),
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap();
     assert!(result.is_none());
@@ -667,7 +673,7 @@ fn malformed_native_json_is_rejected() {
         "PreToolUse",
         "{not json",
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     );
     assert!(result.is_err());
 }
@@ -745,7 +751,7 @@ fn sweep_removes_dead_bindings_and_returns_them_with_running_false() {
     let store = store();
     store.record(&status("swept-session", 302, 32)).unwrap();
     let liveness = FakeProcessLookup::new();
-    let swept = store.sweep(&liveness).unwrap();
+    let swept = store.sweep(&liveness).unwrap().events;
     assert_eq!(swept.len(), 1);
     assert!(!swept[0].running);
     assert_eq!(swept[0].session.id, "swept-session");
@@ -761,7 +767,7 @@ fn a_binding_that_was_alive_is_swept_once_its_process_exits() {
     assert_eq!(store.running(&liveness).unwrap().len(), 1);
 
     liveness.set_dead(303);
-    let swept = store.sweep(&liveness).unwrap();
+    let swept = store.sweep(&liveness).unwrap().events;
     assert_eq!(swept.len(), 1);
     assert_eq!(swept[0].session.id, "exiting-session");
     assert!(store.running(&liveness).unwrap().is_empty());
@@ -785,7 +791,7 @@ fn records_without_process_identity_are_diagnostics_not_running() {
     store.record(&event).unwrap();
     assert!(store.running(&all_alive()).unwrap().is_empty());
     assert_eq!(store.dead_records(&all_alive()).unwrap(), 0);
-    assert!(store.sweep(&all_alive()).unwrap().is_empty());
+    assert!(store.sweep(&all_alive()).unwrap().events.is_empty());
     assert!(store.running(&all_alive()).unwrap().is_empty());
     assert_eq!(ledger_files(&root), 1);
 }
@@ -805,7 +811,7 @@ fn failed_write_leaves_the_previous_complete_record_intact() {
         std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     }
 
-    let mut updated = original.clone();
+    let mut updated = original;
     updated.phase = Phase::Working;
     let result = store.record(&updated);
 
@@ -927,7 +933,7 @@ fn scalar_type_mismatch_error_omits_the_offending_value() {
         "PreToolUse",
         r#"{"session_id": 424242}"#,
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     );
     let message = result.unwrap_err().to_string();
     assert!(!message.contains("424242"));
@@ -1077,7 +1083,7 @@ fn a_populated_environment_lands_on_the_normalized_status_event() {
         "SessionStart",
         generic_native_json(),
         &hook_env,
-        test_process(),
+        Some(test_process()),
     )
     .unwrap()
     .unwrap();
@@ -1184,9 +1190,9 @@ fn fanout_sends_only_to_status_consumers() {
 fn unsupported_capability_does_not_change_registration() {
     let store = consumer_store();
     store
-        .register(consumer("juggler", &["status"], None))
+        .register(&consumer("juggler", &["status"], None))
         .unwrap();
-    assert!(store.register(consumer("future", &["raw"], None)).is_err());
+    assert!(store.register(&consumer("future", &["raw"], None)).is_err());
     assert_eq!(store.list().unwrap().len(), 1);
 }
 
@@ -1195,7 +1201,7 @@ fn ingest_fans_out_the_recorded_event_to_registered_status_sinks() {
     let store = store();
     let consumers = consumer_store();
     consumers
-        .register(consumer(
+        .register(&consumer(
             "juggler",
             &["status"],
             Some("http://127.0.0.1:7483/hook"),
@@ -1234,7 +1240,7 @@ fn a_dead_binding_swept_during_an_unrelated_ingest_produces_a_running_false_post
     let store = store();
     let consumers = consumer_store();
     consumers
-        .register(consumer(
+        .register(&consumer(
             "juggler",
             &["status"],
             Some("http://127.0.0.1:7483/hook"),
@@ -1302,7 +1308,7 @@ fn a_read_between_the_kill_and_the_next_ingest_still_lets_the_sweep_fan_out() {
     let store = StatusStore::open(root.clone()).unwrap();
     let consumers = consumer_store();
     consumers
-        .register(consumer(
+        .register(&consumer(
             "juggler",
             &["status"],
             Some("http://127.0.0.1:7483/hook"),
@@ -1371,7 +1377,7 @@ fn an_event_without_a_session_id_reaches_sinks_but_never_the_ledger() {
     let store = StatusStore::open(root.clone()).unwrap();
     let consumers = consumer_store();
     consumers
-        .register(consumer(
+        .register(&consumer(
             "juggler",
             &["status"],
             Some("http://127.0.0.1:7483/hook"),
@@ -1458,7 +1464,7 @@ fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
     let store = store();
     let consumers = consumer_store();
     consumers
-        .register(consumer(
+        .register(&consumer(
             "juggler",
             &["status"],
             Some("http://127.0.0.1:7483/hook"),
@@ -1533,7 +1539,7 @@ fn opencode_adapter_stdin_shape_normalizes_with_its_explicit_cwd() {
         "session.status.busy",
         native,
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap()
     .unwrap();
@@ -1550,7 +1556,7 @@ fn opencode_adapter_synthetic_session_created_has_no_session_id_yet() {
         "session.created",
         native,
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap()
     .unwrap();
@@ -1566,7 +1572,7 @@ fn pi_adapter_stdin_shape_omits_cwd_and_falls_back_to_the_hook_environment() {
         "agent_start",
         native,
         &test_environment(),
-        test_process(),
+        Some(test_process()),
     )
     .unwrap()
     .unwrap();
@@ -1604,14 +1610,14 @@ fn two_consumers_share_one_activation_and_both_still_receive_sink_fanout() {
     let consumers = consumer_store();
 
     let installed = install
-        .install_candidate(Candidate {
+        .install_candidate(&Candidate {
             version: SemVer::parse("0.1.0").unwrap(),
             protocol_major: PROTOCOL_VERSION,
             binary_path: fake_candidate_binary(&base, "0.1.0"),
         })
         .unwrap();
     consumers
-        .register(consumer(
+        .register(&consumer(
             "juggler",
             &["status"],
             Some("http://127.0.0.1:7483/hook"),
@@ -1621,14 +1627,14 @@ fn two_consumers_share_one_activation_and_both_still_receive_sink_fanout() {
     // A second, unrelated consumer registering afterward must not reactivate
     // the same version, and both consumers must remain registered together.
     let installed_again = install
-        .install_candidate(Candidate {
+        .install_candidate(&Candidate {
             version: SemVer::parse("0.1.0").unwrap(),
             protocol_major: PROTOCOL_VERSION,
             binary_path: fake_candidate_binary(&base, "0.1.0"),
         })
         .unwrap();
     consumers
-        .register(consumer("ringleader", &["status"], None))
+        .register(&consumer("ringleader", &["status"], None))
         .unwrap();
 
     assert_eq!(installed.active_version, installed_again.active_version);
@@ -1648,14 +1654,14 @@ fn last_consumer_uninstall_removes_installed_claude_hooks_and_the_active_symlink
     let hooks = hook_manager_at(&base, install.binary_path());
 
     install
-        .install_candidate(Candidate {
+        .install_candidate(&Candidate {
             version: SemVer::parse("0.1.0").unwrap(),
             protocol_major: PROTOCOL_VERSION,
             binary_path: fake_candidate_binary(&base, "0.1.0"),
         })
         .unwrap();
     consumers
-        .register(consumer("juggler", &["status"], None))
+        .register(&consumer("juggler", &["status"], None))
         .unwrap();
     hooks.install(Agent::Claude).unwrap();
     assert!(base.join("claude/settings.json").exists());
@@ -1672,5 +1678,153 @@ fn last_consumer_uninstall_removes_installed_claude_hooks_and_the_active_symlink
     assert!(
         base.join("data/versions/0.1.0/hooklinesinker").exists(),
         "version directories must survive last-consumer cleanup"
+    );
+}
+
+#[test]
+fn sessions_snapshot_retains_valid_records_and_reports_damaged_ones() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    store.record(&status("valid", 700, 70)).unwrap();
+    std::fs::write(root.join("status/broken.json"), "{").unwrap();
+    std::fs::create_dir(root.join("status/unreadable.json")).unwrap();
+    std::fs::write(root.join("health.json"), "{").unwrap();
+    let envelope = store.sessions_envelope(&all_alive());
+    assert_eq!(envelope.sessions.len(), 1);
+    assert_eq!(envelope.sessions[0].session.id, "valid");
+    assert_eq!(envelope.problems.len(), 3);
+    for file in ["broken.json", "unreadable.json", "health.json"] {
+        assert!(
+            envelope.problems.iter().any(|p| p.message.contains(file)),
+            "missing {file}"
+        );
+    }
+    assert_eq!(
+        store.health_problems().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("health.json")).unwrap(),
+        "{"
+    );
+}
+
+#[test]
+fn partial_sweep_failure_still_delivers_successful_removals() {
+    use std::cell::Cell;
+    struct FailingUnlink {
+        paths: HashMap<u32, PathBuf>,
+        checks: Cell<usize>,
+        failed_pid: Cell<Option<u32>>,
+    }
+    impl ProcessLookup for FailingUnlink {
+        fn owner_of(&self, _: u32, _: Agent) -> Option<ProcessIdentity> {
+            None
+        }
+        fn is_alive(&self, identity: &ProcessIdentity) -> bool {
+            let check = self.checks.get();
+            self.checks.set(check + 1);
+            if check == 1 {
+                let path = &self.paths[&identity.pid];
+                std::fs::rename(path, path.with_extension("saved")).unwrap();
+                std::fs::create_dir(path).unwrap();
+                self.failed_pid.set(Some(identity.pid));
+            }
+            false
+        }
+    }
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let mut paths = HashMap::new();
+    for pid in 800..803 {
+        let event = status("partial-sweep", pid, 80);
+        paths.insert(
+            pid,
+            root.join("status")
+                .join(format!("{}.json", event.binding_id)),
+        );
+        store.record(&event).unwrap();
+    }
+    let liveness = FailingUnlink {
+        paths,
+        checks: Cell::new(0),
+        failed_pid: Cell::new(None),
+    };
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "sink",
+            &["status"],
+            Some("http://localhost/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    let outcome = ingest(&ctx, Agent::Claude, "ignored", "{}", 999);
+    assert!(
+        outcome
+            .problem
+            .unwrap()
+            .contains("failed to remove status record")
+    );
+    let bodies = client.bodies();
+    assert_eq!(bodies.len(), 2);
+    let mut delivered: Vec<_> = bodies
+        .iter()
+        .map(|event| event["process"]["pid"].as_u64().unwrap())
+        .collect();
+    delivered.sort_unstable();
+    let expected: Vec<_> = (800..803)
+        .filter(|pid| Some(*pid) != liveness.failed_pid.get())
+        .map(u64::from)
+        .collect();
+    assert_eq!(delivered, expected);
+    for event in &bodies {
+        assert_eq!(event["running"], false);
+        assert_eq!(event["event"], "swept");
+    }
+    assert_eq!(store.health_problems().unwrap().len(), 1);
+    assert_eq!(ledger_files(&root), 1);
+}
+
+#[test]
+fn damaged_consumer_record_reports_health_while_valid_sink_receives_event() {
+    let root = temp_home();
+    let consumers = ConsumerStore::open(root.clone()).unwrap();
+    consumers
+        .register(&consumer(
+            "sink",
+            &["status"],
+            Some("http://localhost/hook"),
+        ))
+        .unwrap();
+    std::fs::write(root.join("consumers/broken.json"), "{").unwrap();
+    let store = store();
+    let liveness = all_alive();
+    let client = RecordingHttpClient::default();
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    ingest(
+        &ctx,
+        Agent::Claude,
+        "Stop",
+        r#"{"session_id":"valid"}"#,
+        999,
+    );
+    assert_eq!(client.bodies().len(), 1);
+    assert_eq!(client.bodies()[0]["phase"], "idle");
+    assert!(
+        store.health_problems().unwrap()[0]
+            .message
+            .contains("broken.json")
     );
 }

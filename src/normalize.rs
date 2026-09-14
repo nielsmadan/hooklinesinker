@@ -5,6 +5,7 @@ use crate::protocol::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::io;
 
 #[derive(Clone, Debug, Default)]
@@ -44,7 +45,6 @@ fn map_event(
             "SessionStart" | "Stop" | "StopFailure" => Update(Phase::Idle),
             "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
             | "SubagentStart" => Update(Phase::Working),
-            "SubagentStop" => Ignore,
             "PermissionRequest" => Update(Phase::Permission),
             "PreCompact" => Update(Phase::Compacting),
             "SessionEnd" => Remove,
@@ -85,13 +85,12 @@ fn map_event(
             "SessionStart" | "Stop" => Update(Phase::Idle),
             "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Update(Phase::Working),
             "Notification" => match notification_type {
-                Some("permission_prompt") | Some("elicitation_dialog") => Update(Phase::Permission),
+                Some("permission_prompt" | "elicitation_dialog") => Update(Phase::Permission),
                 Some("idle_prompt") => Update(Phase::Idle),
                 _ => Ignore,
             },
             "PreCompact" => Update(Phase::Compacting),
             "SessionEnd" => Remove,
-            "SubagentStop" => Ignore,
             _ => Ignore,
         },
         Agent::Qwen => match event {
@@ -106,7 +105,6 @@ fn map_event(
             },
             "PreCompact" => Update(Phase::Compacting),
             "SessionEnd" => Remove,
-            "SessionDelete" => Ignore,
             _ => Ignore,
         },
         Agent::Kimi => match event {
@@ -154,8 +152,7 @@ pub fn normalize(
     let cwd = native.cwd.unwrap_or_else(|| env.cwd.clone());
     let host = process
         .as_ref()
-        .map(|p| p.host.clone())
-        .unwrap_or_else(|| env.host.clone());
+        .map_or_else(|| env.host.clone(), |p| p.host.clone());
     let binding_id = binding_id(agent, &session_id, &host, process.as_ref());
 
     Ok(Some(StatusEvent {
@@ -179,7 +176,7 @@ pub fn normalize(
     }))
 }
 
-fn agent_wire_name(agent: Agent) -> &'static str {
+const fn agent_wire_name(agent: Agent) -> &'static str {
     match agent {
         Agent::Claude => "claude",
         Agent::Codex => "codex",
@@ -209,11 +206,12 @@ fn binding_id(
         hasher.update([0u8]);
         hasher.update(p.started_at.as_bytes());
     }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
 }
 
 #[cfg(test)]
@@ -228,40 +226,59 @@ mod tests {
         }
     }
 
-    fn process(pid: u32) -> Option<ProcessIdentity> {
-        Some(ProcessIdentity {
+    fn process(pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
             pid,
             started_at: "2026-09-04T00:00:00Z".into(),
             host: "test-host".into(),
-        })
+        }
     }
 
     #[test]
     fn binding_id_differs_by_process_but_matches_for_identical_identity() {
-        let a = binding_id(Agent::Claude, "s", "host", process(1).as_ref());
-        let b = binding_id(Agent::Claude, "s", "host", process(2).as_ref());
-        let c = binding_id(Agent::Claude, "s", "host", process(1).as_ref());
+        let a = binding_id(Agent::Claude, "s", "host", Some(&process(1)));
+        let b = binding_id(Agent::Claude, "s", "host", Some(&process(2)));
+        let c = binding_id(Agent::Claude, "s", "host", Some(&process(1)));
         assert_ne!(a, b);
         assert_eq!(a, c);
     }
 
     #[test]
     fn ignored_events_return_none() {
-        let result = normalize(Agent::Claude, "SubagentStop", "{}", &env(), process(1)).unwrap();
+        let result = normalize(
+            Agent::Claude,
+            "SubagentStop",
+            "{}",
+            &env(),
+            Some(process(1)),
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn invalid_json_is_an_error() {
-        let result = normalize(Agent::Claude, "PreToolUse", "{not json", &env(), process(1));
+        let result = normalize(
+            Agent::Claude,
+            "PreToolUse",
+            "{not json",
+            &env(),
+            Some(process(1)),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn cwd_falls_back_to_the_environment_when_native_json_omits_it() {
-        let event = normalize(Agent::Claude, "SessionStart", "{}", &env(), process(1))
-            .unwrap()
-            .unwrap();
+        let event = normalize(
+            Agent::Claude,
+            "SessionStart",
+            "{}",
+            &env(),
+            Some(process(1)),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(event.session.cwd, "/tmp/project");
     }
 }

@@ -116,8 +116,8 @@ fn run_sessions_json() {
 
 fn run_consumers_json() {
     let (consumers, problems) = match ConsumerStore::open(paths::state_root()) {
-        Ok(store) => match store.list() {
-            Ok(consumers) => (consumers, Vec::new()),
+        Ok(store) => match store.snapshot() {
+            Ok(snapshot) => (snapshot.consumers, snapshot.problems),
             Err(e) => (Vec::new(), vec![format!("failed to list consumers: {e}")]),
         },
         Err(e) => (
@@ -143,7 +143,7 @@ fn run_install(consumer_name: &str, sink: Option<&str>) {
     let result = (|| -> io::Result<InstalledVersion> {
         let installer = open_installer()?;
         let consumers = ConsumerStore::open(paths::state_root())?;
-        installer.install_current(&consumers, consumer)
+        installer.install_current(&consumers, &consumer)
     })();
     match result {
         Ok(installed) => {
@@ -317,29 +317,10 @@ fn run_doctor(json: bool) {
     }
     checks.push(permissions);
 
-    let active_version_check = match open_installer().and_then(|i| i.active_version_summary()) {
-        Ok(Some(installed)) => DoctorCheck {
-            name: "active_version_target",
-            ok: true,
-            detail: format!(
-                "v{} (protocol {})",
-                installed.active_version, installed.protocol_major
-            ),
-        },
-        Ok(None) => DoctorCheck {
-            name: "active_version_target",
-            ok: true,
-            detail: "not installed".to_string(),
-        },
-        Err(e) => {
-            fatal = true;
-            DoctorCheck {
-                name: "active_version_target",
-                ok: false,
-                detail: format!("failed to read active version: {e}"),
-            }
-        }
-    };
+    let active_version_check = doctor_active_version();
+    if !active_version_check.ok {
+        fatal = true;
+    }
     checks.push(active_version_check);
 
     push_parse_problems_check(
@@ -347,50 +328,11 @@ fn run_doctor(json: bool) {
         &mut fatal,
         "consumer_parse_problems",
         "consumer store",
-        consumer_store.as_ref().map_err(|e| e.to_string()),
-        |store| store.parse_problems(),
+        consumer_store.as_ref().map_err(ToString::to_string),
+        ConsumerStore::parse_problems,
     );
 
-    let hook_status_check = match open_installer() {
-        Ok(installer) => {
-            let hooks = hook_manager(&installer);
-            let mut summaries = Vec::new();
-            let mut problems = Vec::new();
-            for agent in [
-                Agent::Claude,
-                Agent::Codex,
-                Agent::Opencode,
-                Agent::Pi,
-                Agent::Droid,
-                Agent::Qwen,
-                Agent::Kimi,
-            ] {
-                match hooks.status(agent) {
-                    Ok(status) => {
-                        summaries.push(format!("{agent:?}={:?}", status.state));
-                        if matches!(status.state, HookState::Drifted | HookState::Unsupported) {
-                            problems.push(format!("{agent:?} hooks are {:?}", status.state));
-                        }
-                    }
-                    Err(e) => problems.push(format!("{agent:?} hook status failed: {e}")),
-                }
-            }
-            DoctorCheck {
-                name: "hook_status",
-                ok: problems.is_empty(),
-                detail: if problems.is_empty() {
-                    summaries.join(", ")
-                } else {
-                    problems.join("; ")
-                },
-            }
-        }
-        Err(e) => DoctorCheck {
-            name: "hook_status",
-            ok: false,
-            detail: format!("failed to prepare hook installer: {e}"),
-        },
-    };
+    let hook_status_check = doctor_hook_status();
     if !hook_status_check.ok {
         fatal = true;
     }
@@ -401,8 +343,8 @@ fn run_doctor(json: bool) {
         &mut fatal,
         "status_parse_problems",
         "status store",
-        status_store.as_ref().map_err(|e| e.to_string()),
-        |store| store.parse_problems(),
+        status_store.as_ref().map_err(ToString::to_string),
+        StatusStore::parse_problems,
     );
 
     match &status_store {
@@ -431,35 +373,9 @@ fn run_doctor(json: bool) {
         }),
     }
 
-    match &status_store {
-        Ok(store) => match store.health_problems() {
-            Ok(problems) => {
-                let last_sink_error = problems
-                    .iter()
-                    .rev()
-                    .find(|p| p.message.starts_with("sink "));
-                checks.push(DoctorCheck {
-                    name: "last_sink_error",
-                    ok: true,
-                    detail: last_sink_error
-                        .map(|p| p.message.clone())
-                        .unwrap_or_else(|| "none".to_string()),
-                });
-            }
-            Err(e) => checks.push(DoctorCheck {
-                name: "last_sink_error",
-                ok: true,
-                detail: format!("failed to read health problems: {e}"),
-            }),
-        },
-        Err(_) => checks.push(DoctorCheck {
-            name: "last_sink_error",
-            ok: true,
-            detail: "unavailable".to_string(),
-        }),
-    }
+    checks.push(doctor_last_sink_error(&status_store));
 
-    let exit_code = if fatal { 1 } else { 0 };
+    let exit_code = i32::from(fatal);
 
     if json {
         let checks_json: Vec<_> = checks
@@ -527,4 +443,89 @@ fn permissions_check(_root: &std::path::Path) -> DoctorCheck {
 fn not_implemented() -> ! {
     eprintln!("not implemented yet");
     std::process::exit(2);
+}
+
+fn doctor_hook_status() -> DoctorCheck {
+    match open_installer() {
+        Ok(installer) => {
+            let hooks = hook_manager(&installer);
+            let mut summaries = Vec::new();
+            let mut problems = Vec::new();
+            for agent in [
+                Agent::Claude,
+                Agent::Codex,
+                Agent::Opencode,
+                Agent::Pi,
+                Agent::Droid,
+                Agent::Qwen,
+                Agent::Kimi,
+            ] {
+                match hooks.status(agent) {
+                    Ok(status) => {
+                        summaries.push(format!("{agent:?}={:?}", status.state));
+                        if matches!(status.state, HookState::Drifted | HookState::Unsupported) {
+                            problems.push(format!("{agent:?} hooks are {:?}", status.state));
+                        }
+                    }
+                    Err(e) => problems.push(format!("{agent:?} hook status failed: {e}")),
+                }
+            }
+            DoctorCheck {
+                name: "hook_status",
+                ok: problems.is_empty(),
+                detail: if problems.is_empty() {
+                    summaries.join(", ")
+                } else {
+                    problems.join("; ")
+                },
+            }
+        }
+        Err(e) => DoctorCheck {
+            name: "hook_status",
+            ok: false,
+            detail: format!("failed to prepare hook installer: {e}"),
+        },
+    }
+}
+
+fn doctor_active_version() -> DoctorCheck {
+    match open_installer().and_then(|i| i.active_version_summary()) {
+        Ok(Some(installed)) => DoctorCheck {
+            name: "active_version_target",
+            ok: true,
+            detail: format!(
+                "v{} (protocol {})",
+                installed.active_version, installed.protocol_major
+            ),
+        },
+        Ok(None) => DoctorCheck {
+            name: "active_version_target",
+            ok: true,
+            detail: "not installed".to_string(),
+        },
+        Err(e) => DoctorCheck {
+            name: "active_version_target",
+            ok: false,
+            detail: format!("failed to read active version: {e}"),
+        },
+    }
+}
+
+fn doctor_last_sink_error(status_store: &io::Result<StatusStore>) -> DoctorCheck {
+    let detail = status_store.as_ref().map_or_else(
+        |_| "unavailable".to_string(),
+        |store| match store.health_problems() {
+            Ok(problems) => problems
+                .iter()
+                .rev()
+                .find(|p| p.message.starts_with("sink "))
+                .map_or_else(|| "none".to_string(), |p| p.message.clone()),
+            Err(e) => format!("failed to read health problems: {e}"),
+        },
+    );
+    DoctorCheck {
+        name: "last_sink_error",
+        ok: true,
+        detail,
+    }
 }

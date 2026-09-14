@@ -1,6 +1,6 @@
 use crate::protocol::{Agent, ProcessIdentity};
 use std::path::Path;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 pub trait ProcessLookup {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
@@ -22,8 +22,6 @@ pub fn epoch_now() -> u64 {
         .unwrap_or(0)
 }
 
-// Inverse of `format_epoch_seconds` for the exact `YYYY-MM-DDTHH:MM:SSZ` shape it emits.
-// Returns None for anything not in that shape rather than guessing.
 pub fn parse_epoch_seconds(s: &str) -> Option<u64> {
     let s = s.strip_suffix('Z')?;
     let (date, time) = s.split_once('T')?;
@@ -38,19 +36,31 @@ pub fn parse_epoch_seconds(s: &str) -> Option<u64> {
     let hour: u64 = t.next()?.parse().ok()?;
     let minute: u64 = t.next()?.parse().ok()?;
     let second: u64 = t.next()?.parse().ok()?;
-    if d.next().is_some() || t.next().is_some() || !(1..=12).contains(&month) {
+    if t.next().is_some()
+        || !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    if days < 0 {
+    if civil_from_days(days) != (year, month, day) {
         return None;
     }
-    Some(days as u64 * 86400 + hour * 3600 + minute * 60 + second)
+    Some(u64::try_from(days).ok()? * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
+#[allow(
+    clippy::missing_panics_doc,
+    reason = "every u64 second count fits in i64 days after division by 86400"
+)]
 pub fn format_epoch_seconds(seconds: u64) -> String {
-    let days = (seconds / 86400) as i64;
-    let secs_of_day = seconds % 86400;
+    let days =
+        i64::try_from(seconds / 86_400).expect("u64 seconds divided by 86_400 fits i64 days");
+    let secs_of_day = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
@@ -58,18 +68,19 @@ pub fn format_epoch_seconds(seconds: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-// Howard Hinnant's civil_from_days algorithm; keeps observed_at/started_at
-// formatting free of a chrono dependency.
+// Howard Hinnant's civil_from_days algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1)
+        .expect("day of month is positive and at most 31");
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 })
+        .expect("month is positive and at most 12");
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d)
 }
@@ -79,11 +90,11 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
-    let m = month as i64;
-    let d = day as i64;
+    let m = i64::from(month);
+    let d = i64::from(day);
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    era * 146_097 + doe - 719_468
 }
 
 pub struct SystemProcessLookup {
@@ -102,7 +113,7 @@ impl SystemProcessLookup {
     // that rename reaching sysinfo's name()/cmd() has not been verified
     // against a live process on either documented install path (npm shim,
     // curl-installed native binary — both named "kimi"), so accept both.
-    fn expected_executables(agent: Agent) -> &'static [&'static str] {
+    const fn expected_executables(agent: Agent) -> &'static [&'static str] {
         match agent {
             Agent::Claude => &["claude"],
             Agent::Codex => &["codex"],
@@ -173,7 +184,7 @@ impl ProcessLookup for SystemProcessLookup {
             let process = self.system.process(pid)?;
             if is_owning_process(&process.name().to_string_lossy(), process.cmd(), expected) {
                 return Some(ProcessIdentity {
-                    pid: usize::from(pid) as u32,
+                    pid: pid.as_u32(),
                     started_at: format_epoch_seconds(process.start_time()),
                     host: local_hostname(),
                 });
@@ -184,10 +195,16 @@ impl ProcessLookup for SystemProcessLookup {
     }
 
     fn is_alive(&self, identity: &ProcessIdentity) -> bool {
-        match self.system.process(Pid::from(identity.pid as usize)) {
-            Some(process) => format_epoch_seconds(process.start_time()) == identity.started_at,
-            None => false,
-        }
+        let pid = Pid::from_u32(identity.pid);
+        let mut current = System::new();
+        current.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        current.process(pid).is_some_and(|process| {
+            format_epoch_seconds(process.start_time()) == identity.started_at
+        })
     }
 }
 
@@ -245,12 +262,6 @@ mod tests {
 
     #[test]
     fn kimi_matches_both_the_documented_command_name_and_its_renamed_title() {
-        // The curl-installed native binary and the npm shim are both
-        // documented as "kimi"; process.title = "kimi-code" is only
-        // confirmed for the shipped JS bundle's main() path, never verified
-        // against a live process. Matching "kimi-code" alone would make
-        // every Kimi session permanently unverifiable if that rename does
-        // not reach sysinfo's name()/cmd() on some install path.
         let candidates = SystemProcessLookup::expected_executables(Agent::Kimi);
         assert!(is_owning_process("kimi", &[], candidates));
         assert!(is_owning_process("kimi-code", &[], candidates));
@@ -318,5 +329,51 @@ mod tests {
             host: "test".into(),
         };
         assert!(!lookup.is_alive(&identity));
+    }
+    #[test]
+    fn liveness_observes_processes_started_after_lookup_creation_and_their_exit() {
+        let lookup = SystemProcessLookup::new();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_u32(child.id());
+        let mut current = System::new();
+        current.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let observation = current.process(pid).map(|process| {
+            let identity = ProcessIdentity {
+                pid: child.id(),
+                started_at: format_epoch_seconds(process.start_time()),
+                host: local_hostname(),
+            };
+            let alive = lookup.is_alive(&identity);
+            (identity, alive)
+        });
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (identity, alive) = observation.expect("the spawned process is observable");
+        assert!(alive);
+        assert!(!lookup.is_alive(&identity));
+    }
+    #[test]
+    fn timestamp_parsing_rejects_invalid_calendar_values_and_overflow() {
+        for text in [
+            "2026-02-31T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:60Z",
+            "9223372036854775807-01-01T00:00:00Z",
+            "2026-01-01T18446744073709551615:00:00Z",
+        ] {
+            assert_eq!(parse_epoch_seconds(text), None, "{text}");
+        }
+        assert_eq!(
+            parse_epoch_seconds("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800)
+        );
     }
 }

@@ -18,7 +18,9 @@ The flow starts in [`run_ingest`](../src/main.rs), passes through
 `session.id` identifies an agent conversation. `bindingId` hashes the agent,
 session ID, host, PID, and process start time. Resuming one conversation in two
 processes therefore produces two bindings. PID reuse does not preserve a binding:
-[`SystemProcessLookup`](../src/processes.rs) checks both PID and start time.
+[`SystemProcessLookup`](../src/processes.rs) checks both PID and start time. Liveness checks
+refresh the requested PID while the ledger lock is held; the earlier ancestor-discovery
+snapshot cannot classify a newly started process as dead.
 
 Ancestor detection accepts executable names and script paths under Node, Bun,
 or Deno. An unrecognized launcher can leave `process` null. A nonempty-session
@@ -48,7 +50,9 @@ honor `running: false` independently of phase.
 
 Keeping deletion inside ingest preserves the removal event for push consumers.
 A poll between process exit and the next hook cannot consume that event. If no
-further hook arrives, dead files remain while live-session reads exclude them.
+further hook arrives, dead files remain while live-session reads exclude them. A sweep
+retains successful removals alongside per-record failures and sends those removal events
+even if another record could not be read or deleted.
 
 ## Consumer contract and delivery
 
@@ -82,6 +86,10 @@ Store-open and stdin-read failures return before normalization and sweeping.
 The health log retains at most 50 problems. `sessions --json` includes problems
 from the last ten minutes; `doctor` can still report an older last sink failure.
 Ledger writes use a lock and atomic replacement, with private state permissions.
+Session envelopes retain valid records and report unreadable or malformed records in
+`problems`; malformed health JSON is also reported, rather than treated as an empty log.
+Consumer lookup follows the same partial-read policy for sink delivery: valid sinks still
+receive events while damaged registrations produce health diagnostics.
 
 [`tests/integration.rs`](../tests/integration.rs) covers identity, PID reuse,
 unverifiable records, empty-ID fanout, privacy, and polling before a later sweep;

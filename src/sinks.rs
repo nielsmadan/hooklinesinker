@@ -23,7 +23,7 @@ pub struct SinkFanout<C: HttpClient> {
 }
 
 impl<C: HttpClient> SinkFanout<C> {
-    pub fn new(client: C) -> Self {
+    pub const fn new(client: C) -> Self {
         Self { client }
     }
 
@@ -132,7 +132,7 @@ mod tests {
         Consumer {
             name: name.to_string(),
             protocol: PROTOCOL_VERSION,
-            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            capabilities: capabilities.iter().map(ToString::to_string).collect(),
             sink: sink.map(str::to_string),
         }
     }

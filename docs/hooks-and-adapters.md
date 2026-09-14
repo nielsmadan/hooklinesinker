@@ -9,9 +9,14 @@ for activation, paths, and consumer lifetime.
 
 Claude, Codex, and Qwen store event groups under a JSON `hooks` key. Droid's JSON
 root is the event map. Their installers preserve foreign groups and unrelated
-values, replace recognized owned groups, and remove legacy Juggler notify groups.
-Ownership uses the canonical command, including agent and event; JSON also
-recognizes a matching hooklinesinker command at an old binary path as drift.
+values. Reconciliation removes recognized command handlers, including legacy Juggler notify
+handlers, and installation adds fresh owned groups. Foreign handlers inside mixed groups
+retain their group metadata, including prompt, agent and unknown handler shapes.
+Ownership uses a command handler's canonical command, including agent and event; JSON also
+recognizes a standalone hooklinesinker invocation at an old binary path as drift.
+Drift and legacy matching require plain command words; shell wrappers, substitutions,
+redirections and compound commands are preserved as foreign. Status exposes only groups
+containing a single recognized command handler as owned.
 
 An unsupported hooks shape, including a non-array value under a managed event,
 produces `unsupported` without rewriting the file. Invalid JSON/TOML produces an
@@ -39,7 +44,8 @@ or foreign field. TypeScript status compares the complete generated content.
 Hook failures must let the agent continue. JSON/TOML registrations set host
 timeouts; Qwen expresses them in milliseconds, while the other command-hook
 hosts use seconds. Codex `Interrupt` and `SessionEnd` use three seconds, including
-in trust computation. Event-specific values live in [`hooks.rs`](../src/hooks.rs).
+in trust computation. [`hooks.rs`](../src/hooks.rs) stores event timeouts as `Duration` and
+converts them to the host's units when rendering configuration.
 
 Both TypeScript adapters spawn with argument arrays, discard child output, and
 resolve failures. Each invocation schedules a kill after two seconds. The host

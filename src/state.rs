@@ -15,10 +15,8 @@ const MAX_HEALTH_PROBLEMS: usize = 50;
 const HEALTH_PROBLEM_TTL_SECS: u64 = 600;
 
 fn is_recent_problem(problem: &HealthProblem, now: u64) -> bool {
-    match parse_epoch_seconds(&problem.observed_at) {
-        Some(observed) => now.saturating_sub(observed) <= HEALTH_PROBLEM_TTL_SECS,
-        None => true,
-    }
+    parse_epoch_seconds(&problem.observed_at)
+        .is_none_or(|observed| now.saturating_sub(observed) <= HEALTH_PROBLEM_TTL_SECS)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,6 +26,17 @@ pub struct HealthProblem {
     pub message: String,
 }
 
+struct StatusSnapshot {
+    records: Vec<(PathBuf, StatusEvent)>,
+    problems: Vec<String>,
+}
+
+#[derive(Default)]
+pub struct SweepOutcome {
+    pub events: Vec<StatusEvent>,
+    pub problems: Vec<String>,
+}
+
 pub struct StatusStore {
     bindings_dir: PathBuf,
     lock_path: PathBuf,
@@ -35,9 +44,10 @@ pub struct StatusStore {
 }
 
 impl StatusStore {
-    pub fn open(root: PathBuf) -> io::Result<Self> {
+    pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref();
         let bindings_dir = root.join("status");
-        crate::paths::ensure_private_dir(&root)?;
+        crate::paths::ensure_private_dir(root)?;
         crate::paths::ensure_private_dir(&bindings_dir)?;
         Ok(Self {
             lock_path: root.join("status.lock"),
@@ -71,25 +81,59 @@ impl StatusStore {
         }
     }
 
-    fn read_all(&self) -> io::Result<Vec<(PathBuf, StatusEvent)>> {
-        let mut out = Vec::new();
+    fn read_all(&self) -> io::Result<StatusSnapshot> {
+        let mut snapshot = StatusSnapshot {
+            records: Vec::new(),
+            problems: Vec::new(),
+        };
         let entries = match fs::read_dir(&self.bindings_dir) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(snapshot),
             Err(e) => return Err(e),
         };
         for entry in entries {
-            let path = entry?.path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    snapshot
+                        .problems
+                        .push(format!("failed to read status directory entry: {e}"));
+                    continue;
+                }
+            };
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(bytes) = fs::read(&path)
-                && let Ok(event) = serde_json::from_slice::<StatusEvent>(&bytes)
-            {
-                out.push((path, event));
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    snapshot.problems.push(format!(
+                        "failed to read status record {}: {e}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<StatusEvent>(&bytes) {
+                Ok(event) => snapshot.records.push((path, event)),
+                Err(e) => snapshot.problems.push(format!(
+                    "failed to parse status record {}: {e}",
+                    path.display()
+                )),
             }
         }
-        Ok(out)
+        Ok(snapshot)
+    }
+
+    fn read_complete(&self) -> io::Result<Vec<(PathBuf, StatusEvent)>> {
+        let snapshot = self.read_all()?;
+        if !snapshot.problems.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                snapshot.problems.join("; "),
+            ));
+        }
+        Ok(snapshot.records)
     }
 
     // Reads never delete: only ingest's sweep removes a dead binding, so it can
@@ -97,7 +141,7 @@ impl StatusStore {
     pub fn running(&self, liveness: &dyn ProcessLookup) -> io::Result<Vec<StatusEvent>> {
         let _guard = self.lock()?;
         Ok(self
-            .read_all()?
+            .read_complete()?
             .into_iter()
             .filter(|(_, event)| is_live(event, liveness))
             .map(|(_, event)| event)
@@ -107,23 +151,37 @@ impl StatusStore {
     pub fn dead_records(&self, liveness: &dyn ProcessLookup) -> io::Result<usize> {
         let _guard = self.lock()?;
         Ok(self
-            .read_all()?
+            .read_complete()?
             .iter()
             .filter(|(_, event)| is_dead(event, liveness))
             .count())
     }
 
-    pub fn sweep(&self, liveness: &dyn ProcessLookup) -> io::Result<Vec<StatusEvent>> {
+    pub fn sweep(&self, liveness: &dyn ProcessLookup) -> io::Result<SweepOutcome> {
         let _guard = self.lock()?;
-        let mut swept = Vec::new();
-        for (path, mut event) in self.read_all()? {
+        let snapshot = self.read_all()?;
+        let mut outcome = SweepOutcome {
+            events: Vec::new(),
+            problems: snapshot.problems,
+        };
+        for (path, mut event) in snapshot.records {
             if is_dead(&event, liveness) {
-                fs::remove_file(&path)?;
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        outcome.problems.push(format!(
+                            "failed to remove status record {}: {e}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                }
                 event.running = false;
-                swept.push(event);
+                outcome.events.push(event);
             }
         }
-        Ok(swept)
+        Ok(outcome)
     }
 
     pub fn record_health(&self, message: &str) -> io::Result<()> {
@@ -149,7 +207,12 @@ impl StatusStore {
 
     fn read_health_locked(&self) -> io::Result<Vec<HealthProblem>> {
         match fs::read(&self.health_path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse {}: {e}", self.health_path.display()),
+                )
+            }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }
@@ -157,57 +220,49 @@ impl StatusStore {
 
     pub fn parse_problems(&self) -> io::Result<Vec<String>> {
         let _guard = self.lock()?;
-        let mut problems = Vec::new();
-        let entries = match fs::read_dir(&self.bindings_dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(problems),
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
-            };
-            if serde_json::from_slice::<StatusEvent>(&bytes).is_err() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("<unknown>");
-                problems.push(format!("failed to parse status record {name}"));
-            }
-        }
-        Ok(problems)
+        Ok(self.read_all()?.problems)
     }
 
     pub fn sessions_envelope(&self, liveness: &dyn ProcessLookup) -> SessionsEnvelope {
-        let mut problems = Vec::new();
-        let sessions = match self.running(liveness) {
-            Ok(sessions) => sessions,
-            Err(e) => {
-                problems.push(HealthProblem {
-                    observed_at: now_rfc3339(),
-                    message: format!("failed to read running sessions: {e}"),
-                });
-                Vec::new()
-            }
-        };
-        // Only surface recent problems here: `sessions --json` is polled routinely, so replaying
-        // the whole accumulated health log turns a past transient into permanent noise. Doctor's
-        // last-sink-error check still reads the full log for its single "last known" diagnostic.
-        let now = epoch_now();
-        match self.health_problems() {
-            Ok(recorded) => {
-                problems.extend(recorded.into_iter().filter(|p| is_recent_problem(p, now)))
-            }
-            Err(e) => problems.push(HealthProblem {
-                observed_at: now_rfc3339(),
-                message: format!("failed to read health problems: {e}"),
-            }),
+        match self.read_sessions_envelope(liveness) {
+            Ok(envelope) => envelope,
+            Err(e) => SessionsEnvelope {
+                sessions: Vec::new(),
+                problems: vec![health_problem(format!(
+                    "failed to read running sessions: {e}"
+                ))],
+            },
         }
-        SessionsEnvelope { sessions, problems }
+    }
+
+    fn read_sessions_envelope(&self, liveness: &dyn ProcessLookup) -> io::Result<SessionsEnvelope> {
+        let _guard = self.lock()?;
+        let snapshot = self.read_all()?;
+        let sessions = snapshot
+            .records
+            .into_iter()
+            .filter(|(_, event)| is_live(event, liveness))
+            .map(|(_, event)| event)
+            .collect();
+        let mut problems: Vec<_> = snapshot.problems.into_iter().map(health_problem).collect();
+        // Doctor reads the full health log for its last-known sink error.
+        let now = epoch_now();
+        match self.read_health_locked() {
+            Ok(recorded) => {
+                problems.extend(recorded.into_iter().filter(|p| is_recent_problem(p, now)));
+            }
+            Err(e) => problems.push(health_problem(format!(
+                "failed to read health problems: {e}"
+            ))),
+        }
+        Ok(SessionsEnvelope { sessions, problems })
+    }
+}
+
+fn health_problem(message: String) -> HealthProblem {
+    HealthProblem {
+        observed_at: now_rfc3339(),
+        message,
     }
 }
 
@@ -331,23 +386,21 @@ pub fn handle_ingest(
             None => Ok(()),
         });
 
-    let mut problem = outcome.err().map(|e| e.to_string());
-
+    let mut problems: Vec<String> = outcome.err().map(|e| e.to_string()).into_iter().collect();
     let swept = match store.sweep(ctx.liveness) {
-        Ok(swept) => swept,
+        Ok(outcome) => {
+            problems.extend(outcome.problems);
+            outcome.events
+        }
         Err(e) => {
-            let message = format!("sweep failed: {e}");
-            problem = Some(match problem {
-                Some(existing) => format!("{existing}; {message}"),
-                None => message,
-            });
+            problems.push(format!("sweep failed: {e}"));
             Vec::new()
         }
     };
-
-    if let Some(message) = &problem {
+    for message in &problems {
         let _ = store.record_health(message);
     }
+    let problem = (!problems.is_empty()).then(|| problems.join("; "));
 
     fan_out_to_sinks(
         store,
@@ -374,13 +427,17 @@ fn fan_out_to_sinks(
         return;
     };
 
-    let status_consumers = match consumers.requested_capabilities("status") {
-        Ok(status_consumers) => status_consumers,
+    let snapshot = match consumers.snapshot() {
+        Ok(snapshot) => snapshot,
         Err(e) => {
             let _ = store.record_health(&format!("sink consumer lookup failed: {e}"));
             return;
         }
     };
+    for problem in snapshot.problems {
+        let _ = store.record_health(&format!("sink consumer lookup failed: {problem}"));
+    }
+    let status_consumers = snapshot.consumers;
     if status_consumers.is_empty() {
         return;
     }

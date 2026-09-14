@@ -20,6 +20,11 @@ The [Lefthook configuration](../lefthook.yml) checks formatting and Clippy for s
 pre-push runs `just check`. The [main/PR CI workflow](../.github/workflows/ci.yml) runs the
 same full checks and additionally builds the four release targets.
 
+[`Cargo.toml`](../Cargo.toml) enables Clippy's nursery and pedantic groups with lower
+priority than individual overrides. `missing_errors_doc` and `must_use_candidate` are
+allowed for the internal library. Scoped exceptions carry reasons at their use sites;
+new nursery suggestions should be checked for false positives before applying them.
+
 [`package.json`](../package.json) has three development dependencies: TypeScript, Node types
 and Oxlint. Run `npm ci` after their lockfile changes. [`tsconfig.json`](../tsconfig.json)
 uses strict checking, `noEmit`, and erasable TypeScript syntax. Oxlint enables

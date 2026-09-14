@@ -300,7 +300,7 @@ fn install_rejects_an_invalid_consumer_name() {
     assert_ne!(output.status.code(), Some(2));
     assert!(
         std::fs::read_dir(temp.join("hooklinesinker/consumers"))
-            .map(|entries| entries.count())
+            .map(std::iter::Iterator::count)
             .unwrap_or(0)
             == 0
     );
@@ -511,7 +511,9 @@ fn doctor_fails_when_a_status_record_is_unparseable() {
     assert_ne!(value["exitCode"], 0);
     assert_eq!(
         output.status.code(),
-        value["exitCode"].as_i64().map(|c| c as i32)
+        value["exitCode"]
+            .as_i64()
+            .map(|c| i32::try_from(c).unwrap())
     );
     let checks = value["checks"].as_array().unwrap();
     let status_check = checks
@@ -604,7 +606,7 @@ fn ingest_without_a_session_id_writes_no_ledger_record() {
     assert!(ingest.status.success());
 
     let ledger_files = std::fs::read_dir(temp.join("hooklinesinker/status"))
-        .map(|entries| entries.count())
+        .map(std::iter::Iterator::count)
         .unwrap_or(0);
     assert_eq!(ledger_files, 0);
 
@@ -740,4 +742,28 @@ fn missing_required_flag_is_a_clap_usage_error_not_unimplemented() {
         String::from_utf8(output.stderr).unwrap(),
         "not implemented yet\n"
     );
+}
+
+#[test]
+fn json_envelopes_report_corrupt_store_files() {
+    for command in ["sessions", "consumers"] {
+        let root = unique_temp_dir("corrupt-envelope");
+        let dir = root.join("hooklinesinker").join(if command == "sessions" {
+            "status"
+        } else {
+            "consumers"
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.json"), "{").unwrap();
+        let output = hooklinesinker_isolated(&root)
+            .args([command, "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["protocol"], 1);
+        let problems = value["problems"].as_array().unwrap();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].to_string().contains("broken.json"));
+    }
 }

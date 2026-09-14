@@ -76,6 +76,10 @@ fn detect_terminal(env: &dyn EnvSource) -> Option<TerminalIdentity> {
     None
 }
 
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "tmux expands its own format expressions"
+)]
 fn detect_tmux(env: &dyn EnvSource) -> Option<TmuxIdentity> {
     let pane = nonempty(env.var("TMUX_PANE"))?;
     let session_name = env.command_output(

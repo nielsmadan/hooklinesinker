@@ -31,12 +31,17 @@ The version comes from the candidate's compiled Cargo package version. Rebuildin
 version does not replace the shared binary; see [local iteration](development-and-releases.md).
 Old version directories survive promotion. Activation happens before registration validation,
 so an invalid consumer name or sink can fail after the binary has already been activated.
+An installation-wide file lock spans version selection, activation and registration, and
+also spans consumer removal through shared cleanup. Concurrent consumers cannot downgrade
+a newer activation or register between the last-consumer check and teardown.
 
 [`ConsumerStore`](../src/consumers.rs) replaces only the registration for the same name;
 other names remain registered. Names start with a lowercase letter or digit and otherwise
 contain lowercase letters, digits, `_` or `-`. The CLI requests the `status` capability with
 its own protocol major. `--sink URL` enables HTTP(S) delivery; omitting it on re-registration
-clears that consumer's sink. Use `consumers --json` to inspect registrations.
+clears that consumer's sink. Use `consumers --json` to inspect registrations; valid records
+remain visible alongside read/parse diagnostics in `problems`. Removal validates the same
+name rules as registration before constructing any file path.
 
 ## Install or refresh hooks
 
@@ -58,8 +63,10 @@ See the [README path reference](../README.md#paths) for agent configuration loca
 ## Remove a consumer
 
 `uninstall --consumer me` removes that registration. While another consumer remains, hooks
-and the active binary stay. Removing the last consumer attempts hook removal for every
-supported agent, then removes the active symlink. An I/O failure stops cleanup at that point;
+and the active binary stay. If any remaining registration cannot be read or parsed, cleanup
+stops with an error and preserves the shared hooks and binary. After a complete registry
+read confirms the last consumer has left, removal attempts hook cleanup for every supported
+agent, then removes the active symlink. An I/O failure stops cleanup at that point;
 unsupported configurations remain untouched. Version directories, ledger/health files and
 installation directories remain. [`Installer::uninstall_consumer`](../src/install.rs) owns
 this sequence; [CLI tests](../tests/cli.rs) cover retention of version directories.
