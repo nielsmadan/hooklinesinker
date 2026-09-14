@@ -2,3 +2,9 @@
 /.superpowers/
 /dist
 /node_modules
+/AGENTS.md
+/CLAUDE.md
+/.claude/skills
+/.agents/skills
+/.loadout-state/
+/loadout/.loadout-state/

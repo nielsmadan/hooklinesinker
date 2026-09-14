@@ -1,0 +1,4 @@
+harnesses = ["claude", "codex", "opencode", "pi", "droid"]
+presets = false
+artifacts = "artifacts.toml"
+templates = ["rust", "cli", "typescript"]
