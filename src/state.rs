@@ -1,6 +1,8 @@
 use crate::consumers::ConsumerStore;
 use crate::normalize::{HookEnvironment, normalize};
-use crate::processes::{ProcessLookup, epoch_now, now_rfc3339, parse_epoch_seconds};
+use crate::processes::{
+    ProcessLiveness, ProcessLookup, epoch_now, now_rfc3339, parse_epoch_seconds,
+};
 use crate::protocol::{Agent, StatusEvent};
 use crate::sinks::{HttpClient, SinkFanout};
 use fs2::FileExt;
@@ -138,7 +140,10 @@ impl StatusStore {
 
     // Reads never delete: only ingest's sweep removes a dead binding, so it can
     // always fan the synthetic running:false event out to sinks.
-    pub fn running(&self, liveness: &dyn ProcessLookup) -> io::Result<Vec<StatusEvent>> {
+    pub fn running<L: ProcessLiveness + ?Sized>(
+        &self,
+        liveness: &L,
+    ) -> io::Result<Vec<StatusEvent>> {
         let _guard = self.lock()?;
         Ok(self
             .read_complete()?
@@ -148,7 +153,7 @@ impl StatusStore {
             .collect())
     }
 
-    pub fn dead_records(&self, liveness: &dyn ProcessLookup) -> io::Result<usize> {
+    pub fn dead_records<L: ProcessLiveness + ?Sized>(&self, liveness: &L) -> io::Result<usize> {
         let _guard = self.lock()?;
         Ok(self
             .read_complete()?
@@ -157,7 +162,7 @@ impl StatusStore {
             .count())
     }
 
-    pub fn sweep(&self, liveness: &dyn ProcessLookup) -> io::Result<SweepOutcome> {
+    pub fn sweep<L: ProcessLiveness + ?Sized>(&self, liveness: &L) -> io::Result<SweepOutcome> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
         let mut outcome = SweepOutcome {
@@ -223,7 +228,7 @@ impl StatusStore {
         Ok(self.read_all()?.problems)
     }
 
-    pub fn sessions_envelope(&self, liveness: &dyn ProcessLookup) -> SessionsEnvelope {
+    pub fn sessions_envelope<L: ProcessLiveness + ?Sized>(&self, liveness: &L) -> SessionsEnvelope {
         match self.read_sessions_envelope(liveness) {
             Ok(envelope) => envelope,
             Err(e) => SessionsEnvelope {
@@ -235,7 +240,10 @@ impl StatusStore {
         }
     }
 
-    fn read_sessions_envelope(&self, liveness: &dyn ProcessLookup) -> io::Result<SessionsEnvelope> {
+    fn read_sessions_envelope<L: ProcessLiveness + ?Sized>(
+        &self,
+        liveness: &L,
+    ) -> io::Result<SessionsEnvelope> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
         let sessions = snapshot
@@ -273,18 +281,18 @@ pub struct SessionsEnvelope {
 
 // A record without a process identity is unverifiable: neither live nor dead,
 // so no read reports it and no sweep removes it.
-fn is_live(event: &StatusEvent, liveness: &dyn ProcessLookup) -> bool {
+fn is_live(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> bool {
     event
         .process
         .as_ref()
-        .is_some_and(|identity| liveness.is_alive(identity))
+        .is_some_and(|identity| liveness.process_is_alive(identity))
 }
 
-fn is_dead(event: &StatusEvent, liveness: &dyn ProcessLookup) -> bool {
+fn is_dead(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> bool {
     event
         .process
         .as_ref()
-        .is_some_and(|identity| !liveness.is_alive(identity))
+        .is_some_and(|identity| !liveness.process_is_alive(identity))
 }
 
 pub(crate) struct LockGuard {

@@ -15,6 +15,30 @@ pub enum Agent {
     Kimi,
 }
 
+impl Agent {
+    pub const ALL: [Self; 7] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Opencode,
+        Self::Pi,
+        Self::Droid,
+        Self::Qwen,
+        Self::Kimi,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+            Self::Pi => "pi",
+            Self::Droid => "droid",
+            Self::Qwen => "qwen",
+            Self::Kimi => "kimi",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {

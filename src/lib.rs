@@ -1,5 +1,6 @@
 pub mod consumers;
 pub mod environment;
+mod events;
 pub mod hooks;
 pub mod install;
 pub mod normalize;

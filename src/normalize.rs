@@ -1,3 +1,4 @@
+use crate::events::{EventAction, native_event_action};
 use crate::processes::now_rfc3339;
 use crate::protocol::{
     Agent, GitIdentity, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity, StatusEvent,
@@ -41,26 +42,6 @@ fn map_event(
 ) -> MappedAction {
     use MappedAction::{Ignore, Remove, Update};
     match agent {
-        Agent::Claude => match event {
-            "SessionStart" | "Stop" | "StopFailure" => Update(Phase::Idle),
-            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-            | "SubagentStart" => Update(Phase::Working),
-            "PermissionRequest" => Update(Phase::Permission),
-            "PreCompact" => Update(Phase::Compacting),
-            "SessionEnd" => Remove,
-            _ => Ignore,
-        },
-        Agent::Codex => match event {
-            "SessionStart" | "Stop" | "Interrupt" => Update(Phase::Idle),
-            "PreToolUse" if tool_name == Some("request_user_input") => Update(Phase::Idle),
-            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostCompact" => {
-                Update(Phase::Working)
-            }
-            "PermissionRequest" => Update(Phase::Permission),
-            "PreCompact" => Update(Phase::Compacting),
-            "SessionEnd" => Remove,
-            _ => Ignore,
-        },
         Agent::Pi => match event {
             "session_start" | "agent_settled" | "session_compact_idle" => Update(Phase::Idle),
             "agent_start" | "session_compact_working" | "permission_resolved" => {
@@ -81,41 +62,13 @@ fn map_event(
             "session.deleted" | "server.instance.disposed" => Remove,
             _ => Ignore,
         },
-        Agent::Droid => match event {
-            "SessionStart" | "Stop" => Update(Phase::Idle),
-            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Update(Phase::Working),
-            "Notification" => match notification_type {
-                Some("permission_prompt" | "elicitation_dialog") => Update(Phase::Permission),
-                Some("idle_prompt") => Update(Phase::Idle),
-                _ => Ignore,
-            },
-            "PreCompact" => Update(Phase::Compacting),
-            "SessionEnd" => Remove,
-            _ => Ignore,
-        },
-        Agent::Qwen => match event {
-            "SessionStart" | "Stop" | "StopFailure" => Update(Phase::Idle),
-            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-            | "PermissionDenied" | "PostCompact" => Update(Phase::Working),
-            "PermissionRequest" => Update(Phase::Permission),
-            "Notification" => match notification_type {
-                Some("permission_prompt") => Update(Phase::Permission),
-                Some("idle_prompt") => Update(Phase::Idle),
-                _ => Ignore,
-            },
-            "PreCompact" => Update(Phase::Compacting),
-            "SessionEnd" => Remove,
-            _ => Ignore,
-        },
-        Agent::Kimi => match event {
-            "SessionStart" | "Stop" | "StopFailure" | "Interrupt" => Update(Phase::Idle),
-            "TurnStarted" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
-            | "PostToolUseFailure" | "PermissionResult" | "PostCompact" => Update(Phase::Working),
-            "PermissionRequest" => Update(Phase::Permission),
-            "PreCompact" => Update(Phase::Compacting),
-            "SessionEnd" => Remove,
-            _ => Ignore,
-        },
+        Agent::Claude | Agent::Codex | Agent::Droid | Agent::Qwen | Agent::Kimi => {
+            match native_event_action(agent, event, tool_name, notification_type) {
+                Some(EventAction::Update(phase)) => Update(phase),
+                Some(EventAction::Remove) => Remove,
+                None => Ignore,
+            }
+        }
     }
 }
 
@@ -176,18 +129,6 @@ pub fn normalize(
     }))
 }
 
-const fn agent_wire_name(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Claude => "claude",
-        Agent::Codex => "codex",
-        Agent::Opencode => "opencode",
-        Agent::Pi => "pi",
-        Agent::Droid => "droid",
-        Agent::Qwen => "qwen",
-        Agent::Kimi => "kimi",
-    }
-}
-
 fn binding_id(
     agent: Agent,
     session_id: &str,
@@ -195,7 +136,7 @@ fn binding_id(
     process: Option<&ProcessIdentity>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(agent_wire_name(agent).as_bytes());
+    hasher.update(agent.as_str().as_bytes());
     hasher.update([0u8]);
     hasher.update(session_id.as_bytes());
     hasher.update([0u8]);

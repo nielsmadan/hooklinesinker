@@ -2,8 +2,8 @@ use crate::consumers::{Consumer, ConsumerStore};
 use crate::hooks::HookManager;
 use crate::protocol::Agent;
 use crate::state::{LockGuard, write_private_atomic};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -248,15 +248,7 @@ impl Installer {
             });
         }
 
-        for agent in [
-            Agent::Claude,
-            Agent::Codex,
-            Agent::Opencode,
-            Agent::Pi,
-            Agent::Droid,
-            Agent::Qwen,
-            Agent::Kimi,
-        ] {
+        for agent in Agent::ALL {
             hooks.uninstall(agent)?;
         }
 
@@ -287,16 +279,8 @@ fn symlink(_target: &Path, _link: &Path) -> io::Result<()> {
 }
 
 fn copy_executable_and_fsync(src: &Path, dst: &Path) -> io::Result<()> {
-    let bytes = fs::read(src)?;
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o755);
-    }
-    let mut file: File = options.open(dst)?;
-    file.write_all(&bytes)?;
+    fs::copy(src, dst)?;
+    let file = File::open(dst)?;
     file.sync_all()?;
     #[cfg(unix)]
     {

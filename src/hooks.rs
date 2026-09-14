@@ -1,3 +1,4 @@
+use crate::events::{EventSpec, native_event_specs};
 use crate::protocol::Agent;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -5,7 +6,6 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value as toml_value};
 
 const MARKER_PREFIX: &str = "// hooklinesinker-generated protocol=";
@@ -13,310 +13,6 @@ const BIN_PLACEHOLDER: &str = "__HOOKLINESINKER_BIN__";
 
 const OPENCODE_TEMPLATE: &str = include_str!("../adapters/opencode-hooklinesinker.ts");
 const PI_TEMPLATE: &str = include_str!("../adapters/pi-hooklinesinker.ts");
-
-struct EventSpec {
-    name: &'static str,
-    matcher: Option<&'static str>,
-    timeout: Duration,
-}
-
-const CLAUDE_EVENTS: &[EventSpec] = &[
-    EventSpec {
-        name: "SessionStart",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "SessionEnd",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "UserPromptSubmit",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreToolUse",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUse",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUseFailure",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PermissionRequest",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "SubagentStart",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Stop",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "StopFailure",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreCompact",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-];
-
-const CODEX_EVENTS: &[EventSpec] = &[
-    EventSpec {
-        name: "SessionStart",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "UserPromptSubmit",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreToolUse",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUse",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreCompact",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostCompact",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PermissionRequest",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Stop",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Interrupt",
-        matcher: None,
-        timeout: Duration::from_secs(3),
-    },
-    EventSpec {
-        name: "SessionEnd",
-        matcher: None,
-        timeout: Duration::from_secs(3),
-    },
-];
-
-const DROID_EVENTS: &[EventSpec] = &[
-    EventSpec {
-        name: "SessionStart",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "UserPromptSubmit",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreToolUse",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUse",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Stop",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Notification",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreCompact",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "SessionEnd",
-        matcher: None,
-        timeout: Duration::from_secs(3),
-    },
-];
-
-const QWEN_EVENTS: &[EventSpec] = &[
-    EventSpec {
-        name: "SessionStart",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "UserPromptSubmit",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreToolUse",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUse",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUseFailure",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PermissionRequest",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PermissionDenied",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Stop",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "StopFailure",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Notification",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreCompact",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostCompact",
-        matcher: Some("*"),
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "SessionEnd",
-        matcher: None,
-        timeout: Duration::from_secs(3),
-    },
-];
-
-// Kimi's config.toml `[[hooks]]` schema has no matcher-group concept: each
-// entry is a flat table, so EventSpec.matcher goes unused here (our rulings
-// apply the same phase to every matcher value of a given event).
-const KIMI_EVENTS: &[EventSpec] = &[
-    EventSpec {
-        name: "SessionStart",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "TurnStarted",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "UserPromptSubmit",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreToolUse",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUse",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostToolUseFailure",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PermissionRequest",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PermissionResult",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Stop",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "StopFailure",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "Interrupt",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PreCompact",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "PostCompact",
-        matcher: None,
-        timeout: Duration::from_secs(5),
-    },
-    EventSpec {
-        name: "SessionEnd",
-        matcher: None,
-        timeout: Duration::from_secs(3),
-    },
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -406,50 +102,50 @@ impl HookManager {
 
     pub fn install(&self, agent: Agent) -> io::Result<HookStatus> {
         match agent {
-            Agent::Claude => self.reconcile_json(
+            Agent::Claude => self.json_hooks().reconcile(
                 agent,
                 &self.claude_settings_path(),
-                CLAUDE_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Install,
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Codex => self.reconcile_json(
+            Agent::Codex => self.json_hooks().reconcile(
                 agent,
                 &self.codex_hooks_path(),
-                CODEX_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Install,
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Opencode => self.install_ts(
+            Agent::Opencode => self.typescript_hooks().install(
                 agent,
                 &self.opencode_plugin_path(),
                 OPENCODE_TEMPLATE,
                 &self.opencode_legacy_path(),
             ),
-            Agent::Pi => self.install_ts(
+            Agent::Pi => self.typescript_hooks().install(
                 agent,
                 &self.pi_extension_path(),
                 PI_TEMPLATE,
                 &self.pi_legacy_path(),
             ),
-            Agent::Droid => self.reconcile_json(
+            Agent::Droid => self.json_hooks().reconcile(
                 agent,
                 &self.droid_hooks_path(),
-                DROID_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Install,
                 HooksLocation::TopLevel,
             ),
-            Agent::Qwen => self.reconcile_json(
+            Agent::Qwen => self.json_hooks().reconcile(
                 agent,
                 &self.qwen_settings_path(),
-                QWEN_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Install,
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Kimi => self.reconcile_toml(
+            Agent::Kimi => self.toml_hooks().reconcile(
                 agent,
                 &self.kimi_config_path(),
-                KIMI_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Install,
             ),
         }
@@ -457,84 +153,92 @@ impl HookManager {
 
     pub fn status(&self, agent: Agent) -> io::Result<HookStatus> {
         match agent {
-            Agent::Claude => self.status_json(
+            Agent::Claude => self.json_hooks().status(
                 agent,
                 &self.claude_settings_path(),
-                CLAUDE_EVENTS,
+                native_event_specs(agent),
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Codex => self.status_json(
+            Agent::Codex => self.json_hooks().status(
                 agent,
                 &self.codex_hooks_path(),
-                CODEX_EVENTS,
+                native_event_specs(agent),
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Opencode => {
-                self.status_ts(agent, &self.opencode_plugin_path(), OPENCODE_TEMPLATE)
+            Agent::Opencode => self.typescript_hooks().status(
+                agent,
+                &self.opencode_plugin_path(),
+                OPENCODE_TEMPLATE,
+            ),
+            Agent::Pi => {
+                self.typescript_hooks()
+                    .status(agent, &self.pi_extension_path(), PI_TEMPLATE)
             }
-            Agent::Pi => self.status_ts(agent, &self.pi_extension_path(), PI_TEMPLATE),
-            Agent::Droid => self.status_json(
+            Agent::Droid => self.json_hooks().status(
                 agent,
                 &self.droid_hooks_path(),
-                DROID_EVENTS,
+                native_event_specs(agent),
                 HooksLocation::TopLevel,
             ),
-            Agent::Qwen => self.status_json(
+            Agent::Qwen => self.json_hooks().status(
                 agent,
                 &self.qwen_settings_path(),
-                QWEN_EVENTS,
+                native_event_specs(agent),
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Kimi => self.status_toml(agent, &self.kimi_config_path(), KIMI_EVENTS),
+            Agent::Kimi => {
+                self.toml_hooks()
+                    .status(agent, &self.kimi_config_path(), native_event_specs(agent))
+            }
         }
     }
 
     pub fn uninstall(&self, agent: Agent) -> io::Result<HookStatus> {
         match agent {
-            Agent::Claude => self.reconcile_json(
+            Agent::Claude => self.json_hooks().reconcile(
                 agent,
                 &self.claude_settings_path(),
-                CLAUDE_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Uninstall,
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Codex => self.reconcile_json(
+            Agent::Codex => self.json_hooks().reconcile(
                 agent,
                 &self.codex_hooks_path(),
-                CODEX_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Uninstall,
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Opencode => self.uninstall_ts(
+            Agent::Opencode => self.typescript_hooks().uninstall(
                 agent,
                 &self.opencode_plugin_path(),
                 OPENCODE_TEMPLATE,
                 &self.opencode_legacy_path(),
             ),
-            Agent::Pi => self.uninstall_ts(
+            Agent::Pi => self.typescript_hooks().uninstall(
                 agent,
                 &self.pi_extension_path(),
                 PI_TEMPLATE,
                 &self.pi_legacy_path(),
             ),
-            Agent::Droid => self.reconcile_json(
+            Agent::Droid => self.json_hooks().reconcile(
                 agent,
                 &self.droid_hooks_path(),
-                DROID_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Uninstall,
                 HooksLocation::TopLevel,
             ),
-            Agent::Qwen => self.reconcile_json(
+            Agent::Qwen => self.json_hooks().reconcile(
                 agent,
                 &self.qwen_settings_path(),
-                QWEN_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Uninstall,
                 HooksLocation::Nested("hooks"),
             ),
-            Agent::Kimi => self.reconcile_toml(
+            Agent::Kimi => self.toml_hooks().reconcile(
                 agent,
                 &self.kimi_config_path(),
-                KIMI_EVENTS,
+                native_event_specs(agent),
                 ReconcileMode::Uninstall,
             ),
         }
@@ -588,7 +292,31 @@ impl HookManager {
         self.roots.kimi_code_dir.join("config.toml")
     }
 
-    fn reconcile_json(
+    fn json_hooks(&self) -> JsonHooks<'_> {
+        JsonHooks {
+            binary_path: &self.roots.binary_path,
+        }
+    }
+
+    fn toml_hooks(&self) -> TomlHooks<'_> {
+        TomlHooks {
+            binary_path: &self.roots.binary_path,
+        }
+    }
+
+    fn typescript_hooks(&self) -> TypeScriptHooks<'_> {
+        TypeScriptHooks {
+            binary_path: &self.roots.binary_path,
+        }
+    }
+}
+
+struct JsonHooks<'a> {
+    binary_path: &'a Path,
+}
+
+impl JsonHooks<'_> {
+    fn reconcile(
         &self,
         agent: Agent,
         path: &Path,
@@ -607,30 +335,16 @@ impl HookManager {
         }
         let root = root.unwrap_or_default();
 
-        let (mut root, mut hooks) = match location {
-            HooksLocation::Nested(key) => {
-                let mut root = root;
-                match root.remove(key) {
-                    None => (root, Map::new()),
-                    Some(Value::Object(map)) => (root, map),
-                    Some(other) => {
-                        root.insert(key.to_string(), other);
-                        return Ok(HookStatus {
-                            agent,
-                            state: HookState::Unsupported,
-                            path: path.to_path_buf(),
-                            entries: Vec::new(),
-                        });
-                    }
-                }
-            }
-            HooksLocation::TopLevel => (Map::new(), root),
+        let Ok((root, mut hooks)) = take_hook_map(root, location) else {
+            return Ok(HookStatus {
+                agent,
+                state: HookState::Unsupported,
+                path: path.to_path_buf(),
+                entries: Vec::new(),
+            });
         };
 
         if managed_event_shape_is_unsupported(&hooks, events) {
-            if let HooksLocation::Nested(key) = location {
-                root.insert(key.to_string(), Value::Object(hooks));
-            }
             return Ok(HookStatus {
                 agent,
                 state: HookState::Unsupported,
@@ -639,67 +353,19 @@ impl HookManager {
             });
         }
 
-        let keys: Vec<String> = hooks.keys().cloned().collect();
-        for key in &keys {
-            if let Some(Value::Array(arr)) = hooks.get(key) {
-                let filtered: Vec<Value> = arr
-                    .iter()
-                    .cloned()
-                    .filter_map(|g| retain_foreign_handlers(g, is_legacy_command))
-                    .collect();
-                hooks.insert(key.clone(), Value::Array(filtered));
-            }
-        }
-
-        for spec in events {
-            let canonical = canonical_command(&self.roots.binary_path, agent, spec.name);
-            let existing = hooks
-                .remove(spec.name)
-                .unwrap_or_else(|| Value::Array(Vec::new()));
-            let Value::Array(arr) = existing else {
-                unreachable!("non-array managed event values are rejected above");
-            };
-            let mut filtered: Vec<Value> = arr
-                .into_iter()
-                .filter_map(|g| {
-                    retain_foreign_handlers(g, |command| {
-                        matches!(
-                            classify_command(command, &canonical, agent, spec.name),
-                            GroupOwnership::Ours { .. }
-                        )
-                    })
-                })
-                .collect();
-            if matches!(mode, ReconcileMode::Install) {
-                filtered.push(build_group(spec, &canonical, agent));
-            }
-            hooks.insert(spec.name.to_string(), Value::Array(filtered));
-        }
-
-        let keys: Vec<String> = hooks.keys().cloned().collect();
-        for key in keys {
-            let is_empty = matches!(hooks.get(&key), Some(Value::Array(a)) if a.is_empty());
-            if is_empty {
-                hooks.remove(&key);
-            }
-        }
-
-        let final_root = match location {
-            HooksLocation::Nested(key) => {
-                root.insert(key.to_string(), Value::Object(hooks));
-                root
-            }
-            HooksLocation::TopLevel => hooks,
-        };
+        remove_legacy_handlers(&mut hooks);
+        reconcile_managed_events(&mut hooks, events, mode, self.binary_path, agent);
+        hooks.retain(|_, value| !matches!(value, Value::Array(items) if items.is_empty()));
+        let final_root = place_hook_map(root, hooks, location);
         let mut bytes = serde_json::to_vec_pretty(&Value::Object(final_root))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         bytes.push(b'\n');
         write_agent_config(path, &bytes)?;
 
-        self.status_json(agent, path, events, location)
+        self.status(agent, path, events, location)
     }
 
-    fn status_json(
+    fn status(
         &self,
         agent: Agent,
         path: &Path,
@@ -752,7 +418,7 @@ impl HookManager {
         let mut any_found = false;
 
         for spec in events {
-            let canonical = canonical_command(&self.roots.binary_path, agent, spec.name);
+            let canonical = canonical_command(self.binary_path, agent, spec.name);
             if let Some(Value::Array(arr)) = hooks.get(spec.name) {
                 for (index, group) in arr.iter().enumerate() {
                     if let GroupOwnership::Ours { exact } =
@@ -791,12 +457,18 @@ impl HookManager {
             entries,
         })
     }
+}
 
+struct TomlHooks<'a> {
+    binary_path: &'a Path,
+}
+
+impl TomlHooks<'_> {
     // Kimi's config.toml bricks entirely on one malformed [[hooks]] entry, so
     // this only ever removes exact-command matches, only ever writes entries
     // with the schema's plain {event, command, timeout} shape, and re-parses
     // its own rendering before it ever touches disk.
-    fn reconcile_toml(
+    fn reconcile(
         &self,
         agent: Agent,
         path: &Path,
@@ -839,8 +511,7 @@ impl HookManager {
             for table in array {
                 let command = table.get("command").and_then(Item::as_str);
                 let is_ours = events.iter().any(|spec| {
-                    Some(canonical_command(&self.roots.binary_path, agent, spec.name).as_str())
-                        == command
+                    Some(canonical_command(self.binary_path, agent, spec.name).as_str()) == command
                 });
                 if is_ours {
                     any_found = true;
@@ -863,7 +534,7 @@ impl HookManager {
             }
             ReconcileMode::Install => {
                 for spec in events {
-                    kept.push(kimi_hook_table(&self.roots.binary_path, agent, spec));
+                    kept.push(kimi_hook_table(self.binary_path, agent, spec));
                 }
                 doc["hooks"] = Item::ArrayOfTables(kept);
                 true
@@ -878,15 +549,10 @@ impl HookManager {
             parse_toml_document(path, &on_disk)?;
         }
 
-        self.status_toml(agent, path, events)
+        self.status(agent, path, events)
     }
 
-    fn status_toml(
-        &self,
-        agent: Agent,
-        path: &Path,
-        events: &[EventSpec],
-    ) -> io::Result<HookStatus> {
+    fn status(&self, agent: Agent, path: &Path, events: &[EventSpec]) -> io::Result<HookStatus> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -930,9 +596,7 @@ impl HookManager {
             let Some((spec, command)) = command.and_then(|command| {
                 events
                     .iter()
-                    .find(|spec| {
-                        canonical_command(&self.roots.binary_path, agent, spec.name) == command
-                    })
+                    .find(|spec| canonical_command(self.binary_path, agent, spec.name) == command)
                     .map(|spec| (spec, command))
             }) else {
                 continue;
@@ -960,15 +624,21 @@ impl HookManager {
             entries,
         })
     }
+}
 
+struct TypeScriptHooks<'a> {
+    binary_path: &'a Path,
+}
+
+impl TypeScriptHooks<'_> {
     fn generated_content(&self, template: &str) -> String {
         let marker = format!("{MARKER_PREFIX}{}\n", crate::protocol::PROTOCOL_VERSION);
-        let bin = escape_ts_string(&self.roots.binary_path.display().to_string());
+        let bin = escape_ts_string(&self.binary_path.display().to_string());
         let body = template.replace(BIN_PLACEHOLDER, &bin);
         format!("{marker}{body}")
     }
 
-    fn status_ts(&self, agent: Agent, path: &Path, template: &str) -> io::Result<HookStatus> {
+    fn status(&self, agent: Agent, path: &Path, template: &str) -> io::Result<HookStatus> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1004,7 +674,7 @@ impl HookManager {
         })
     }
 
-    fn install_ts(
+    fn install(
         &self,
         agent: Agent,
         path: &Path,
@@ -1012,16 +682,16 @@ impl HookManager {
         legacy_path: &Path,
     ) -> io::Result<HookStatus> {
         remove_if_exists(legacy_path)?;
-        let current = self.status_ts(agent, path, template)?;
+        let current = self.status(agent, path, template)?;
         if current.state == HookState::Unsupported {
             return Ok(current);
         }
         let contents = self.generated_content(template);
         write_generated_file(path, &contents)?;
-        self.status_ts(agent, path, template)
+        self.status(agent, path, template)
     }
 
-    fn uninstall_ts(
+    fn uninstall(
         &self,
         agent: Agent,
         path: &Path,
@@ -1029,14 +699,14 @@ impl HookManager {
         legacy_path: &Path,
     ) -> io::Result<HookStatus> {
         remove_if_exists(legacy_path)?;
-        let current = self.status_ts(agent, path, template)?;
+        let current = self.status(agent, path, template)?;
         match current.state {
             HookState::Missing | HookState::Unsupported => Ok(current),
             HookState::Installed | HookState::Drifted => {
                 let text = fs::read_to_string(path)?;
                 if file_protocol(&text) == Some(crate::protocol::PROTOCOL_VERSION) {
                     fs::remove_file(path)?;
-                    self.status_ts(agent, path, template)
+                    self.status(agent, path, template)
                 } else {
                     Ok(current)
                 }
@@ -1064,15 +734,75 @@ enum GroupOwnership {
     Foreign,
 }
 
-const fn wire_name(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Claude => "claude",
-        Agent::Codex => "codex",
-        Agent::Opencode => "opencode",
-        Agent::Pi => "pi",
-        Agent::Droid => "droid",
-        Agent::Qwen => "qwen",
-        Agent::Kimi => "kimi",
+type HookMaps = (Map<String, Value>, Map<String, Value>);
+
+fn take_hook_map(mut root: Map<String, Value>, location: HooksLocation) -> Result<HookMaps, ()> {
+    match location {
+        HooksLocation::Nested(key) => match root.remove(key) {
+            None => Ok((root, Map::new())),
+            Some(Value::Object(hooks)) => Ok((root, hooks)),
+            Some(_) => Err(()),
+        },
+        HooksLocation::TopLevel => Ok((Map::new(), root)),
+    }
+}
+
+fn place_hook_map(
+    mut root: Map<String, Value>,
+    hooks: Map<String, Value>,
+    location: HooksLocation,
+) -> Map<String, Value> {
+    match location {
+        HooksLocation::Nested(key) => {
+            root.insert(key.to_string(), Value::Object(hooks));
+            root
+        }
+        HooksLocation::TopLevel => hooks,
+    }
+}
+
+fn remove_legacy_handlers(hooks: &mut Map<String, Value>) {
+    for value in hooks.values_mut() {
+        let Value::Array(groups) = value else {
+            continue;
+        };
+        *groups = groups
+            .drain(..)
+            .filter_map(|group| retain_foreign_handlers(group, is_legacy_command))
+            .collect();
+    }
+}
+
+fn reconcile_managed_events(
+    hooks: &mut Map<String, Value>,
+    events: &[EventSpec],
+    mode: ReconcileMode,
+    binary_path: &Path,
+    agent: Agent,
+) {
+    for spec in events {
+        let canonical = canonical_command(binary_path, agent, spec.name);
+        let existing = hooks
+            .remove(spec.name)
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let Value::Array(groups) = existing else {
+            unreachable!("non-array managed event values are rejected before reconciliation");
+        };
+        let mut kept: Vec<Value> = groups
+            .into_iter()
+            .filter_map(|group| {
+                retain_foreign_handlers(group, |command| {
+                    matches!(
+                        classify_command(command, &canonical, agent, spec.name),
+                        GroupOwnership::Ours { .. }
+                    )
+                })
+            })
+            .collect();
+        if matches!(mode, ReconcileMode::Install) {
+            kept.push(build_group(spec, &canonical, agent));
+        }
+        hooks.insert(spec.name.to_string(), Value::Array(kept));
     }
 }
 
@@ -1080,7 +810,7 @@ fn canonical_command(binary_path: &Path, agent: Agent, event: &str) -> String {
     format!(
         "{} ingest --agent {} --event {}",
         binary_path.display(),
-        wire_name(agent),
+        agent.as_str(),
         event
     )
 }
@@ -1153,7 +883,7 @@ fn classify_command(command: &str, canonical: &str, agent: Agent, event: &str) -
     if command == canonical {
         return GroupOwnership::Ours { exact: true };
     }
-    let suffix = format!(" ingest --agent {} --event {}", wire_name(agent), event);
+    let suffix = format!(" ingest --agent {} --event {}", agent.as_str(), event);
     if command.strip_suffix(&suffix).is_some_and(|binary| {
         (binary == "hooklinesinker" || binary.ends_with("/hooklinesinker"))
             && is_unquoted_shell_word(binary)

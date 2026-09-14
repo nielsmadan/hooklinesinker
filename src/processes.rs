@@ -2,9 +2,29 @@ use crate::protocol::{Agent, ProcessIdentity};
 use std::path::Path;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+pub trait ProcessLiveness {
+    fn process_is_alive(&self, identity: &ProcessIdentity) -> bool;
+}
+
+pub trait ProcessOwnerResolver {
+    fn resolve_owner(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
+}
+
 pub trait ProcessLookup {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
     fn is_alive(&self, identity: &ProcessIdentity) -> bool;
+}
+
+impl<T: ProcessLookup + ?Sized> ProcessOwnerResolver for T {
+    fn resolve_owner(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity> {
+        ProcessLookup::owner_of(self, hook_pid, agent)
+    }
+}
+
+impl<T: ProcessLookup + ?Sized> ProcessLiveness for T {
+    fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
+        ProcessLookup::is_alive(self, identity)
+    }
 }
 
 pub fn local_hostname() -> String {
@@ -193,7 +213,6 @@ impl ProcessLookup for SystemProcessLookup {
         }
         None
     }
-
     fn is_alive(&self, identity: &ProcessIdentity) -> bool {
         let pid = Pid::from_u32(identity.pid);
         let mut current = System::new();

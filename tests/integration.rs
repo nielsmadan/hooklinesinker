@@ -147,7 +147,6 @@ impl ProcessLookup for AllAlive {
     fn owner_of(&self, _hook_pid: u32, _agent: Agent) -> Option<ProcessIdentity> {
         None
     }
-
     fn is_alive(&self, _identity: &ProcessIdentity) -> bool {
         true
     }
@@ -193,7 +192,6 @@ impl ProcessLookup for FakeProcessLookup {
     fn owner_of(&self, _hook_pid: u32, _agent: Agent) -> Option<ProcessIdentity> {
         self.owner.clone()
     }
-
     fn is_alive(&self, identity: &ProcessIdentity) -> bool {
         self.alive
             .lock()
