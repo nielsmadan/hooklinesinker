@@ -38,8 +38,7 @@ pub fn now_rfc3339() -> String {
 pub fn epoch_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub fn parse_epoch_seconds(s: &str) -> Option<u64> {

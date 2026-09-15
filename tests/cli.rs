@@ -298,11 +298,10 @@ fn install_rejects_an_invalid_consumer_name() {
         .unwrap();
     assert!(!output.status.success());
     assert_ne!(output.status.code(), Some(2));
-    assert!(
+    assert_eq!(
         std::fs::read_dir(temp.join("hooklinesinker/consumers"))
-            .map(std::iter::Iterator::count)
-            .unwrap_or(0)
-            == 0
+            .map_or(0, std::iter::Iterator::count),
+        0
     );
 }
 
@@ -605,9 +604,8 @@ fn ingest_without_a_session_id_writes_no_ledger_record() {
         .unwrap();
     assert!(ingest.status.success());
 
-    let ledger_files = std::fs::read_dir(temp.join("hooklinesinker/status"))
-        .map(std::iter::Iterator::count)
-        .unwrap_or(0);
+    let ledger_files =
+        std::fs::read_dir(temp.join("hooklinesinker/status")).map_or(0, std::iter::Iterator::count);
     assert_eq!(ledger_files, 0);
 
     let output = Command::cargo_bin("hooklinesinker")
