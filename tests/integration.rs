@@ -33,14 +33,12 @@ fn store() -> StatusStore {
 }
 
 fn ledger_files(root: &std::path::Path) -> usize {
-    std::fs::read_dir(root.join("status"))
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
-                .count()
-        })
-        .unwrap_or(0)
+    std::fs::read_dir(root.join("status")).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+            .count()
+    })
 }
 
 fn consumer_store() -> ConsumerStore {
