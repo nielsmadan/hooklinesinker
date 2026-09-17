@@ -7,6 +7,7 @@ These documents explain the flows and constraints behind that interface.
 |---|---|
 | Understand stale sessions, binding identity, or sink recovery | [Status lifecycle](status-lifecycle.md) |
 | Change agent hooks or the embedded TypeScript adapters | [Hooks and adapters](hooks-and-adapters.md) |
+| Compare native agent events, tool names, and wait-resolution signals | [Agent hook events](reference/agent-hook-events.md) |
 | Integrate a consumer or change activation and removal | [Installation](installation.md) |
 | Set up checks, ship a release, or update a consumer's pin | [Development and releases](development-and-releases.md) |
 | Understand why the protocol exposes only status | [Status-only decision](decisions/0001-status-events-only.md) |
