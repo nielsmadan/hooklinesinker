@@ -141,6 +141,7 @@ impl Installer {
     }
 
     pub fn active_version_summary(&self) -> io::Result<Option<InstalledVersion>> {
+        let _guard = self.lock()?;
         Ok(self.active_version()?.map(|a| InstalledVersion {
             active_version: a.version_str,
             protocol_major: a.protocol_major,
@@ -600,6 +601,37 @@ mod tests {
     }
 
     #[test]
+    fn active_version_summary_waits_for_the_installation_transaction() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let install = installation_with_active("1.0.2", 1);
+        let newer = candidate("1.0.3", 1);
+        let guard = install.lock().unwrap();
+        let root = install.data_root.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let installer = Installer::open(root).unwrap();
+            started_tx.send(()).unwrap();
+            done_tx.send(installer.active_version_summary()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(100));
+        install.install_candidate_locked(&newer).unwrap();
+        drop(guard);
+        reader.join().unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(
+            done_rx.recv().unwrap().unwrap(),
+            Some(InstalledVersion {
+                active_version: "1.0.3".into(),
+                protocol_major: 1,
+            })
+        );
+    }
+
+    #[test]
     fn install_current_keeps_registration_inside_the_uninstall_transaction() {
         use fs2::FileExt;
         use std::time::{Duration, Instant};
@@ -621,6 +653,9 @@ mod tests {
         let hooks = hook_manager_for(&install);
         hooks.install(Agent::Claude).unwrap();
         let registration_guard = LockGuard::acquire(&state_root.join("consumers.lock")).unwrap();
+        let current_binary_len = fs::metadata(std::env::current_exe().unwrap())
+            .unwrap()
+            .len();
         let root = install.data_root.clone();
         let registering_store = ConsumerStore::open(&state_root).unwrap();
         let installer = std::thread::spawn(move || {
@@ -630,13 +665,7 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while install
-            .active_version_summary()
-            .unwrap()
-            .unwrap()
-            .active_version
-            != env!("CARGO_PKG_VERSION")
-        {
+        while fs::metadata(install.binary_path()).unwrap().len() != current_binary_len {
             assert!(Instant::now() < deadline, "installation did not activate");
             std::thread::sleep(Duration::from_millis(5));
         }

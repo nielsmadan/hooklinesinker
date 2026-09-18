@@ -34,6 +34,8 @@ so an invalid consumer name or sink can fail after the binary has already been a
 An installation-wide file lock spans version selection, activation and registration, and
 also spans consumer removal through shared cleanup. Concurrent consumers cannot downgrade
 a newer activation or register between the last-consumer check and teardown.
+Active-version reads also take this lock, so `doctor` waits for installation or removal
+to finish before inspecting the symlink.
 
 [`ConsumerStore`](../src/consumers.rs) replaces only the registration for the same name;
 other names remain registered. Names start with a lowercase letter or digit and otherwise

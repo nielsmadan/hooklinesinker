@@ -12,8 +12,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_HEALTH_PROBLEMS: usize = 50;
-// Problems are transient diagnostics (a consumer's sink briefly down, a one-off parse fault).
-// Past this age they are stale history, not a current fault, and must not replay on every read.
+// Expired diagnostics must not replay as current faults on every read.
 const HEALTH_PROBLEM_TTL_SECS: u64 = 600;
 
 fn is_recent_problem(problem: &HealthProblem, now: u64) -> bool {
@@ -29,8 +28,41 @@ pub struct HealthProblem {
 }
 
 struct StatusSnapshot {
-    records: Vec<(PathBuf, StatusEvent)>,
+    records: Vec<(PathBuf, StoredStatus)>,
     problems: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredStatus {
+    #[serde(flatten)]
+    status: StatusEvent,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    claude_parallel: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    claude_retired: bool,
+}
+
+#[derive(Deserialize)]
+struct ClaudeContext {
+    source: Option<String>,
+    agent_id: Option<String>,
+}
+
+impl ClaudeContext {
+    fn is_resume(&self, event: &str) -> bool {
+        self.agent_id.is_none()
+            && event == "SessionStart"
+            && self.source.as_deref() == Some("resume")
+    }
+}
+
+impl StoredStatus {
+    fn write(&self, path: &Path) -> io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        write_private_atomic(path, &bytes)
+    }
 }
 
 #[derive(Default)]
@@ -74,8 +106,78 @@ impl StatusStore {
         write_private_atomic(&path, &bytes)
     }
 
+    fn ingest_claude(&self, event: &StatusEvent, input: &str) -> io::Result<(bool, SweepOutcome)> {
+        let _guard = self.lock()?;
+        let snapshot = self.read_all()?;
+        let mut outcome = SweepOutcome {
+            events: Vec::new(),
+            problems: snapshot.problems,
+        };
+        let Ok(context) = serde_json::from_str::<ClaudeContext>(input) else {
+            outcome
+                .problems
+                .push("invalid Claude lifecycle metadata".into());
+            return Ok((false, outcome));
+        };
+        let previous = snapshot.records.iter().find_map(|(_, stored)| {
+            (stored.status.binding_id == event.binding_id).then_some(stored)
+        });
+        let resume = context.is_resume(&event.event);
+        if previous.is_some_and(|stored| stored.claude_retired) && !resume {
+            return Ok((false, outcome));
+        }
+        let parallel = !resume
+            && (previous.is_some_and(|stored| stored.claude_parallel)
+                || (previous.is_none() && context.agent_id.is_some())
+                || (event.event == "SessionStart" && context.source.as_deref() == Some("fork")));
+        let stored = StoredStatus {
+            status: event.clone(),
+            claude_parallel: parallel,
+            claude_retired: !event.running && event.process.is_some(),
+        };
+        if !event.running && event.process.is_none() {
+            self.remove_binding(&event.binding_id)?;
+        } else {
+            stored.write(&self.binding_path(&event.binding_id))?;
+        }
+
+        if parallel || context.agent_id.is_some() || !event.running || event.process.is_none() {
+            return Ok((true, outcome));
+        }
+        for (path, mut stored) in snapshot.records {
+            let previous = &stored.status;
+            if !stored.claude_parallel
+                && !stored.claude_retired
+                && matches!(previous.agent, Agent::Claude)
+                && previous.session.id != event.session.id
+                && previous.process == event.process
+                && previous.terminal == event.terminal
+                && previous.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
+                    == event.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
+                && previous.remote_host == event.remote_host
+            {
+                stored.status.running = false;
+                stored.claude_retired = true;
+                match stored.write(&path) {
+                    Ok(()) => {
+                        outcome.events.push(stored.status);
+                    }
+                    Err(e) => outcome.problems.push(format!(
+                        "failed to retire superseded status record {}: {e}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+        Ok((true, outcome))
+    }
+
     pub fn end(&self, binding_id: &str) -> io::Result<()> {
         let _guard = self.lock()?;
+        self.remove_binding(binding_id)
+    }
+
+    fn remove_binding(&self, binding_id: &str) -> io::Result<()> {
         match fs::remove_file(self.binding_path(binding_id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -116,7 +218,7 @@ impl StatusStore {
                     continue;
                 }
             };
-            match serde_json::from_slice::<StatusEvent>(&bytes) {
+            match serde_json::from_slice::<StoredStatus>(&bytes) {
                 Ok(event) => snapshot.records.push((path, event)),
                 Err(e) => snapshot.problems.push(format!(
                     "failed to parse status record {}: {e}",
@@ -135,11 +237,15 @@ impl StatusStore {
                 snapshot.problems.join("; "),
             ));
         }
-        Ok(snapshot.records)
+        Ok(snapshot
+            .records
+            .into_iter()
+            .filter(|(_, stored)| !stored.claude_retired)
+            .map(|(path, stored)| (path, stored.status))
+            .collect())
     }
 
-    // Reads never delete: only ingest's sweep removes a dead binding, so it can
-    // always fan the synthetic running:false event out to sinks.
+    // Leave deletion to ingest so polling cannot swallow a sink's removal event.
     pub fn running<L: ProcessLiveness + ?Sized>(
         &self,
         liveness: &L,
@@ -169,7 +275,8 @@ impl StatusStore {
             events: Vec::new(),
             problems: snapshot.problems,
         };
-        for (path, mut event) in snapshot.records {
+        for (path, stored) in snapshot.records {
+            let mut event = stored.status;
             if is_dead(&event, liveness) {
                 match fs::remove_file(&path) {
                     Ok(()) => {}
@@ -182,8 +289,10 @@ impl StatusStore {
                         continue;
                     }
                 }
-                event.running = false;
-                outcome.events.push(event);
+                if !stored.claude_retired {
+                    event.running = false;
+                    outcome.events.push(event);
+                }
             }
         }
         Ok(outcome)
@@ -249,6 +358,8 @@ impl StatusStore {
         let sessions = snapshot
             .records
             .into_iter()
+            .filter(|(_, stored)| !stored.claude_retired)
+            .map(|(path, stored)| (path, stored.status))
             .filter(|(_, event)| is_live(event, liveness))
             .map(|(_, event)| event)
             .collect();
@@ -279,8 +390,7 @@ pub struct SessionsEnvelope {
     pub problems: Vec<HealthProblem>,
 }
 
-// A record without a process identity is unverifiable: neither live nor dead,
-// so no read reports it and no sweep removes it.
+// Unverifiable process identities qualify for neither live results nor dead-record cleanup.
 fn is_live(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> bool {
     event
         .process
@@ -372,13 +482,20 @@ pub fn handle_ingest(
     let store = ctx.store;
     let process = ctx.liveness.owner_of(hook_pid, agent);
     let mut normalized_event: Option<StatusEvent> = None;
+    let mut retired = SweepOutcome::default();
     let outcome =
         normalize(agent, event, input, env, process).and_then(|maybe_event| match maybe_event {
-            // An event carrying no agent session id reaches sinks (consumers key
-            // rows on terminal identity) but never the ledger: its binding would
-            // outlive every real session in the same still-running process.
+            // Empty IDs reach terminal-keyed sinks but cannot be paired with a conversation's end event.
             Some(status_event) if status_event.session.id.is_empty() => {
                 normalized_event = Some(status_event);
+                Ok(())
+            }
+            Some(status_event) if matches!(agent, Agent::Claude) => {
+                let forward;
+                (forward, retired) = store.ingest_claude(&status_event, input)?;
+                if forward {
+                    normalized_event = Some(status_event);
+                }
                 Ok(())
             }
             Some(status_event) if status_event.running => {
@@ -395,16 +512,17 @@ pub fn handle_ingest(
         });
 
     let mut problems: Vec<String> = outcome.err().map(|e| e.to_string()).into_iter().collect();
-    let swept = match store.sweep(ctx.liveness) {
+    problems.extend(retired.problems);
+    let mut swept = retired.events;
+    match store.sweep(ctx.liveness) {
         Ok(outcome) => {
             problems.extend(outcome.problems);
-            outcome.events
+            swept.extend(outcome.events);
         }
         Err(e) => {
             problems.push(format!("sweep failed: {e}"));
-            Vec::new()
         }
-    };
+    }
     for message in &problems {
         let _ = store.record_health(message);
     }

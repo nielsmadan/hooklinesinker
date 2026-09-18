@@ -75,7 +75,7 @@ pub struct SessionIdentity {
     pub transcript_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -83,7 +83,7 @@ pub struct ProcessIdentity {
     pub host: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalIdentity {
     pub session_id: Option<String>,
@@ -92,7 +92,7 @@ pub struct TerminalIdentity {
     pub kitty_pid: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TmuxIdentity {
     pub pane: Option<String>,

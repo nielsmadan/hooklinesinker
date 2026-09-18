@@ -1232,6 +1232,704 @@ fn ingest_fans_out_the_recorded_event_to_registered_status_sinks() {
 }
 
 #[test]
+fn claude_replacement_uses_tmux_pane_identity_when_session_names_change() {
+    let environment = |pane: &str, name: Option<&str>| {
+        let mut source = FakeEnvSource::new().with_var("TMUX_PANE", pane);
+        if let Some(name) = name {
+            source = source.with_command(
+                "tmux",
+                &["display-message", "-p", "-t", pane, "#{session_name}"],
+                name,
+            );
+        }
+        environment::gather_environment(&source, "/tmp/project".into())
+    };
+    for (old_name, new_name, new_pane) in [
+        (Some("work"), Some("project"), "%1"),
+        (Some("work"), None, "%1"),
+        (None, Some("work"), "%1"),
+        (Some("work"), Some("work"), "%2"),
+    ] {
+        let store = store();
+        let process = test_process();
+        let liveness = FakeProcessLookup::with_owner(process.clone());
+        liveness.set_alive(process.pid, &process.started_at);
+        let consumers = consumer_store();
+        consumers
+            .register(&consumer(
+                "monitor",
+                &["status"],
+                Some("http://127.0.0.1:7483/hook"),
+            ))
+            .unwrap();
+        let client = RecordingHttpClient::default();
+        let ctx = state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        };
+        for (event, input, env) in [
+            (
+                "PermissionRequest",
+                r#"{"session_id":"a"}"#,
+                environment("%1", old_name),
+            ),
+            (
+                "SessionStart",
+                r#"{"session_id":"b","source":"clear"}"#,
+                environment(new_pane, new_name),
+            ),
+        ] {
+            let outcome =
+                state::handle_ingest(&ctx, Agent::Claude, event, input, &env, process.pid);
+            assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+        }
+        let mut ids: Vec<_> = store
+            .running(&liveness)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session.id)
+            .collect();
+        ids.sort();
+        if new_pane == "%1" {
+            assert_eq!(ids, ["b"], "{old_name:?} -> {new_name:?}");
+            let before = client.bodies();
+            assert_eq!(before.len(), 3);
+            assert_eq!(before[2]["session"]["id"], "a");
+            assert_eq!(before[2]["running"], false);
+            let outcome = state::handle_ingest(
+                &ctx,
+                Agent::Claude,
+                "Stop",
+                r#"{"session_id":"a"}"#,
+                &environment("%1", new_name),
+                process.pid,
+            );
+            assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+            assert_eq!(client.bodies(), before);
+            let sessions = store.running(&liveness).unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].session.id, "b");
+        } else {
+            assert_eq!(ids, ["a", "b"]);
+            assert_eq!(client.bodies().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn claude_session_start_immediately_replaces_every_foreground_phase() {
+    for previous_event in [
+        "SessionStart",
+        "PreToolUse",
+        "PermissionRequest",
+        "Stop",
+        "PreCompact",
+    ] {
+        let store = store();
+        let process = test_process();
+        let liveness = FakeProcessLookup::with_owner(process.clone());
+        liveness.set_alive(process.pid, &process.started_at);
+        let consumers = consumer_store();
+        consumers
+            .register(&consumer(
+                "monitor",
+                &["status"],
+                Some("http://127.0.0.1:7483/hook"),
+            ))
+            .unwrap();
+        let client = RecordingHttpClient::default();
+        let ctx = state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        };
+        for (event, input) in [
+            (previous_event, r#"{"session_id":"a"}"#),
+            ("SessionStart", r#"{"session_id":"b","source":"clear"}"#),
+        ] {
+            let outcome = ingest(&ctx, Agent::Claude, event, input, process.pid);
+            assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+        }
+        let sessions = store.sessions_envelope(&liveness);
+        assert!(sessions.problems.is_empty());
+        assert_eq!(sessions.sessions.len(), 1, "{previous_event}");
+        assert_eq!(sessions.sessions[0].session.id, "b");
+        assert_eq!(sessions.sessions[0].event, "SessionStart");
+        assert_eq!(sessions.sessions[0].phase, Phase::Idle);
+        let removals: Vec<_> = client
+            .bodies()
+            .into_iter()
+            .filter(|body| body["running"] == false)
+            .collect();
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0]["session"]["id"], "a");
+    }
+}
+
+#[test]
+fn claude_activity_retires_an_abandoned_startup_in_the_same_process() {
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "monitor",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+
+    // Seed a pre-upgrade record, which has no private lifecycle metadata.
+    store
+        .record(&normalize_for_test(
+            Agent::Claude,
+            "SessionStart",
+            r#"{"session_id":"startup"}"#,
+        ))
+        .unwrap();
+    let outcome = ingest(
+        &ctx,
+        Agent::Claude,
+        "PermissionRequest",
+        r#"{"session_id":"conversation"}"#,
+        process.pid,
+    );
+    assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+
+    let sessions = StatusStore::open(&root)
+        .unwrap()
+        .sessions_envelope(&liveness);
+    assert!(sessions.problems.is_empty());
+    assert_eq!(sessions.sessions.len(), 1);
+    assert_eq!(sessions.sessions[0].session.id, "conversation");
+    assert_eq!(sessions.sessions[0].phase, Phase::Permission);
+
+    let bodies = client.bodies();
+    assert_eq!(bodies.len(), 2);
+    let removed = bodies
+        .iter()
+        .find(|body| body["session"]["id"] == "startup")
+        .unwrap();
+    assert_eq!(removed["running"], false);
+    let current = bodies
+        .iter()
+        .find(|body| body["session"]["id"] == "conversation")
+        .unwrap();
+    assert_eq!(current["running"], true);
+    assert_eq!(current["phase"], "permission");
+
+    ingest(
+        &ctx,
+        Agent::Claude,
+        "SessionEnd",
+        r#"{"session_id":"startup"}"#,
+        process.pid,
+    );
+    assert_eq!(
+        store.running(&liveness).unwrap()[0].session.id,
+        "conversation"
+    );
+}
+
+#[test]
+fn claude_parallel_conversations_preserve_foreground_startups() {
+    for parallel_input in [
+        r#"{"session_id":"parallel","source":"fork"}"#,
+        r#"{"session_id":"parallel","agent_id":"worker"}"#,
+    ] {
+        let root = temp_home();
+        let store = StatusStore::open(&root).unwrap();
+        let process = test_process();
+        let liveness = FakeProcessLookup::with_owner(process.clone());
+        liveness.set_alive(process.pid, &process.started_at);
+        let client = RecordingHttpClient::default();
+        let ctx = state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: None,
+            http_client: &client,
+        };
+        for input in [
+            r#"{"session_id":"foreground","source":"startup"}"#,
+            parallel_input,
+        ] {
+            let outcome = ingest(&ctx, Agent::Claude, "SessionStart", input, process.pid);
+            assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+        }
+
+        let reopened = StatusStore::open(&root).unwrap();
+        let ctx = state::IngestContext {
+            store: &reopened,
+            ..ctx
+        };
+        let outcome = ingest(
+            &ctx,
+            Agent::Claude,
+            "PermissionRequest",
+            r#"{"session_id":"parallel"}"#,
+            process.pid,
+        );
+        assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+        let sessions = reopened.running(&liveness).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.session.id == "foreground")
+                .unwrap()
+                .event,
+            "SessionStart"
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.session.id == "parallel")
+                .unwrap()
+                .phase,
+            Phase::Permission
+        );
+    }
+}
+
+#[test]
+fn claude_foreground_activity_preserves_fork_startups() {
+    let store = store();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let client = RecordingHttpClient::default();
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: None,
+        http_client: &client,
+    };
+    for (event, input) in [
+        ("SessionStart", r#"{"session_id":"fork","source":"fork"}"#),
+        (
+            "SessionStart",
+            r#"{"session_id":"abandoned","source":"startup"}"#,
+        ),
+        ("PermissionRequest", r#"{"session_id":"foreground"}"#),
+    ] {
+        let outcome = ingest(&ctx, Agent::Claude, event, input, process.pid);
+        assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+    }
+    let mut ids: Vec<_> = store
+        .running(&liveness)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.session.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["foreground", "fork"]);
+}
+
+#[test]
+fn claude_replacement_preserves_other_bindings() {
+    struct OwnerAlive(ProcessIdentity);
+    impl ProcessLookup for OwnerAlive {
+        fn owner_of(&self, _: u32, _: Agent) -> Option<ProcessIdentity> {
+            Some(self.0.clone())
+        }
+        fn is_alive(&self, _: &ProcessIdentity) -> bool {
+            true
+        }
+    }
+
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    let process = test_process();
+    let base = normalize_for_test(
+        Agent::Claude,
+        "SessionStart",
+        r#"{"session_id":"original"}"#,
+    );
+    let mut expected = Vec::new();
+    for case in [
+        "pid",
+        "start",
+        "host",
+        "agent",
+        "terminal",
+        "tmux",
+        "remote",
+        "unverifiable",
+    ] {
+        let mut other = base.clone();
+        other.binding_id = case.into();
+        other.session.id = case.into();
+        match case {
+            "pid" => other.process.as_mut().unwrap().pid += 1,
+            "start" => other.process.as_mut().unwrap().started_at = "2026-09-03T00:00:00Z".into(),
+            "host" => other.process.as_mut().unwrap().host = "another-host".into(),
+            "agent" => other.agent = Agent::Codex,
+            "terminal" => {
+                other.terminal = Some(hooklinesinker::protocol::TerminalIdentity {
+                    session_id: Some("another-terminal".into()),
+                    terminal_type: Some("iterm2".into()),
+                    kitty_listen_on: None,
+                    kitty_pid: None,
+                });
+            }
+            "tmux" => {
+                other.tmux = Some(hooklinesinker::protocol::TmuxIdentity {
+                    pane: Some("%2".into()),
+                    session_name: Some("work".into()),
+                });
+            }
+            "remote" => other.remote_host = Some("remote-host".into()),
+            "unverifiable" => other.process = None,
+            _ => unreachable!(),
+        }
+        expected.push(case.to_string());
+        store.record(&other).unwrap();
+    }
+    let liveness = OwnerAlive(process.clone());
+    let client = RecordingHttpClient::default();
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: None,
+            http_client: &client,
+        },
+        Agent::Claude,
+        "PermissionRequest",
+        r#"{"session_id":"current"}"#,
+        process.pid,
+    );
+    assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+    expected.retain(|id| id != "unverifiable");
+    expected.push("current".into());
+    expected.sort();
+    let mut actual: Vec<_> = store
+        .running(&liveness)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.session.id)
+        .collect();
+    actual.sort();
+    assert_eq!(actual, expected);
+    assert!(root.join("status/unverifiable.json").is_file());
+}
+
+#[test]
+fn claude_replacement_requires_identified_foreground_activity() {
+    for (agent, event, input, identified) in [
+        (
+            Agent::Claude,
+            "PermissionRequest",
+            r#"{"session_id":""}"#,
+            true,
+        ),
+        (Agent::Claude, "SessionEnd", r#"{"session_id":"new"}"#, true),
+        (
+            Agent::Codex,
+            "PermissionRequest",
+            r#"{"session_id":"new"}"#,
+            true,
+        ),
+        (
+            Agent::Claude,
+            "PermissionRequest",
+            r#"{"session_id":"new","agent_id":"worker"}"#,
+            true,
+        ),
+        (
+            Agent::Claude,
+            "PermissionRequest",
+            r#"{"session_id":"new"}"#,
+            false,
+        ),
+    ] {
+        let root = temp_home();
+        let store = StatusStore::open(&root).unwrap();
+        let startup =
+            normalize_for_test(Agent::Claude, "SessionStart", r#"{"session_id":"startup"}"#);
+        store.record(&startup).unwrap();
+        let process = test_process();
+        let liveness = if identified {
+            FakeProcessLookup::with_owner(process.clone())
+        } else {
+            FakeProcessLookup::new()
+        };
+        liveness.set_alive(process.pid, &process.started_at);
+        let client = RecordingHttpClient::default();
+        let outcome = ingest(
+            &state::IngestContext {
+                store: &store,
+                liveness: &liveness,
+                consumers: None,
+                http_client: &client,
+            },
+            agent,
+            event,
+            input,
+            process.pid,
+        );
+        assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+        let preserved: StatusEvent = serde_json::from_slice(
+            &std::fs::read(
+                root.join("status")
+                    .join(format!("{}.json", startup.binding_id)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(preserved.session.id, "startup");
+        assert_eq!(preserved.event, "SessionStart");
+        assert!(preserved.running);
+    }
+}
+
+#[test]
+fn retired_claude_hooks_neither_resurrect_the_session_nor_reach_sinks() {
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "monitor",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    for (event, input) in [
+        ("PreToolUse", r#"{"session_id":"a"}"#),
+        ("SessionStart", r#"{"session_id":"b","source":"clear"}"#),
+        ("PermissionRequest", r#"{"session_id":"b"}"#),
+    ] {
+        assert!(
+            ingest(&ctx, Agent::Claude, event, input, process.pid)
+                .problem
+                .is_none()
+        );
+    }
+    let reopened = StatusStore::open(&root).unwrap();
+    let ctx = state::IngestContext {
+        store: &reopened,
+        ..ctx
+    };
+    let before = client.bodies();
+    for (event, input) in [
+        ("SessionEnd", r#"{"session_id":"a"}"#),
+        ("SessionStart", r#"{"session_id":"a","source":"startup"}"#),
+        ("SessionStart", r#"{"session_id":"a","source":"clear"}"#),
+        ("SessionStart", r#"{"session_id":"a","source":"compact"}"#),
+        ("PreToolUse", r#"{"session_id":"a"}"#),
+        (
+            "PermissionRequest",
+            r#"{"session_id":"a","agent_id":"worker"}"#,
+        ),
+        ("Stop", r#"{"session_id":"a"}"#),
+    ] {
+        assert!(
+            ingest(&ctx, Agent::Claude, event, input, process.pid)
+                .problem
+                .is_none()
+        );
+    }
+    assert_eq!(client.bodies(), before);
+    let sessions = reopened.sessions_envelope(&liveness);
+    assert!(sessions.problems.is_empty());
+    assert_eq!(sessions.sessions.len(), 1);
+    assert_eq!(sessions.sessions[0].session.id, "b");
+    assert_eq!(sessions.sessions[0].phase, Phase::Permission);
+}
+
+#[test]
+fn claude_can_explicitly_resume_a_retired_or_forked_conversation() {
+    for source in ["startup", "fork"] {
+        let store = store();
+        let process = test_process();
+        let liveness = FakeProcessLookup::with_owner(process.clone());
+        liveness.set_alive(process.pid, &process.started_at);
+        let client = RecordingHttpClient::default();
+        let ctx = state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: None,
+            http_client: &client,
+        };
+        let initial = serde_json::json!({"session_id": "a", "source": source}).to_string();
+        for (event, input) in [
+            ("SessionStart", initial.as_str()),
+            ("SessionStart", r#"{"session_id":"b","source":"clear"}"#),
+            ("SessionStart", r#"{"session_id":"a","source":"resume"}"#),
+            ("PermissionRequest", r#"{"session_id":"a"}"#),
+            ("Stop", r#"{"session_id":"b"}"#),
+        ] {
+            assert!(
+                ingest(&ctx, Agent::Claude, event, input, process.pid)
+                    .problem
+                    .is_none()
+            );
+        }
+        let sessions = store.running(&liveness).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session.id, "a");
+        assert_eq!(sessions[0].phase, Phase::Permission);
+    }
+}
+
+#[test]
+fn claude_end_retains_a_guard_until_process_exit_without_duplicate_removals() {
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "monitor",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let client = RecordingHttpClient::default();
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    for event in ["SessionStart", "SessionEnd"] {
+        assert!(
+            ingest(
+                &ctx,
+                Agent::Claude,
+                event,
+                r#"{"session_id":"a"}"#,
+                process.pid
+            )
+            .problem
+            .is_none()
+        );
+    }
+    let before = client.bodies();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[1]["event"], "SessionEnd");
+    assert_eq!(before[1]["running"], false);
+    assert!(store.running(&liveness).unwrap().is_empty());
+    assert!(
+        ingest(
+            &ctx,
+            Agent::Claude,
+            "Stop",
+            r#"{"session_id":"a"}"#,
+            process.pid
+        )
+        .problem
+        .is_none()
+    );
+    assert_eq!(client.bodies(), before);
+    assert_eq!(ledger_files(&root), 1);
+    liveness.set_dead(process.pid);
+    assert_eq!(store.dead_records(&liveness).unwrap(), 0);
+    assert_eq!(ledger_files(&root), 1);
+    assert!(
+        ingest(&ctx, Agent::Claude, "Unknown", "{}", process.pid)
+            .problem
+            .is_none()
+    );
+    assert_eq!(client.bodies(), before);
+    assert_eq!(ledger_files(&root), 0);
+}
+
+#[test]
+fn claude_subagent_hooks_do_not_change_the_parent_binding_to_parallel() {
+    let store = store();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let client = RecordingHttpClient::default();
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: None,
+        http_client: &client,
+    };
+    for (event, input) in [
+        ("SessionStart", r#"{"session_id":"a","source":"startup"}"#),
+        ("PreToolUse", r#"{"session_id":"a","agent_id":"worker"}"#),
+        ("SessionStart", r#"{"session_id":"b","source":"clear"}"#),
+    ] {
+        assert!(
+            ingest(&ctx, Agent::Claude, event, input, process.pid)
+                .problem
+                .is_none()
+        );
+    }
+    let sessions = store.running(&liveness).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session.id, "b");
+}
+
+#[test]
+fn failed_claude_status_write_preserves_the_startup() {
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    let startup = normalize_for_test(Agent::Claude, "SessionStart", r#"{"session_id":"startup"}"#);
+    let current = normalize_for_test(
+        Agent::Claude,
+        "PermissionRequest",
+        r#"{"session_id":"current"}"#,
+    );
+    store.record(&startup).unwrap();
+    std::fs::create_dir(
+        root.join("status")
+            .join(format!("{}.json", current.binding_id)),
+    )
+    .unwrap();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let client = RecordingHttpClient::default();
+    let outcome = ingest(
+        &state::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: None,
+            http_client: &client,
+        },
+        Agent::Claude,
+        "PermissionRequest",
+        r#"{"session_id":"current"}"#,
+        process.pid,
+    );
+    assert!(outcome.problem.is_some());
+    let sessions = store.sessions_envelope(&liveness);
+    assert_eq!(sessions.sessions.len(), 1);
+    assert_eq!(sessions.sessions[0].session.id, "startup");
+    assert!(sessions.sessions[0].running);
+}
+
+#[test]
 fn a_dead_binding_swept_during_an_unrelated_ingest_produces_a_running_false_post() {
     let store = store();
     let consumers = consumer_store();
@@ -1521,11 +2219,7 @@ fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
     );
 }
 
-// The OpenCode and Pi TypeScript adapters (adapters/opencode-hooklinesinker.ts,
-// adapters/pi-hooklinesinker.ts) pipe a bare `{"session_id": ..., "cwd": ...}`
-// object to `ingest` on stdin — never terminal/tmux/git/remote fields, which
-// normalize.rs sources from the hook environment instead. These tests pin
-// that exact stdin contract against normalize()'s NativeEvent expectations.
+// Adapter stdin excludes navigation metadata; normalization must gather it from the hook environment.
 
 #[test]
 fn opencode_adapter_stdin_shape_normalizes_with_its_explicit_cwd() {
@@ -1620,8 +2314,6 @@ fn two_consumers_share_one_activation_and_both_still_receive_sink_fanout() {
         ))
         .unwrap();
 
-    // A second, unrelated consumer registering afterward must not reactivate
-    // the same version, and both consumers must remain registered together.
     let installed_again = install
         .install_candidate(&Candidate {
             version: SemVer::parse("0.1.0").unwrap(),

@@ -117,6 +117,11 @@ filtered out of both, and removed by the next `ingest`, which fans out one `runn
 event as it goes, so a poll landing between the kill and the next hook event cannot swallow
 that notification.
 
+Ingest also retires the previous Claude foreground binding as soon as its replacement
+appears in the same process and terminal, regardless of its previous phase. Retired
+bindings ignore late hooks and can be explicitly resumed. The
+[status lifecycle](docs/status-lifecycle.md) documents identity checks and fork handling.
+
 `problems` is never dropped on the floor: a consumer that cannot answer must say so rather than
 report an empty, healthy-looking result.
 
