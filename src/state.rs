@@ -1,4 +1,5 @@
 use crate::consumers::ConsumerStore;
+use crate::lifecycle::SessionContext;
 use crate::normalize::{HookEnvironment, normalize};
 use crate::processes::{
     ProcessLiveness, ProcessLookup, epoch_now, now_rfc3339, parse_epoch_seconds,
@@ -37,27 +38,26 @@ struct StatusSnapshot {
 struct StoredStatus {
     #[serde(flatten)]
     status: StatusEvent,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    claude_parallel: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    claude_retired: bool,
-}
-
-#[derive(Deserialize)]
-struct ClaudeContext {
-    source: Option<String>,
-    agent_id: Option<String>,
-}
-
-impl ClaudeContext {
-    fn is_resume(&self, event: &str) -> bool {
-        self.agent_id.is_none()
-            && event == "SessionStart"
-            && self.source.as_deref() == Some("resume")
-    }
+    #[serde(
+        default,
+        alias = "claudeParallel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    parallel: Option<bool>,
+    #[serde(
+        default,
+        alias = "claudeRetired",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    retired: bool,
 }
 
 impl StoredStatus {
+    fn is_parallel(&self) -> bool {
+        self.parallel
+            .unwrap_or(self.status.agent == Agent::Opencode)
+    }
+
     fn write(&self, path: &Path) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -106,34 +106,42 @@ impl StatusStore {
         write_private_atomic(&path, &bytes)
     }
 
-    fn ingest_claude(&self, event: &StatusEvent, input: &str) -> io::Result<(bool, SweepOutcome)> {
+    fn ingest_session(
+        &self,
+        event: &mut StatusEvent,
+        context: SessionContext,
+    ) -> io::Result<(bool, SweepOutcome)> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
         let mut outcome = SweepOutcome {
             events: Vec::new(),
             problems: snapshot.problems,
         };
-        let Ok(context) = serde_json::from_str::<ClaudeContext>(input) else {
-            outcome
-                .problems
-                .push("invalid Claude lifecycle metadata".into());
-            return Ok((false, outcome));
-        };
         let previous = snapshot.records.iter().find_map(|(_, stored)| {
             (stored.status.binding_id == event.binding_id).then_some(stored)
         });
-        let resume = context.is_resume(&event.event);
-        if previous.is_some_and(|stored| stored.claude_retired) && !resume {
+        let resume = matches!(
+            context,
+            SessionContext::Selected | SessionContext::SelectedParallel
+        );
+        if previous.is_some_and(|stored| stored.retired) && !resume {
             return Ok((false, outcome));
         }
-        let parallel = !resume
-            && (previous.is_some_and(|stored| stored.claude_parallel)
-                || (previous.is_none() && context.agent_id.is_some())
-                || (event.event == "SessionStart" && context.source.as_deref() == Some("fork")));
+        let parallel = matches!(context, SessionContext::SelectedParallel)
+            || !resume
+                && (previous.is_some_and(StoredStatus::is_parallel)
+                    || (previous.is_none() && matches!(context, SessionContext::Background))
+                    || matches!(context, SessionContext::Parallel));
+        if resume
+            && event.agent == Agent::Opencode
+            && let Some(previous) = previous
+        {
+            event.phase = previous.status.phase;
+        }
         let stored = StoredStatus {
             status: event.clone(),
-            claude_parallel: parallel,
-            claude_retired: !event.running && event.process.is_some(),
+            parallel: Some(parallel),
+            retired: !event.running && event.process.is_some(),
         };
         if !event.running && event.process.is_none() {
             self.remove_binding(&event.binding_id)?;
@@ -141,14 +149,18 @@ impl StatusStore {
             stored.write(&self.binding_path(&event.binding_id))?;
         }
 
-        if parallel || context.agent_id.is_some() || !event.running || event.process.is_none() {
+        if parallel
+            || matches!(context, SessionContext::Background)
+            || !event.running
+            || event.process.is_none()
+        {
             return Ok((true, outcome));
         }
         for (path, mut stored) in snapshot.records {
             let previous = &stored.status;
-            if !stored.claude_parallel
-                && !stored.claude_retired
-                && matches!(previous.agent, Agent::Claude)
+            if !stored.is_parallel()
+                && !stored.retired
+                && previous.agent == event.agent
                 && previous.session.id != event.session.id
                 && previous.process == event.process
                 && previous.terminal == event.terminal
@@ -157,7 +169,7 @@ impl StatusStore {
                 && previous.remote_host == event.remote_host
             {
                 stored.status.running = false;
-                stored.claude_retired = true;
+                stored.retired = true;
                 match stored.write(&path) {
                     Ok(()) => {
                         outcome.events.push(stored.status);
@@ -240,7 +252,7 @@ impl StatusStore {
         Ok(snapshot
             .records
             .into_iter()
-            .filter(|(_, stored)| !stored.claude_retired)
+            .filter(|(_, stored)| !stored.retired)
             .map(|(path, stored)| (path, stored.status))
             .collect())
     }
@@ -289,7 +301,7 @@ impl StatusStore {
                         continue;
                     }
                 }
-                if !stored.claude_retired {
+                if !stored.retired {
                     event.running = false;
                     outcome.events.push(event);
                 }
@@ -358,7 +370,7 @@ impl StatusStore {
         let sessions = snapshot
             .records
             .into_iter()
-            .filter(|(_, stored)| !stored.claude_retired)
+            .filter(|(_, stored)| !stored.retired)
             .map(|(path, stored)| (path, stored.status))
             .filter(|(_, event)| is_live(event, liveness))
             .map(|(_, event)| event)
@@ -490,22 +502,20 @@ pub fn handle_ingest(
                 normalized_event = Some(status_event);
                 Ok(())
             }
-            Some(status_event) if matches!(agent, Agent::Claude) => {
+            Some(mut status_event) => {
+                let mut context = SessionContext::parse(agent, event, input)?;
+                if status_event
+                    .process
+                    .as_ref()
+                    .is_some_and(|process| !ctx.liveness.has_exclusive_session(process, agent))
+                {
+                    context = context.in_shared_process();
+                }
                 let forward;
-                (forward, retired) = store.ingest_claude(&status_event, input)?;
+                (forward, retired) = store.ingest_session(&mut status_event, context)?;
                 if forward {
                     normalized_event = Some(status_event);
                 }
-                Ok(())
-            }
-            Some(status_event) if status_event.running => {
-                store.record(&status_event)?;
-                normalized_event = Some(status_event);
-                Ok(())
-            }
-            Some(status_event) => {
-                store.end(&status_event.binding_id)?;
-                normalized_event = Some(status_event);
                 Ok(())
             }
             None => Ok(()),

@@ -53,9 +53,11 @@ fn map_event(
             _ => Ignore,
         },
         Agent::Opencode => match event {
-            "session.created" | "session.status.idle" | "session.idle" | "session.error" => {
-                Update(Phase::Idle)
-            }
+            "session.created"
+            | "session.status.idle"
+            | "session.idle"
+            | "session.error"
+            | "tui.session.select" => Update(Phase::Idle),
             "session.status.busy" | "session.status.retry" => Update(Phase::Working),
             "permission.asked" => Update(Phase::Permission),
             "session.compacted" => Update(Phase::Compacting),

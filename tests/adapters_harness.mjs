@@ -99,12 +99,26 @@ async function runPi(scenario, adapterPath, invocations) {
   module.default(pi);
 
   const ctx = { hasUI: true, sessionManager: { getSessionId: () => "pi-parent" } };
-  const start = (c = ctx) => lifecycle.get("session_start")({}, c);
+  const start = (c = ctx, reason = "startup") => lifecycle.get("session_start")({ reason }, c);
   const shutdown = (reason, c = ctx) => lifecycle.get("session_shutdown")({ reason }, c);
   const prompt = (requestId) => events.get("permissions:ui_prompt")({ requestId });
   const decide = (resolution) => events.get("permissions:decision")({ resolution });
 
   switch (scenario) {
+    case "pi:session_switches":
+      await start();
+      for (const reason of ["new", "resume", "fork", "reload"]) {
+        const next = { hasUI: true, sessionManager: { getSessionId: () => `pi-${reason}` } };
+        await shutdown(reason);
+        await start(next, reason);
+        await lifecycle.get("agent_start")({}, next);
+      }
+      break;
+
+    case "pi:start_without_reason":
+      await lifecycle.get("session_start")({}, ctx);
+      break;
+
     case "pi:permission_lifecycle":
       await start();
       prompt("prompt-1");
@@ -189,6 +203,15 @@ async function runOpenCode(scenario, adapterPath) {
   });
 
   switch (scenario) {
+    case "opencode:selection_and_status_are_serialized":
+      await Promise.all([
+        plugin.event({ event: { type: "tui.session.select", properties: { sessionID: "a" } } }),
+        plugin.event({ event: { type: "session.status", properties: { sessionID: "a", status: { type: "busy" } } } }),
+        plugin.event({ event: { type: "tui.session.select", properties: { sessionID: "b" } } }),
+        plugin.event({ event: { type: "session.deleted", properties: { info: { id: "a" } } } }),
+      ]);
+      break;
+
     case "opencode:load_posts_created":
     case "opencode:hanging_binary:hang":
       break;
@@ -247,6 +270,8 @@ async function runOpenCode(scenario, adapterPath) {
 }
 
 const SCENARIOS = [
+  [PI_ADAPTER, "pi:session_switches"],
+  [PI_ADAPTER, "pi:start_without_reason"],
   [PI_ADAPTER, "pi:permission_lifecycle"],
   [PI_ADAPTER, "pi:malformed_permission_payloads"],
   [PI_ADAPTER, "pi:silent_and_orphan_decisions"],
@@ -259,6 +284,7 @@ const SCENARIOS = [
   [PI_ADAPTER, "pi:shutdown_fork"],
   [PI_ADAPTER, "pi:hanging_binary:hang"],
   [OPENCODE_ADAPTER, "opencode:load_posts_created"],
+  [OPENCODE_ADAPTER, "opencode:selection_and_status_are_serialized"],
   [OPENCODE_ADAPTER, "opencode:status_becomes_event_suffix"],
   [OPENCODE_ADAPTER, "opencode:status_without_type_is_dropped"],
   [OPENCODE_ADAPTER, "opencode:untracked_event_is_dropped"],

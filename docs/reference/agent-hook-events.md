@@ -7,6 +7,8 @@ lifecycle changes.
 - [Question and permission lifecycle](#question-and-permission-lifecycle)
 - [Observed Droid timelines](#observed-droid-timelines)
 - [Cross-agent lifecycle comparison](#cross-agent-lifecycle-comparison)
+- [Session identity, subagents, and shared processes](#session-identity-subagents-and-shared-processes)
+- [OpenCode selection is navigation](#opencode-selection-is-navigation)
 - [Interpreting tool events](#interpreting-tool-events)
 - [How this affects hooklinesinker](#how-this-affects-hooklinesinker)
 - [Sources](#sources)
@@ -125,6 +127,52 @@ Codex's `request_user_input` is a tool name, not an event name. Pi's permission
 events are synthesized from the optional `@gotgenes/pi-permission-system` event
 bus rather than Pi core. OpenCode supplies authoritative session statuses
 instead of before- and after-tool transitions.
+
+## Session identity, subagents, and shared processes
+
+A session ID identifies a conversation, not an operating-system process. One
+process can host several conversations, including children. The process launched
+for a command hook is also distinct from the agent process that owns the session.
+A different session ID with the same owner PID therefore does not, by itself,
+prove that the previous conversation was replaced.
+
+Evidence below was inspected on **2026-09-18**. **Documented** means the upstream
+contract describes it; **source-inspected** means the linked implementation shows
+it. These findings are not end-to-end verification of installed agent versions.
+
+| Agent | Session and child identity | Evidence and limits |
+|---|---|---|
+| Claude Code | Documented subagent examples use the parent `session_id` with a separate child `agent_id`; tool hooks inside children carry `agent_id` and `agent_type`. | **Documented:** [hook inputs and subagent events](https://code.claude.com/docs/en/hooks). In-process teammates also exist; do not assume every child has a separate PID. |
+| Codex | A child has its own thread/session ID. Tool hook inputs carry the subagent's `agent_id` and `agent_type`; children can share a host process. | **Source-inspected:** [hook runtime](https://github.com/openai/codex/blob/main/codex-rs/core/src/hook_runtime.rs) and [PreToolUse payload](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/events/pre_tool_use.rs). Thread-spawn children use subagent lifecycle events, distinct from root session starts. |
+| OpenCode | Child sessions have their own IDs and a `parentID`. One backend can host multiple root and child sessions. | **Source-inspected:** [task session creation](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/opencode/src/tool/task.ts) and [backend plugin event subscription](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/opencode/src/plugin/index.ts). A root session is not necessarily the currently viewed session. |
+| Pi | SDK extensions can create child sessions with distinct IDs inside the parent process. Headless extension contexts expose `hasUI: false`. | **Source-inspected:** [pi-subagents session construction](https://github.com/gotgenes/pi-packages/blob/9bfe0369940766f4571f7c46fd1ab74ecb330166/packages/pi-subagents/src/lifecycle/create-subagent-session.ts) and [Pi extension context](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts). `hasUI` also includes RPC contexts; it does not establish exclusive ownership of a terminal. Custom extensions may behave differently. |
+| Qwen Code | The inspected native subagent path shares the parent hook system; base hook input gets `session_id` from its configuration. It also exposes optional `source_type` and `source_id` attribution. | **Source-inspected:** [subagent manager](https://github.com/QwenLM/qwen-code/blob/be9d5e8d3f1470d80ec36546788c801225d66e3e/packages/core/src/subagents/subagent-manager.ts) and [hook input construction](https://github.com/QwenLM/qwen-code/blob/be9d5e8d3f1470d80ec36546788c801225d66e3e/packages/core/src/hooks/hookEventHandler.ts). This path does not establish that every ACP or custom integration uses the same identity model. |
+| Kimi Code CLI | In the inspected Python implementation, a child runtime reuses the parent session and does not inherit its hook engine. | **Source-inspected:** [runtime copy for subagents](https://github.com/MoonshotAI/kimi-cli/blob/main/src/kimi_cli/soul/agent.py). Scope this finding to that implementation; it is not a guarantee for other Kimi clients or shared server modes. |
+| Factory Droid | The hook contract exposes `session_id`, and subagents can run concurrently. A reliable hook-level child discriminator or guaranteed separate owner process has not been established. | **Documented, with unresolved identity behavior:** [hooks](https://docs.factory.ai/harness/hooks.md) and [subagents](https://docs.factory.ai/harness/subagents.md). Do not infer process separation from the existence of a task ID. |
+
+Preserving a marked child prevents it from replacing another conversation. It
+does not automatically isolate phase updates when parent and child hooks share
+one session ID. Session retirement and aggregation of child activity are separate
+integration decisions.
+
+## OpenCode selection is navigation
+
+**Source-inspected at `65c35977bd564e23c0e9cf124b3e3e3b9308e9e8`, 2026-09-18.**
+The [`tui.session.select` handler](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/tui/src/app.tsx)
+calls `route.navigate`. The [route implementation](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/tui/src/context/route.tsx)
+updates local UI state; selection does not end the previous session. The ordinary
+[session picker](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/tui/src/component/dialog-session-list.tsx)
+also calls `route.navigate` directly, without publishing `tui.session.select`.
+
+Consequently, a backend plugin cannot use that event as either an exhaustive
+foreground-selection feed or evidence that the previous session ended. Selecting
+A, then B, is compatible with A continuing to work or request permission. Returning
+to A through the picker need not produce a backend selection event.
+
+Tracking live conversations requires preserving independent session identities.
+Tracking which conversation a particular TUI is displaying additionally requires
+a TUI integration with client/terminal attribution. Even complete navigation
+tracking would not make it safe to retire another live conversation.
 
 ## Interpreting tool events
 

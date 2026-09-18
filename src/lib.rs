@@ -3,6 +3,7 @@ pub mod environment;
 mod events;
 pub mod hooks;
 pub mod install;
+mod lifecycle;
 pub mod normalize;
 pub mod paths;
 pub mod processes;

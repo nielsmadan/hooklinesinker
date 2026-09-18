@@ -11,6 +11,7 @@ const TRACKED_EVENTS = new Set([
   "session.idle",
   "permission.asked",
   "server.instance.disposed",
+  "tui.session.select",
 ]);
 
 const HOOK_TIMEOUT_MS = 2000;
@@ -67,9 +68,14 @@ export const HooklinesinkerPlugin = async ({
 }: {
   directory: string;
 }) => {
-  // Post session.created on plugin load so status is seen immediately, even
-  // when OpenCode resumes a previous session (which skips session.created).
-  await runHook("session.created", undefined, directory);
+  let hookQueue: Promise<void> = Promise.resolve();
+  function queueHook(event: string, sessionId?: string): Promise<void> {
+    hookQueue = hookQueue.then(() => runHook(event, sessionId, directory));
+    return hookQueue;
+  }
+
+  // Resuming a session can skip the native session.created event.
+  await queueHook("session.created");
 
   return {
     event: async ({
@@ -92,7 +98,7 @@ export const HooklinesinkerPlugin = async ({
         eventName = `session.status.${status}`;
       }
 
-      await runHook(eventName, sessionId, directory);
+      await queueHook(eventName, sessionId);
     },
   };
 };

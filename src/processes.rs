@@ -13,6 +13,9 @@ pub trait ProcessOwnerResolver {
 pub trait ProcessLookup {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
     fn is_alive(&self, identity: &ProcessIdentity) -> bool;
+    fn has_exclusive_session(&self, _identity: &ProcessIdentity, _agent: Agent) -> bool {
+        true
+    }
 }
 
 impl<T: ProcessLookup + ?Sized> ProcessOwnerResolver for T {
@@ -127,11 +130,7 @@ impl SystemProcessLookup {
         Self { system }
     }
 
-    // Kimi's own CLI renames its process via `process.title = "kimi-code"` at
-    // startup (confirmed from the shipped @moonshot-ai/kimi-code bundle), but
-    // that rename reaching sysinfo's name()/cmd() has not been verified
-    // against a live process on either documented install path (npm shim,
-    // curl-installed native binary — both named "kimi"), so accept both.
+    // Accept Kimi's launcher name and its self-assigned process title.
     const fn expected_executables(agent: Agent) -> &'static [&'static str] {
         match agent {
             Agent::Claude => &["claude"],
@@ -145,19 +144,12 @@ impl SystemProcessLookup {
     }
 }
 
-// Some agent CLIs are `#!/usr/bin/env node` shims (confirmed for Qwen's shipped
-// @qwen-code/qwen-code bundle, which never renames its process on non-Windows
-// platforms): the OS-visible process name is the interpreter's, not the agent's
-// own command name. npm's bin-shimming still invokes
-// the interpreter with the original command-named script path in argv, so fall
-// back to matching that path's file name when the direct name check misses and
-// the process is a known script runtime.
+// Script-backed CLIs may retain the interpreter's process name.
 fn is_script_runtime(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "node" | "bun" | "deno")
 }
 
-// On Linux the reported process name is the main thread's (/proc/<pid>/comm), and
-// node >= 24 names that thread "MainThread"; argv[0] still carries the interpreter's path.
+// Linux may report Node's thread name; argv[0] still identifies the interpreter.
 fn runs_a_script_runtime(name: &str, cmd: &[std::ffi::OsString]) -> bool {
     if is_script_runtime(name) {
         return true;
@@ -184,6 +176,24 @@ fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &[&str]) 
     })
 }
 
+fn is_shared_session_host(agent: Agent, cmd: &[std::ffi::OsString]) -> bool {
+    let markers: &[&str] = match agent {
+        Agent::Codex => &["app-server", "mcp-server"],
+        Agent::Qwen => &["--acp", "--experimental-acp", "serve"],
+        Agent::Kimi => &["acp", "--acp", "web", "--wire"],
+        Agent::Claude | Agent::Opencode | Agent::Pi | Agent::Droid => &[],
+    };
+    cmd.iter().skip(1).any(|arg| {
+        let arg = arg.to_string_lossy();
+        markers.iter().any(|marker| {
+            arg == *marker
+                || arg
+                    .strip_prefix(marker)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    })
+}
+
 impl Default for SystemProcessLookup {
     fn default() -> Self {
         Self::new()
@@ -191,6 +201,15 @@ impl Default for SystemProcessLookup {
 }
 
 impl ProcessLookup for SystemProcessLookup {
+    fn has_exclusive_session(&self, identity: &ProcessIdentity, agent: Agent) -> bool {
+        self.system
+            .process(Pid::from_u32(identity.pid))
+            .is_some_and(|process| {
+                format_epoch_seconds(process.start_time()) == identity.started_at
+                    && !is_shared_session_host(agent, process.cmd())
+            })
+    }
+
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity> {
         let expected = Self::expected_executables(agent);
         let mut current = Some(Pid::from(hook_pid as usize));
@@ -229,6 +248,38 @@ impl ProcessLookup for SystemProcessLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_launch_modes_are_shared_session_hosts() {
+        for (agent, args) in [
+            (Agent::Codex, vec!["codex", "app-server", "daemon"]),
+            (Agent::Codex, vec!["codex", "mcp-server"]),
+            (Agent::Qwen, vec!["node", "/bin/qwen", "--acp"]),
+            (Agent::Qwen, vec!["qwen", "--experimental-acp"]),
+            (Agent::Qwen, vec!["qwen", "--acp=true"]),
+            (Agent::Qwen, vec!["qwen", "serve"]),
+            (Agent::Kimi, vec!["kimi", "acp"]),
+            (Agent::Kimi, vec!["kimi", "--acp"]),
+            (Agent::Kimi, vec!["kimi", "web"]),
+            (Agent::Kimi, vec!["kimi", "--wire"]),
+        ] {
+            let args: Vec<_> = args.into_iter().map(std::ffi::OsString::from).collect();
+            assert!(is_shared_session_host(agent, &args), "{agent:?} {args:?}");
+        }
+    }
+
+    #[test]
+    fn interactive_launch_modes_allow_foreground_replacement() {
+        for (agent, args) in [
+            (Agent::Codex, vec!["codex", "resume"]),
+            (Agent::Codex, vec!["codex", "fork"]),
+            (Agent::Qwen, vec!["node", "/bin/qwen", "--resume"]),
+            (Agent::Kimi, vec!["kimi", "--continue"]),
+        ] {
+            let args: Vec<_> = args.into_iter().map(std::ffi::OsString::from).collect();
+            assert!(!is_shared_session_host(agent, &args), "{agent:?} {args:?}");
+        }
+    }
 
     #[test]
     fn epoch_zero_is_the_unix_epoch() {

@@ -117,9 +117,10 @@ filtered out of both, and removed by the next `ingest`, which fans out one `runn
 event as it goes, so a poll landing between the kill and the next hook event cannot swallow
 that notification.
 
-Ingest also retires the previous Claude foreground binding as soon as its replacement
-appears in the same process and terminal, regardless of its previous phase. Retired
-bindings ignore late hooks and can be explicitly resumed. The
+Ingest also retires a previous foreground binding when the agent signals its replacement
+in the same process and terminal. Retired bindings ignore late hooks and can be explicitly
+resumed. Independent server sessions and recognized child sessions are preserved. OpenCode
+sessions remain independent when another conversation is selected. The
 [status lifecycle](docs/status-lifecycle.md) documents identity checks and fork handling.
 
 `problems` is never dropped on the floor: a consumer that cannot answer must say so rather than

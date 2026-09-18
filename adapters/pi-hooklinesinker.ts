@@ -10,7 +10,7 @@ interface PiContext {
 }
 
 interface PiEvents {
-  session_start: unknown;
+  session_start: { reason?: "startup" | "reload" | "new" | "resume" | "fork" };
   agent_start: unknown;
   agent_settled: unknown;
   session_before_compact: unknown;
@@ -32,7 +32,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function runHook(event: string, sessionId?: string): Promise<void> {
+function runHook(event: string, sessionId?: string, reason?: string): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = () => {
@@ -67,6 +67,7 @@ function runHook(event: string, sessionId?: string): Promise<void> {
 
       const native: Record<string, string> = {};
       if (sessionId) native.session_id = sessionId;
+      if (reason) native.reason = reason;
       child.stdin.end(JSON.stringify(native));
     } catch {
       finish();
@@ -80,8 +81,8 @@ export default function (pi: PiHost) {
   const pendingPermissionRequestIds = new Set<string>();
   let hookQueue: Promise<void> = Promise.resolve();
 
-  function queueHook(event: string, sessionId?: string): Promise<void> {
-    hookQueue = hookQueue.then(() => runHook(event, sessionId));
+  function queueHook(event: string, sessionId?: string, reason?: string): Promise<void> {
+    hookQueue = hookQueue.then(() => runHook(event, sessionId, reason));
     return hookQueue;
   }
 
@@ -133,19 +134,17 @@ export default function (pi: PiHost) {
     queuePermissionResolvedIfNonePending();
   });
 
-  // Session appears (fires at launch with reason "startup", and again on
-  // new/resume/reload/fork — re-queuing idle is correct: the session is idle).
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     pendingPermissionRequestIds.clear();
     isUISession = ctx?.hasUI !== false;
     currentSessionId = isUISession ? sessionId(ctx) : undefined;
     if (isUISession) {
-      await queueHook("session_start", currentSessionId);
+      const reason = typeof event?.reason === "string" ? event.reason : undefined;
+      await queueHook("session_start", currentSessionId, reason);
     }
   });
 
-  // Turn boundaries. agent_settled is Pi's recommended "done" signal — unlike
-  // agent_end, Pi will not auto-retry/compact/continue after it.
+  // agent_settled fires after automatic retries and compaction finish.
   pi.on("agent_start", async (_event, ctx) => {
     if (!isUISession) return;
     await queueHook("agent_start", rememberSessionId(ctx));
@@ -156,8 +155,7 @@ export default function (pi: PiHost) {
     await queueHook("agent_settled", rememberSessionId(ctx));
   });
 
-  // Compaction. session_compact carries a reason: a manual /compact leaves the
-  // session idle; a threshold/overflow compaction is mid-turn and resumes work.
+  // Automatic compaction resumes the current turn; manual compaction leaves it idle.
   pi.on("session_before_compact", async (_event, ctx) => {
     if (!isUISession) return;
     await queueHook("session_before_compact", rememberSessionId(ctx));
@@ -168,8 +166,7 @@ export default function (pi: PiHost) {
     await queueHook(done, rememberSessionId(ctx));
   });
 
-  // Session removal. Only a real quit removes the session — new/resume/reload/
-  // fork keep the same terminal session and are followed by a session_start.
+  // Session switches are reconciled by the next session_start.
   pi.on("session_shutdown", async (event, ctx) => {
     const id = isUISession ? rememberSessionId(ctx) : undefined;
     unsubscribePermissionPrompt();

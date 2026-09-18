@@ -203,6 +203,54 @@ fn adapters_carry_the_binary_placeholder() {
 // MARK: - Pi
 
 #[test]
+fn pi_session_starts_forward_the_native_switch_reason() {
+    let Some(run) = run("pi:session_switches") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "session_start",
+            "agent_start",
+            "session_start",
+            "agent_start",
+            "session_start",
+            "agent_start",
+            "session_start",
+            "agent_start"
+        ]
+    );
+    assert_eq!(
+        run.stdin(0),
+        &serde_json::json!({"session_id": "pi-parent", "reason": "startup"})
+    );
+    for (index, reason) in ["new", "resume", "fork", "reload"].iter().enumerate() {
+        let id = format!("pi-{reason}");
+        assert_eq!(
+            run.stdin(index * 2 + 1),
+            &serde_json::json!({"session_id": id, "reason": reason})
+        );
+        assert_eq!(
+            run.stdin(index * 2 + 2),
+            &serde_json::json!({"session_id": id})
+        );
+    }
+}
+
+#[test]
+fn pi_session_start_accepts_hosts_without_a_reason() {
+    let Some(run) = run("pi:start_without_reason") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start"]);
+    assert_eq!(
+        run.stdin(0),
+        &serde_json::json!({"session_id": "pi-parent"})
+    );
+}
+
+#[test]
 fn pi_prompt_and_decision_produce_the_permission_lifecycle() {
     let Some(run) = run("pi:permission_lifecycle") else {
         return;
@@ -308,6 +356,29 @@ fn pi_a_hanging_binary_cannot_block_the_adapter() {
 }
 
 // MARK: - OpenCode
+
+#[test]
+fn opencode_selection_and_status_hooks_keep_arrival_order() {
+    let Some(run) = run("opencode:selection_and_status_are_serialized") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session.created",
+            "tui.session.select",
+            "session.status.busy",
+            "tui.session.select",
+            "session.deleted"
+        ]
+    );
+    for (index, id) in ["a", "a", "b", "a"].iter().enumerate() {
+        assert_eq!(
+            run.stdin(index + 1),
+            &serde_json::json!({"session_id": id, "cwd": "/work/repo"})
+        );
+    }
+}
 
 #[test]
 fn opencode_plugin_load_ingests_session_created_with_the_directory() {

@@ -12,7 +12,7 @@ The flow starts in [`run_ingest`](../src/main.rs), passes through
    context; discover the owning agent by walking the hook process's ancestors.
 2. Map the native event to a phase update, removal, or ignored event. The mapping
    in `normalize.rs` is canonical; unknown event names are ignored.
-3. Write or remove the binding, retire superseded Claude foreground bindings, then
+3. Write or remove the binding, retire superseded foreground bindings, then
    sweep bindings whose processes have died.
 4. Send the normalized event and synthetic removals to registered status sinks.
 
@@ -32,37 +32,67 @@ An empty session ID is different: the normalized event reaches sinks but never
 enters the ledger. OpenCode's load-time event uses this path so consumers can
 update a terminal row before a conversation ID becomes available.
 
-Claude foreground bindings replace one another within the same PID, process start
+Foreground bindings replace one another within the same agent, PID, process start
 time, host, terminal, tmux pane, and remote-host context. Tmux session names are
 navigation metadata: renames or failed name lookups do not change binding identity.
-A different nonempty session ID retires the previous foreground binding immediately,
-including on `SessionStart`,
-regardless of the previous phase. If the new session's start hook was missed, its
-first status update also triggers replacement. A missing process identity, an empty
-session ID, or `SessionEnd` cannot replace another binding. The new record is written
-before retirement, under the same ledger lock; successful retirements produce
-`swept` events for sinks even if another retirement fails.
+A different nonempty foreground session ID retires the previous foreground binding
+immediately, regardless of its phase. For exclusive CLI sessions, the first status
+update can replace a binding even if the new session's start hook was missed.
+An empty session ID, missing process identity, or end event cannot replace another
+binding. The new record is written before retirement, under the same ledger lock;
+successful retirements produce `swept` events for sinks even if another retirement fails.
 
-`SessionStart` with `source: "fork"` marks a parallel binding. A hook carrying
-`agent_id` cannot replace the foreground binding; when it introduces a separate
-binding, that binding is marked parallel too. Subagent hooks for an existing parent
-binding preserve its role. Parallel markers survive updates, and those bindings
-neither trigger replacement nor qualify for it. `SessionStart` with `source: "resume"`
-explicitly selects a foreground binding, including a previously forked conversation.
+[`lifecycle.rs`](../src/lifecycle.rs) interprets agent-specific signals for the shared
+ledger transaction in `state.rs`:
 
-Retired bindings retain a private marker until their owning process exits. They are
-excluded from session results and dead-binding counts. Subsequent hooks for them,
-including delayed startup, status, and end hooks, are discarded without sink delivery.
-An explicit foreground `SessionStart` with `source: "resume"` reactivates the binding
-and retires its replacement. An identified Claude `SessionEnd` also leaves a marker,
-so later hooks cannot resurrect an ended conversation. Ingest sweeps discard markers
-after process exit without sending duplicate removals; reads never delete them.
+| Agent | Foreground selection and replacement | Parallel protection |
+|---|---|---|
+| Claude | Ordinary activity; `SessionStart source: resume` reactivates a retired binding | `source: fork` starts parallel; `agent_id` identifies child activity |
+| Codex | Ordinary activity, including a root `source: fork`; `source: resume` reactivates | `agent_id` identifies child activity; app-server and legacy mcp-server modes stay independent |
+| Droid | Ordinary activity; `SessionStart source: resume` reactivates | Distinct owner processes stay independent; no guaranteed native same-process child discriminator |
+| Qwen | Ordinary activity, including `source: branch`; `source: resume` reactivates | ACP/serve modes and attributed `source_type`/`source_id` sessions stay independent |
+| Kimi | Ordinary activity; `SessionStart source: resume` reactivates | ACP, web and wire launch modes stay independent |
+| Pi | UI session activity, including new/fork; `session_start reason: resume` reactivates | Adapter suppresses contexts with `hasUI: false` |
+| OpenCode | `tui.session.select` selects/reactivates an independent binding | Selection and activity never retire another conversation |
+
+Recognized child activity cannot replace another binding. When it introduces a separate binding,
+that binding is marked parallel; child activity on an existing parent preserves its role.
+Parallel markers survive ordinary updates. An explicit foreground resume can select a
+previously parallel binding. Resume in a recognized shared server remains independent.
+OpenCode selection retains the last known phase rather than resetting a busy or waiting
+session to idle; a newly observed selection starts idle.
+
+OpenCode selection marks the selected binding parallel and preserves every other live
+conversation. After selecting A then B, A's activity, permission requests, and deletion still
+reach the ledger and sinks. Selection is navigation, not an exclusive-session lifecycle
+boundary. The backend plugin does not observe ordinary session-picker navigation; accurate
+display selection would require a separate TUI integration. See the
+[external identity and navigation evidence](reference/agent-hook-events.md#opencode-selection-is-navigation).
+
+**Unverified Droid case:** a child with a different ID, the same owner process, and no child
+marker currently looks like a replacement. Real child hook metadata/process ancestry still
+needs verification; conservative retention is the safe fallback if exclusivity is unknown.
+The [cross-agent reference](reference/agent-hook-events.md#session-identity-subagents-and-shared-processes)
+distinguishes documented contracts, inspected source, and unresolved behavior. Current
+regression tests exercise synthetic metadata; they do not verify real subagents across agents.
+
+Server-mode protection in
+[`processes.rs`](../src/processes.rs) checks known launch arguments; in-process mode changes
+or custom multiplexing wrappers without those arguments cannot be identified reliably.
+
+Retired and explicitly ended bindings retain a private marker until their owning process
+exits. They are excluded from session results and dead-binding counts. Subsequent hooks
+for them, including delayed startup, status, and end hooks, are discarded without sink
+delivery. Explicit resume/selection reactivates them. Ingest sweeps discard markers after
+process exit without sending duplicate removals; reads never delete them.
 
 Lifecycle decisions follow ingest order. Native hooks provide no sequence number to
-distinguish a delayed `resume` from an intentional return to that conversation, or an
-unseen delayed session from a new one. Fork isolation depends on observing the native
-fork/subagent fields; older records without role metadata are treated as foreground.
-All lifecycle markers are private and omitted from the wire protocol.
+distinguish a delayed resume from an intentional return, or an unseen delayed session
+from a new one. Parallel protection depends on observed native metadata and recognized
+launch mode. Pre-upgrade records without role metadata are treated as foreground except
+for OpenCode, whose legacy records remain independent. Existing `claudeParallel` and
+`claudeRetired` markers are accepted on upgrade. Lifecycle markers remain private and do
+not change the consumer wire protocol.
 
 [`gather_environment`](../src/environment.rs) supplies optional navigation metadata.
 Native `cwd` overrides the event's session directory; environment probes use the
@@ -110,8 +140,8 @@ does not undo ledger updates or stop delivery attempts to the remaining sinks.
 
 The capped raw input exists in memory while parsing. `NativeEvent` extracts
 session ID, transcript path, tool name, working directory, and notification type.
-Claude lifecycle handling also reads `source` and `agent_id`, retaining parallel and
-retired flags alongside the last status in private state.
+Lifecycle handling also reads native `source`, `agent_id`, `source_type`, `source_id`,
+and Pi `reason`, retaining only parallel and retired flags alongside private status.
 Raw payloads are never persisted or forwarded; tool inputs, outputs, and prompts
 do not enter status records. JSON errors report position without the offending
 value. A transcript path is metadata; ingest does not open the transcript.
@@ -127,8 +157,10 @@ Consumer lookup follows the same partial-read policy for sink delivery: valid si
 receive events while damaged registrations produce health diagnostics.
 
 [`tests/integration.rs`](../tests/integration.rs) covers identity, PID reuse,
-unverifiable records, empty-ID fanout, Claude replacement, late hooks, resume, and fork isolation,
+unverifiable records, empty-ID fanout, late hooks, resume, and fork isolation,
 privacy, and polling before a later sweep;
-[`tests/cli.rs`](../tests/cli.rs) covers envelopes and ingest failure exits.
+[`tests/lifecycle.rs`](../tests/lifecycle.rs) covers cross-agent replacement, independent
+sessions, marker migration and wire privacy; [`tests/cli.rs`](../tests/cli.rs) covers
+envelopes and ingest failure exits.
 See [hooks and adapters](hooks-and-adapters.md) for event production and host
 timeouts, and [installation](installation.md) for consumer registration.

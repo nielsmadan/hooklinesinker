@@ -74,11 +74,15 @@ The named legacy Juggler adapter files are also removed during reconciliation.
 OpenCode emits a synthetic `session.created` on plugin load with directory but
 no session ID, including when resuming. Its listener validates dynamic objects,
 selects the first valid session ID, and expands `session.status` with its status
-suffix before invoking ingest. It forwards only ID and directory metadata.
+suffix before invoking ingest. It forwards only ID and directory metadata, and serializes
+invocations to preserve arrival order. `tui.session.select` forwards explicit selection
+requests without retiring other conversations; ordinary TUI navigation is not visible to
+this backend plugin.
 
 Pi queues hooks serially and suppresses sessions whose `hasUI` is false.
-`agent_settled` marks idle; manual compaction returns to idle, other compaction to
-working. Permission prompts stay pending until eligible decisions clear them all;
+Session starts forward their native `reason` so resumes can reactivate retired bindings;
+new and fork starts replace the previous foreground binding. `agent_settled` marks idle;
+manual compaction returns to idle, other compaction to working. Permission prompts stay pending until eligible decisions clear them all;
 settlement clears pending prompts. Only a shutdown with reason `quit` emits
 removal. Every shutdown drains hooks and unsubscribes permission listeners.
 
