@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
+// Agent has no deserialization fallback and cannot get a meaningful one: an unknown
+// agent has no hook table, no executable names and no lifecycle mapping. Adding a
+// variant is additive, but accepting an unknown one is a protocol-major bump.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Agent {
@@ -46,10 +49,24 @@ pub enum Phase {
     Working,
     Permission,
     Compacting,
+    // A phase string from a newer protocol minor deserializes here rather than failing.
+    #[serde(other)]
     Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+impl Phase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Permission => "permission",
+            Self::Compacting => "compacting",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusEvent {
     pub protocol: u16,
@@ -67,7 +84,7 @@ pub struct StatusEvent {
     pub remote_host: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionIdentity {
     pub id: String,
@@ -99,7 +116,7 @@ pub struct TmuxIdentity {
     pub session_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitIdentity {
     pub branch: Option<String>,
@@ -193,11 +210,29 @@ mod tests {
 
     #[test]
     fn status_event_round_trips_through_json() {
-        let value = serde_json::to_value(sample_event()).unwrap();
+        let event = sample_event();
+        let value = serde_json::to_value(&event).unwrap();
         let round_tripped: StatusEvent = serde_json::from_value(value).unwrap();
 
-        assert_eq!(round_tripped.session.id, "session-1");
-        assert_eq!(round_tripped.session.transcript_path, None);
-        assert!(round_tripped.process.is_some());
+        assert_eq!(round_tripped, event);
+    }
+
+    #[test]
+    fn an_unrecognized_phase_string_deserializes_to_unknown() {
+        let phase: Phase = serde_json::from_value(serde_json::json!("teleporting")).unwrap();
+        assert_eq!(phase, Phase::Unknown);
+    }
+
+    #[test]
+    fn phase_display_spellings_match_the_wire_spellings() {
+        for phase in [
+            Phase::Idle,
+            Phase::Working,
+            Phase::Permission,
+            Phase::Compacting,
+            Phase::Unknown,
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), phase.as_str());
+        }
     }
 }

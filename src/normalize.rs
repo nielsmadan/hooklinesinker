@@ -1,4 +1,4 @@
-use crate::events::{EventAction, native_event_action};
+use crate::events::{EventAction, EventLookup, native_event_lookup};
 use crate::processes::now_rfc3339;
 use crate::protocol::{
     Agent, GitIdentity, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity, StatusEvent,
@@ -32,6 +32,29 @@ enum MappedAction {
     Update(Phase),
     Remove,
     Ignore,
+    Unrecognized,
+}
+
+// Empty session IDs reach terminal-keyed sinks but cannot be paired with a conversation's
+// end event, so they are forwarded without ever entering the ledger. Keeping that in the
+// return type means a second ingestion path cannot record one by omission.
+#[derive(Debug)]
+pub enum Normalized {
+    Recordable(StatusEvent),
+    ForwardOnly(StatusEvent),
+    Ignored,
+    Unrecognized,
+}
+
+impl Normalized {
+    // The event to forward to sinks, if this maps to one. Whether it may also be recorded
+    // stays in the variant.
+    pub fn into_event(self) -> Option<StatusEvent> {
+        match self {
+            Self::Recordable(event) | Self::ForwardOnly(event) => Some(event),
+            Self::Ignored | Self::Unrecognized => None,
+        }
+    }
 }
 
 fn map_event(
@@ -40,7 +63,7 @@ fn map_event(
     tool_name: Option<&str>,
     notification_type: Option<&str>,
 ) -> MappedAction {
-    use MappedAction::{Ignore, Remove, Update};
+    use MappedAction::{Ignore, Remove, Unrecognized, Update};
     match agent {
         Agent::Pi => match event {
             "session_start" | "agent_settled" | "session_compact_idle" => Update(Phase::Idle),
@@ -50,7 +73,7 @@ fn map_event(
             "permission_prompt" => Update(Phase::Permission),
             "session_before_compact" => Update(Phase::Compacting),
             "session_shutdown" => Remove,
-            _ => Ignore,
+            _ => Unrecognized,
         },
         Agent::Opencode => match event {
             "session.created"
@@ -62,13 +85,14 @@ fn map_event(
             "permission.asked" => Update(Phase::Permission),
             "session.compacted" => Update(Phase::Compacting),
             "session.deleted" | "server.instance.disposed" => Remove,
-            _ => Ignore,
+            _ => Unrecognized,
         },
         Agent::Claude | Agent::Codex | Agent::Droid | Agent::Qwen | Agent::Kimi => {
-            match native_event_action(agent, event, tool_name, notification_type) {
-                Some(EventAction::Update(phase)) => Update(phase),
-                Some(EventAction::Remove) => Remove,
-                None => Ignore,
+            match native_event_lookup(agent, event, tool_name, notification_type) {
+                EventLookup::Mapped(EventAction::Update(phase)) => Update(phase),
+                EventLookup::Mapped(EventAction::Remove) => Remove,
+                EventLookup::Unmapped => Ignore,
+                EventLookup::Unrecognized => Unrecognized,
             }
         }
     }
@@ -80,7 +104,7 @@ pub fn normalize(
     input: &str,
     env: &HookEnvironment,
     process: Option<ProcessIdentity>,
-) -> io::Result<Option<StatusEvent>> {
+) -> io::Result<Normalized> {
     let native: NativeEvent = serde_json::from_str(input).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -98,7 +122,8 @@ pub fn normalize(
         native.tool_name.as_deref(),
         native.notification_type.as_deref(),
     ) {
-        MappedAction::Ignore => return Ok(None),
+        MappedAction::Ignore => return Ok(Normalized::Ignored),
+        MappedAction::Unrecognized => return Ok(Normalized::Unrecognized),
         MappedAction::Update(phase) => (phase, true),
         MappedAction::Remove => (Phase::Idle, false),
     };
@@ -110,7 +135,8 @@ pub fn normalize(
         .map_or_else(|| env.host.clone(), |p| p.host.clone());
     let binding_id = binding_id(agent, &session_id, &host, process.as_ref());
 
-    Ok(Some(StatusEvent {
+    let recordable = !session_id.is_empty();
+    let status = StatusEvent {
         protocol: PROTOCOL_VERSION,
         binding_id,
         agent,
@@ -128,7 +154,12 @@ pub fn normalize(
         tmux: env.tmux.clone(),
         git: env.git.clone(),
         remote_host: env.remote_host.clone(),
-    }))
+    };
+    Ok(if recordable {
+        Normalized::Recordable(status)
+    } else {
+        Normalized::ForwardOnly(status)
+    })
 }
 
 fn binding_id(
@@ -187,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_events_return_none() {
+    fn events_outside_the_agent_vocabulary_are_reported_as_unrecognized() {
         let result = normalize(
             Agent::Claude,
             "SubagentStop",
@@ -196,7 +227,7 @@ mod tests {
             Some(process(1)),
         )
         .unwrap();
-        assert!(result.is_none());
+        assert!(matches!(result, Normalized::Unrecognized));
     }
 
     #[test]
@@ -213,15 +244,39 @@ mod tests {
 
     #[test]
     fn cwd_falls_back_to_the_environment_when_native_json_omits_it() {
-        let event = normalize(
+        let normalized = normalize(
             Agent::Claude,
             "SessionStart",
             "{}",
             &env(),
             Some(process(1)),
         )
-        .unwrap()
         .unwrap();
+        let Normalized::ForwardOnly(event) = normalized else {
+            panic!("an event without a session id is forward-only");
+        };
         assert_eq!(event.session.cwd, "/tmp/project");
+    }
+
+    #[test]
+    fn an_installed_hook_with_no_mapped_phase_is_ignored_not_unrecognized() {
+        let result = normalize(
+            Agent::Droid,
+            "Notification",
+            r#"{"session_id":"s","notification_type":"something_new"}"#,
+            &env(),
+            Some(process(1)),
+        )
+        .unwrap();
+        assert!(matches!(result, Normalized::Ignored));
+    }
+
+    #[test]
+    fn binding_id_is_stable_across_binary_versions() {
+        // Binding IDs name persisted ledger files; a change here orphans every live record.
+        assert_eq!(
+            binding_id(Agent::Claude, "session-1", "host-1", Some(&process(42))),
+            "7ce3e1e5c3d5d9269f5d961538ec85a5edee83eb521793c129d3aba09f1a150a"
+        );
     }
 }

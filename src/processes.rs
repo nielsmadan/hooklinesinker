@@ -1,22 +1,65 @@
 use crate::protocol::{Agent, ProcessIdentity};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 pub trait ProcessLiveness {
     fn process_is_alive(&self, identity: &ProcessIdentity) -> bool;
 }
 
-pub trait ProcessLookup {
+pub trait ProcessLookup: ProcessLiveness {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
-    fn is_alive(&self, identity: &ProcessIdentity) -> bool;
     fn has_exclusive_session(&self, _identity: &ProcessIdentity, _agent: Agent) -> bool {
         true
     }
 }
 
-impl<T: ProcessLookup + ?Sized> ProcessLiveness for T {
-    fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
-        ProcessLookup::is_alive(self, identity)
+// An instant on the wire as RFC 3339, in memory as epoch seconds. Parsing happens once,
+// at deserialization, so comparisons are integer arithmetic and a malformed timestamp
+// fails its record instead of silently classifying itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    pub fn now() -> Self {
+        Self(epoch_now())
+    }
+
+    pub const fn from_epoch_seconds(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    pub const fn epoch_seconds(self) -> u64 {
+        self.0
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        parse_epoch_seconds(text).map(Self)
+    }
+
+    pub const fn seconds_since(self, earlier: Self) -> u64 {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
+impl std::fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format_epoch_seconds(self.0))
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format_epoch_seconds(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom("expected an RFC 3339 timestamp in UTC seconds")
+        })
     }
 }
 
@@ -109,14 +152,47 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+// A PID whose start time still matches is the same process; a reused PID is not.
+fn pid_is_alive(identity: &ProcessIdentity) -> bool {
+    let pid = Pid::from_u32(identity.pid);
+    let mut current = System::new();
+    current.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    current
+        .process(pid)
+        .is_some_and(|process| format_epoch_seconds(process.start_time()) == identity.started_at)
+}
+
+// Liveness costs one targeted refresh per query. The paths that only poll liveness
+// (`sessions`, `doctor`) use this instead of paying for the full process table.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemProcessLiveness;
+
+impl ProcessLiveness for SystemProcessLiveness {
+    fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
+        pid_is_alive(identity)
+    }
+}
+
+// Ancestry walks and shared-host detection need every process at once, so ingest
+// pays for the full table that `SystemProcessLiveness` avoids.
 pub struct SystemProcessLookup {
     system: System,
 }
 
 impl SystemProcessLookup {
     pub fn new() -> Self {
-        let mut system = System::new_all();
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        let mut system = System::new();
+        // Ancestry matching reads name, parent, start time and argv. `refresh_processes`
+        // leaves argv unset and would silently fall through to a same-named ancestor.
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
         Self { system }
     }
 
@@ -190,6 +266,12 @@ impl Default for SystemProcessLookup {
     }
 }
 
+impl ProcessLiveness for SystemProcessLookup {
+    fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
+        pid_is_alive(identity)
+    }
+}
+
 impl ProcessLookup for SystemProcessLookup {
     fn has_exclusive_session(&self, identity: &ProcessIdentity, agent: Agent) -> bool {
         self.system
@@ -220,18 +302,6 @@ impl ProcessLookup for SystemProcessLookup {
             current = process.parent();
         }
         None
-    }
-    fn is_alive(&self, identity: &ProcessIdentity) -> bool {
-        let pid = Pid::from_u32(identity.pid);
-        let mut current = System::new();
-        current.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
-        current.process(pid).is_some_and(|process| {
-            format_epoch_seconds(process.start_time()) == identity.started_at
-        })
     }
 }
 
@@ -387,7 +457,8 @@ mod tests {
             started_at: "1970-01-01T00:00:00Z".into(),
             host: "test".into(),
         };
-        assert!(!lookup.is_alive(&identity));
+        assert!(!lookup.process_is_alive(&identity));
+        assert!(!SystemProcessLiveness.process_is_alive(&identity));
     }
     #[test]
     fn liveness_observes_processes_started_after_lookup_creation_and_their_exit() {
@@ -409,14 +480,20 @@ mod tests {
                 started_at: format_epoch_seconds(process.start_time()),
                 host: local_hostname(),
             };
-            let alive = lookup.is_alive(&identity);
+            let alive = lookup.process_is_alive(&identity);
+            assert_eq!(
+                alive,
+                SystemProcessLiveness.process_is_alive(&identity),
+                "the table-free liveness path must agree with the full lookup"
+            );
             (identity, alive)
         });
         child.kill().unwrap();
         child.wait().unwrap();
         let (identity, alive) = observation.expect("the spawned process is observable");
         assert!(alive);
-        assert!(!lookup.is_alive(&identity));
+        assert!(!lookup.process_is_alive(&identity));
+        assert!(!SystemProcessLiveness.process_is_alive(&identity));
     }
     #[test]
     fn timestamp_parsing_rejects_invalid_calendar_values_and_overflow() {

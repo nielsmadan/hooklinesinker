@@ -1,9 +1,7 @@
 use crate::consumers::ConsumerStore;
 use crate::lifecycle::SessionContext;
-use crate::normalize::{HookEnvironment, normalize};
-use crate::processes::{
-    ProcessLiveness, ProcessLookup, epoch_now, now_rfc3339, parse_epoch_seconds,
-};
+use crate::normalize::{HookEnvironment, Normalized, normalize};
+use crate::processes::{ProcessLiveness, ProcessLookup, Timestamp};
 use crate::protocol::{Agent, StatusEvent};
 use crate::sinks::{HttpClient, SinkFanout};
 use fs2::FileExt;
@@ -11,21 +9,56 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const MAX_HEALTH_PROBLEMS: usize = 50;
 // Expired diagnostics must not replay as current faults on every read.
 const HEALTH_PROBLEM_TTL_SECS: u64 = 600;
+// A sweep backlog is unbounded, each sink send costs up to ~600ms of ureq timeouts, and
+// Codex caps a hook at 3s. Deliver what fits and record the rest as a health problem.
+const SINK_FANOUT_BUDGET: Duration = Duration::from_millis(1_000);
 
-fn is_recent_problem(problem: &HealthProblem, now: u64) -> bool {
-    parse_epoch_seconds(&problem.observed_at)
-        .is_none_or(|observed| now.saturating_sub(observed) <= HEALTH_PROBLEM_TTL_SECS)
+// Doctor recovers the last sink failure from the health log, so the failing subsystem is
+// part of the record rather than a prefix on its message.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum HealthKind {
+    Sink {
+        consumer: String,
+    },
+    Ingest,
+    Sweep,
+    #[default]
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthProblem {
-    pub observed_at: String,
+    pub observed_at: Timestamp,
     pub message: String,
+    // Protocol 1 records predate the field and read back as `Other`.
+    #[serde(default)]
+    pub kind: HealthKind,
+}
+
+impl HealthProblem {
+    pub fn new(kind: HealthKind, message: impl Into<String>) -> Self {
+        Self {
+            observed_at: Timestamp::now(),
+            message: message.into(),
+            kind,
+        }
+    }
+
+    pub const fn is_sink_failure(&self) -> bool {
+        matches!(self.kind, HealthKind::Sink { .. })
+    }
+
+    const fn is_recent(&self, now: Timestamp) -> bool {
+        now.seconds_since(self.observed_at) <= HEALTH_PROBLEM_TTL_SECS
+    }
 }
 
 struct StatusSnapshot {
@@ -35,14 +68,10 @@ struct StatusSnapshot {
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredStatus {
+struct StoredStatusWire {
     #[serde(flatten)]
     status: StatusEvent,
-    #[serde(
-        default,
-        alias = "claudeParallel",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, alias = "claudeParallel")]
     parallel: Option<bool>,
     #[serde(
         default,
@@ -52,14 +81,35 @@ struct StoredStatus {
     retired: bool,
 }
 
-impl StoredStatus {
-    fn is_parallel(&self) -> bool {
-        self.parallel
-            .unwrap_or(self.status.agent == Agent::Opencode)
-    }
+// `parallel` is resolved once, at the read boundary: a legacy record without the field
+// infers it from the agent there, so nothing downstream carries the tri-state.
+struct StoredStatus {
+    status: StatusEvent,
+    parallel: bool,
+    retired: bool,
+}
 
+impl From<StoredStatusWire> for StoredStatus {
+    fn from(wire: StoredStatusWire) -> Self {
+        let parallel = wire
+            .parallel
+            .unwrap_or(wire.status.agent == Agent::Opencode);
+        Self {
+            status: wire.status,
+            parallel,
+            retired: wire.retired,
+        }
+    }
+}
+
+impl StoredStatus {
     fn write(&self, path: &Path) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self)
+        let wire = StoredStatusWire {
+            status: self.status.clone(),
+            parallel: Some(self.parallel),
+            retired: self.retired,
+        };
+        let bytes = serde_json::to_vec_pretty(&wire)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         write_private_atomic(path, &bytes)
     }
@@ -78,10 +128,28 @@ struct IngestSessionOutcome {
 
 enum SessionDisposition {
     Ignore,
-    Store {
-        parallel: bool,
-        retire_superseded: bool,
-    },
+    Store(StoreMode),
+}
+
+// Retirement is exclusive-mode business only, so a parallel session cannot carry the flag.
+enum StoreMode {
+    Parallel,
+    Exclusive { retire_superseded: bool },
+}
+
+impl StoreMode {
+    const fn is_parallel(&self) -> bool {
+        matches!(self, Self::Parallel)
+    }
+
+    const fn retires_superseded(&self) -> bool {
+        matches!(
+            self,
+            Self::Exclusive {
+                retire_superseded: true
+            }
+        )
+    }
 }
 
 pub struct StatusStore {
@@ -129,12 +197,7 @@ impl StatusStore {
         let previous = snapshot.records.iter().find_map(|(_, stored)| {
             (stored.status.binding_id == event.binding_id).then_some(stored)
         });
-        let disposition = session_disposition(event, previous, context);
-        let SessionDisposition::Store {
-            parallel,
-            retire_superseded,
-        } = disposition
-        else {
+        let SessionDisposition::Store(mode) = session_disposition(event, previous, context) else {
             return Ok(IngestSessionOutcome {
                 forward: false,
                 retired: SweepOutcome {
@@ -151,8 +214,8 @@ impl StatusStore {
         {
             event.phase = previous.status.phase;
         }
-        self.persist_session(event, parallel)?;
-        let retired = if retire_superseded {
+        self.persist_session(event, mode.is_parallel())?;
+        let retired = if mode.retires_superseded() {
             Self::retire_superseded(event, snapshot.records, snapshot.problems)
         } else {
             SweepOutcome {
@@ -169,7 +232,7 @@ impl StatusStore {
     fn persist_session(&self, event: &StatusEvent, parallel: bool) -> io::Result<()> {
         let stored = StoredStatus {
             status: event.clone(),
-            parallel: Some(parallel),
+            parallel,
             retired: !event.running && event.process.is_some(),
         };
         if !event.running && event.process.is_none() {
@@ -190,7 +253,7 @@ impl StatusStore {
         };
         for (path, mut stored) in records {
             let previous = &stored.status;
-            if !stored.is_parallel()
+            if !stored.parallel
                 && !stored.retired
                 && previous.agent == event.agent
                 && previous.session.id != event.session.id
@@ -262,8 +325,8 @@ impl StatusStore {
                     continue;
                 }
             };
-            match serde_json::from_slice::<StoredStatus>(&bytes) {
-                Ok(event) => snapshot.records.push((path, event)),
+            match serde_json::from_slice::<StoredStatusWire>(&bytes) {
+                Ok(wire) => snapshot.records.push((path, wire.into())),
                 Err(e) => snapshot.problems.push(format!(
                     "failed to parse status record {}: {e}",
                     path.display()
@@ -273,6 +336,8 @@ impl StatusStore {
         Ok(snapshot)
     }
 
+    // Deliberately stricter than `sessions_envelope`: `running()` and `dead_records()` back
+    // doctor's counts, where a number computed from a partial read would read as healthy.
     fn read_complete(&self) -> io::Result<Vec<(PathBuf, StatusEvent)>> {
         let snapshot = self.read_all()?;
         if !snapshot.problems.is_empty() {
@@ -342,13 +407,12 @@ impl StatusStore {
         Ok(outcome)
     }
 
-    pub fn record_health(&self, message: &str) -> io::Result<()> {
+    pub fn record_health(&self, problem: HealthProblem) -> io::Result<()> {
         let _guard = self.lock()?;
         let mut problems = self.read_health_locked()?;
-        problems.push(HealthProblem {
-            observed_at: now_rfc3339(),
-            message: message.to_string(),
-        });
+        // A repeating fault refreshes its entry instead of evicting every other diagnostic.
+        problems.retain(|p| p.kind != problem.kind || p.message != problem.message);
+        problems.push(problem);
         if problems.len() > MAX_HEALTH_PROBLEMS {
             let excess = problems.len() - MAX_HEALTH_PROBLEMS;
             problems.drain(0..excess);
@@ -386,9 +450,10 @@ impl StatusStore {
             Ok(envelope) => envelope,
             Err(e) => SessionsEnvelope {
                 sessions: Vec::new(),
-                problems: vec![health_problem(format!(
-                    "failed to read running sessions: {e}"
-                ))],
+                problems: vec![HealthProblem::new(
+                    HealthKind::Other,
+                    format!("failed to read running sessions: {e}"),
+                )],
             },
         }
     }
@@ -407,16 +472,21 @@ impl StatusStore {
             .filter(|(_, event)| is_live(event, liveness))
             .map(|(_, event)| event)
             .collect();
-        let mut problems: Vec<_> = snapshot.problems.into_iter().map(health_problem).collect();
+        let mut problems: Vec<_> = snapshot
+            .problems
+            .into_iter()
+            .map(|message| HealthProblem::new(HealthKind::Other, message))
+            .collect();
         // Doctor reads the full health log for its last-known sink error.
-        let now = epoch_now();
+        let now = Timestamp::now();
         match self.read_health_locked() {
             Ok(recorded) => {
-                problems.extend(recorded.into_iter().filter(|p| is_recent_problem(p, now)));
+                problems.extend(recorded.into_iter().filter(|p| p.is_recent(now)));
             }
-            Err(e) => problems.push(health_problem(format!(
-                "failed to read health problems: {e}"
-            ))),
+            Err(e) => problems.push(HealthProblem::new(
+                HealthKind::Other,
+                format!("failed to read health problems: {e}"),
+            )),
         }
         Ok(SessionsEnvelope { sessions, problems })
     }
@@ -436,23 +506,18 @@ fn session_disposition(
     }
     let parallel = matches!(context, SessionContext::SelectedParallel)
         || !resume
-            && (previous.is_some_and(StoredStatus::is_parallel)
+            && (previous.is_some_and(|stored| stored.parallel)
                 || (previous.is_none() && matches!(context, SessionContext::Background))
                 || matches!(context, SessionContext::Parallel));
-    SessionDisposition::Store {
-        parallel,
-        retire_superseded: !parallel
-            && !matches!(context, SessionContext::Background)
-            && event.running
-            && event.process.is_some(),
-    }
-}
-
-fn health_problem(message: String) -> HealthProblem {
-    HealthProblem {
-        observed_at: now_rfc3339(),
-        message,
-    }
+    SessionDisposition::Store(if parallel {
+        StoreMode::Parallel
+    } else {
+        StoreMode::Exclusive {
+            retire_superseded: !matches!(context, SessionContext::Background)
+                && event.running
+                && event.process.is_some(),
+        }
+    })
 }
 
 pub struct SessionsEnvelope {
@@ -551,16 +616,28 @@ pub fn handle_ingest(
 ) -> IngestOutcome {
     let store = ctx.store;
     let process = ctx.liveness.owner_of(hook_pid, agent);
-    let mut normalized_event: Option<StatusEvent> = None;
+    let mut forwarded: Option<StatusEvent> = None;
+    let mut problems: Vec<HealthProblem> = Vec::new();
     let mut retired = SweepOutcome::default();
+
     let outcome =
-        normalize(agent, event, input, env, process).and_then(|maybe_event| match maybe_event {
-            // Empty IDs reach terminal-keyed sinks but cannot be paired with a conversation's end event.
-            Some(status_event) if status_event.session.id.is_empty() => {
-                normalized_event = Some(status_event);
+        normalize(agent, event, input, env, process).and_then(|normalized| match normalized {
+            Normalized::Ignored => Ok(()),
+            Normalized::Unrecognized => {
+                problems.push(HealthProblem::new(
+                    HealthKind::Ingest,
+                    format!(
+                        "unrecognized {} event \"{event}\"; no status was recorded",
+                        agent.as_str()
+                    ),
+                ));
                 Ok(())
             }
-            Some(mut status_event) => {
+            Normalized::ForwardOnly(status_event) => {
+                forwarded = Some(status_event);
+                Ok(())
+            }
+            Normalized::Recordable(mut status_event) => {
                 let mut context = SessionContext::parse(agent, event, input)?;
                 if status_event
                     .process
@@ -571,94 +648,142 @@ pub fn handle_ingest(
                 }
                 let session_outcome = store.ingest_session(&mut status_event, context)?;
                 if session_outcome.forward {
-                    normalized_event = Some(status_event);
+                    forwarded = Some(status_event);
                 }
                 retired = session_outcome.retired;
                 Ok(())
             }
-            None => Ok(()),
         });
 
-    let mut problems: Vec<String> = outcome.err().map(|e| e.to_string()).into_iter().collect();
-    problems.extend(retired.problems);
+    if let Err(e) = outcome {
+        problems.push(HealthProblem::new(HealthKind::Ingest, e.to_string()));
+    }
+    problems.extend(
+        retired
+            .problems
+            .into_iter()
+            .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
+    );
     let mut swept = retired.events;
     match store.sweep(ctx.liveness) {
         Ok(outcome) => {
-            problems.extend(outcome.problems);
+            problems.extend(
+                outcome
+                    .problems
+                    .into_iter()
+                    .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
+            );
             swept.extend(outcome.events);
         }
         Err(e) => {
-            problems.push(format!("sweep failed: {e}"));
+            problems.push(HealthProblem::new(
+                HealthKind::Sweep,
+                format!("sweep failed: {e}"),
+            ));
         }
     }
-    for message in &problems {
-        let _ = store.record_health(message);
-    }
-    let problem = (!problems.is_empty()).then(|| problems.join("; "));
 
-    fan_out_to_sinks(
-        store,
-        ctx.consumers,
-        ctx.http_client,
-        normalized_event.as_ref(),
-        &swept,
+    let mut messages: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
+    // A health write that fails is still reported to the caller, which is the only place
+    // left that can surface it.
+    messages.extend(
+        problems
+            .into_iter()
+            .filter_map(|problem| store.record_health(problem).err())
+            .map(|e| format!("failed to record health problem: {e}")),
     );
+    let problem = (!messages.is_empty()).then(|| messages.join("; "));
+
+    fan_out_to_sinks(store, ctx, forwarded.as_ref(), swept);
 
     IngestOutcome { problem }
 }
 
 fn fan_out_to_sinks(
     store: &StatusStore,
-    consumers: Option<&ConsumerStore>,
-    http_client: &dyn HttpClient,
-    normalized_event: Option<&StatusEvent>,
-    swept: &[StatusEvent],
+    ctx: &IngestContext,
+    forwarded: Option<&StatusEvent>,
+    swept: Vec<StatusEvent>,
 ) {
-    if normalized_event.is_none() && swept.is_empty() {
+    if forwarded.is_none() && swept.is_empty() {
         return;
     }
-    let Some(consumers) = consumers else {
+    let Some(consumers) = ctx.consumers else {
         return;
     };
 
     let snapshot = match consumers.snapshot() {
         Ok(snapshot) => snapshot,
         Err(e) => {
-            let _ = store.record_health(&format!("sink consumer lookup failed: {e}"));
+            record(
+                store,
+                HealthKind::Other,
+                format!("sink consumer lookup failed: {e}"),
+            );
             return;
         }
     };
     for problem in snapshot.problems {
-        let _ = store.record_health(&format!("sink consumer lookup failed: {problem}"));
+        record(
+            store,
+            HealthKind::Other,
+            format!("sink consumer lookup failed: {problem}"),
+        );
     }
     let status_consumers = snapshot.consumers;
     if status_consumers.is_empty() {
         return;
     }
 
-    let fanout = SinkFanout::new(http_client);
+    let fanout = SinkFanout::new(ctx.http_client);
     let record_problems = |problems: Vec<crate::sinks::SinkProblem>| {
         for problem in problems {
-            let _ = store.record_health(&format!(
-                "sink {} failed: {}",
-                problem.consumer, problem.message
-            ));
+            // The message keeps its existing wording for consumers reading `problems[].message`;
+            // the kind is what doctor classifies on.
+            let message = format!("sink {} failed: {}", problem.consumer, problem.message);
+            record(
+                store,
+                HealthKind::Sink {
+                    consumer: problem.consumer,
+                },
+                message,
+            );
         }
     };
 
-    if let Some(event) = normalized_event {
+    // The live event is one send and always goes out; only the sweep backlog is bounded.
+    if let Some(event) = forwarded {
         record_problems(fanout.send(event, &status_consumers));
     }
+    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
+    let mut undelivered = 0usize;
     for swept_event in swept {
-        let synthetic = synthetic_swept_event(swept_event);
-        record_problems(fanout.send(&synthetic, &status_consumers));
+        if Instant::now() >= deadline {
+            undelivered += 1;
+            continue;
+        }
+        record_problems(fanout.send(&synthetic_swept_event(swept_event), &status_consumers));
+    }
+    if undelivered > 0 {
+        record(
+            store,
+            HealthKind::Sweep,
+            format!(
+                "sink fan-out exceeded its {}ms budget; {undelivered} swept event(s) were not delivered",
+                SINK_FANOUT_BUDGET.as_millis()
+            ),
+        );
     }
 }
 
-fn synthetic_swept_event(swept: &StatusEvent) -> StatusEvent {
-    let mut synthetic = swept.clone();
-    synthetic.event = "swept".to_string();
-    synthetic.running = false;
-    synthetic.observed_at = now_rfc3339();
-    synthetic
+fn record(store: &StatusStore, kind: HealthKind, message: String) {
+    let _ = store.record_health(HealthProblem::new(kind, message));
+}
+
+fn synthetic_swept_event(mut swept: StatusEvent) -> StatusEvent {
+    // The `swept` event name is part of the protocol 1 consumer contract.
+    swept.event = "swept".to_string();
+    swept.running = false;
+    swept.observed_at = crate::processes::now_rfc3339();
+    swept
 }

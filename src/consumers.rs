@@ -17,7 +17,23 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    pub fn validate(&self) -> io::Result<()> {
+    // The only constructor that enforces the invariants `register` relies on.
+    pub fn new(
+        name: impl Into<String>,
+        capabilities: Vec<String>,
+        sink: Option<String>,
+    ) -> io::Result<Self> {
+        let consumer = Self {
+            name: name.into(),
+            protocol: SUPPORTED_PROTOCOL_MAJOR,
+            capabilities,
+            sink,
+        };
+        consumer.validate()?;
+        Ok(consumer)
+    }
+
+    pub(crate) fn validate(&self) -> io::Result<()> {
         validate_name(&self.name)?;
         validate_protocol(self.protocol)?;
         validate_capabilities(&self.capabilities)?;

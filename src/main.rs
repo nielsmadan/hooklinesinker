@@ -7,10 +7,10 @@ use hooklinesinker::environment::{self, SystemEnv};
 use hooklinesinker::hooks::{HookManager, HookRoots, HookState, HookStatus};
 use hooklinesinker::install::{InstalledVersion, Installer, UninstallOutcome};
 use hooklinesinker::paths;
-use hooklinesinker::processes::{SystemProcessLookup, now_rfc3339};
+use hooklinesinker::processes::{SystemProcessLiveness, SystemProcessLookup};
 use hooklinesinker::protocol::{Agent, PROTOCOL_VERSION};
 use hooklinesinker::sinks::UreqHttpClient;
-use hooklinesinker::state::{self, HealthProblem, SessionsEnvelope, StatusStore};
+use hooklinesinker::state::{self, HealthKind, HealthProblem, SessionsEnvelope, StatusStore};
 use std::io;
 
 fn main() {
@@ -60,7 +60,10 @@ fn run_ingest(agent: Agent, event: &str) {
     let input = match state::read_capped(&mut io::stdin(), 1_048_576) {
         Ok(input) => input,
         Err(e) => {
-            let _ = store.record_health(&format!("stdin read failed: {e}"));
+            let _ = store.record_health(HealthProblem::new(
+                HealthKind::Ingest,
+                format!("stdin read failed: {e}"),
+            ));
             std::process::exit(0);
         }
     };
@@ -68,7 +71,10 @@ fn run_ingest(agent: Agent, event: &str) {
     let consumers = match ConsumerStore::open(paths::state_root()) {
         Ok(consumers) => Some(consumers),
         Err(e) => {
-            let _ = store.record_health(&format!("failed to open consumer store: {e}"));
+            let _ = store.record_health(HealthProblem::new(
+                HealthKind::Other,
+                format!("failed to open consumer store: {e}"),
+            ));
             None
         }
     };
@@ -87,22 +93,24 @@ fn run_ingest(agent: Agent, event: &str) {
         consumers: consumers.as_ref(),
         http_client: &http_client,
     };
-    state::handle_ingest(&ctx, agent, event, &input, &env, hook_pid);
+    let outcome = state::handle_ingest(&ctx, agent, event, &input, &env, hook_pid);
+    // Agent hosts ignore hook stderr, so this surfaces the failure to a human running the
+    // command by hand without touching ingest's exit-0 contract.
+    if let Some(problem) = outcome.problem {
+        eprintln!("ingest problem: {problem}");
+    }
     std::process::exit(0);
 }
 
 fn run_sessions(json: bool) {
     let envelope = match StatusStore::open(paths::state_root()) {
-        Ok(store) => {
-            let liveness = SystemProcessLookup::new();
-            store.sessions_envelope(&liveness)
-        }
+        Ok(store) => store.sessions_envelope(&SystemProcessLiveness),
         Err(e) => SessionsEnvelope {
             sessions: Vec::new(),
-            problems: vec![HealthProblem {
-                observed_at: now_rfc3339(),
-                message: format!("failed to open state store: {e}"),
-            }],
+            problems: vec![HealthProblem::new(
+                HealthKind::Other,
+                format!("failed to open state store: {e}"),
+            )],
         },
     };
     if json {
@@ -119,10 +127,10 @@ fn run_sessions(json: bool) {
     } else {
         for session in envelope.sessions {
             println!(
-                "{}\t{}\t{:?}\t{}",
+                "{}\t{}\t{}\t{}",
                 session.agent.as_str(),
                 session.session.id,
-                session.phase,
+                session.phase.as_str(),
                 session.session.cwd
             );
         }
@@ -171,13 +179,12 @@ fn run_consumers(json: bool) {
 }
 
 fn run_install(consumer_name: &str, sink: Option<&str>) {
-    let consumer = Consumer {
-        name: consumer_name.to_string(),
-        protocol: PROTOCOL_VERSION,
-        capabilities: vec!["status".to_string()],
-        sink: sink.map(str::to_string),
-    };
     let result = (|| -> io::Result<InstalledVersion> {
+        let consumer = Consumer::new(
+            consumer_name,
+            vec!["status".to_string()],
+            sink.map(str::to_string),
+        )?;
         let installer = open_installer()?;
         let consumers = ConsumerStore::open(paths::state_root())?;
         installer.install_current(&consumers, &consumer)
@@ -231,7 +238,7 @@ fn run_hooks_install(agent: Agent) {
     match with_hook_manager(|hooks| hooks.install(agent)) {
         Ok(status) => print_hook_status_human(&status),
         Err(e) => {
-            eprintln!("failed to install {agent:?} hooks: {e}");
+            eprintln!("failed to install {} hooks: {e}", agent.as_str());
             std::process::exit(1);
         }
     }
@@ -241,7 +248,7 @@ fn run_hooks_uninstall(agent: Agent) {
     match with_hook_manager(|hooks| hooks.uninstall(agent)) {
         Ok(status) => print_hook_status_human(&status),
         Err(e) => {
-            eprintln!("failed to uninstall {agent:?} hooks: {e}");
+            eprintln!("failed to uninstall {} hooks: {e}", agent.as_str());
             std::process::exit(1);
         }
     }
@@ -252,7 +259,7 @@ fn run_hooks_status(agent: Agent, json: bool) {
         Ok(status) if json => print_hook_status_json(&status),
         Ok(status) => print_hook_status_human(&status),
         Err(e) => {
-            eprintln!("failed to read {agent:?} hook status: {e}");
+            eprintln!("failed to read {} hook status: {e}", agent.as_str());
             std::process::exit(1);
         }
     }
@@ -279,9 +286,9 @@ fn print_hook_status_json(status: &HookStatus) {
 
 fn print_hook_status_human(status: &HookStatus) {
     println!(
-        "[{:?}] {:?}: {}",
-        status.agent,
-        status.state,
+        "[{}] {}: {}",
+        status.agent.as_str(),
+        status.state.as_str(),
         status.path.display()
     );
 }
@@ -385,24 +392,21 @@ fn run_doctor(json: bool) {
     );
 
     match &status_store {
-        Ok(store) => {
-            let liveness = SystemProcessLookup::new();
-            match store.dead_records(&liveness) {
-                Ok(count) => checks.push(DoctorCheck {
+        Ok(store) => match store.dead_records(&SystemProcessLiveness) {
+            Ok(count) => checks.push(DoctorCheck {
+                name: "dead_records",
+                ok: true,
+                detail: count.to_string(),
+            }),
+            Err(e) => {
+                fatal = true;
+                checks.push(DoctorCheck {
                     name: "dead_records",
-                    ok: true,
-                    detail: count.to_string(),
-                }),
-                Err(e) => {
-                    fatal = true;
-                    checks.push(DoctorCheck {
-                        name: "dead_records",
-                        ok: false,
-                        detail: format!("failed to count dead records: {e}"),
-                    });
-                }
+                    ok: false,
+                    detail: format!("failed to count dead records: {e}"),
+                });
             }
-        }
+        },
         Err(_) => checks.push(DoctorCheck {
             name: "dead_records",
             ok: true,
@@ -486,12 +490,18 @@ fn doctor_hook_status() -> DoctorCheck {
             for agent in Agent::ALL {
                 match hooks.status(agent) {
                     Ok(status) => {
-                        summaries.push(format!("{agent:?}={:?}", status.state));
+                        summaries.push(format!("{}={}", agent.as_str(), status.state.as_str()));
                         if matches!(status.state, HookState::Drifted | HookState::Unsupported) {
-                            problems.push(format!("{agent:?} hooks are {:?}", status.state));
+                            problems.push(format!(
+                                "{} hooks are {}",
+                                agent.as_str(),
+                                status.state.as_str()
+                            ));
                         }
                     }
-                    Err(e) => problems.push(format!("{agent:?} hook status failed: {e}")),
+                    Err(e) => {
+                        problems.push(format!("{} hook status failed: {e}", agent.as_str()));
+                    }
                 }
             }
             DoctorCheck {
@@ -542,7 +552,7 @@ fn doctor_last_sink_error(status_store: &io::Result<StatusStore>) -> DoctorCheck
             Ok(problems) => problems
                 .iter()
                 .rev()
-                .find(|p| p.message.starts_with("sink "))
+                .find(|p| p.is_sink_failure())
                 .map_or_else(|| "none".to_string(), |p| p.message.clone()),
             Err(e) => format!("failed to read health problems: {e}"),
         },

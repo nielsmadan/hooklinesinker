@@ -21,15 +21,17 @@ session ID, host, PID, and process start time. Resuming one conversation in two
 processes therefore produces two bindings. PID reuse does not preserve a binding:
 [`SystemProcessLookup`](../src/processes.rs) checks both PID and start time. Liveness checks
 refresh the requested PID while the ledger lock is held; the earlier ancestor-discovery
-snapshot cannot classify a newly started process as dead.
+snapshot cannot classify a newly started process as dead. Only ancestor discovery needs that
+snapshot, so `sessions` and `doctor` use `SystemProcessLiveness`, which holds no process
+table at all.
 
 Ancestor detection accepts executable names and script paths under Node, Bun,
 or Deno. An unrecognized launcher can leave `process` null. A nonempty-session
 record with no process identity is retained as unverifiable diagnostic state;
 it is excluded from running results and dead counts, and a sweep leaves it alone.
 
-An empty session ID is different: the normalized event reaches sinks but never
-enters the ledger. OpenCode's load-time event uses this path so consumers can
+An empty session ID is different: `normalize` returns it as forward-only, so the event
+reaches sinks but cannot enter the ledger. OpenCode's load-time event uses this path so consumers can
 update a terminal row before a conversation ID becomes available.
 
 Foreground bindings replace one another within the same agent, PID, process start
@@ -123,8 +125,10 @@ even if another record could not be read or deleted.
 kebab-case agent names, and snake_case phases. One protocol major versions all
 consumer-facing envelopes and status records. Consumers must reject unknown
 envelope majors, skip records with unsupported majors, and surface `problems`.
-Consumers supporting future phase strings must implement their own fallback to
-`unknown`; the Rust `Phase` deserializer currently accepts only named variants.
+An unrecognized phase string deserializes to `unknown` rather than failing the record,
+so a future phase added in a protocol minor degrades instead of breaking. `Agent` has no
+such fallback and cannot get a meaningful one — an unknown agent has no hook table,
+executable names or lifecycle mapping — so accepting one is a protocol-major bump.
 
 Optional additive fields preserve compatibility. Other wire changes need a
 protocol bump and coordinated Juggler and ringleader changes. Consumers read state
@@ -136,6 +140,11 @@ never retried. Ureq configures separate 200 ms connection, response-receive, and
 body-receive timeouts; these are not a 200 ms total ingest deadline. A failed sink
 does not undo ledger updates or stop delivery attempts to the remaining sinks.
 
+The live event is always sent. A sweep backlog is unbounded — the first ingest after a
+sleep, or a crash pile-up — so the swept events that follow share a one-second fan-out
+budget, and whatever does not fit is dropped and recorded as a health problem rather than
+stalling the editor inside the host's hook timeout.
+
 ## Privacy and failures
 
 The capped raw input exists in memory while parsing. `NativeEvent` extracts
@@ -146,10 +155,18 @@ Raw payloads are never persisted or forwarded; tool inputs, outputs, and prompts
 do not enter status records. JSON errors report position without the offending
 value. A transcript path is metadata; ingest does not open the transcript.
 
-Handled ingest failures exit zero and record health when the store is available.
-Store-open and stdin-read failures return before normalization and sweeping.
-The health log retains at most 50 problems. `sessions --json` includes problems
-from the last ten minutes; `doctor` can still report an older last sink failure.
+Handled ingest failures exit zero and record health when the store is available; ingest
+also prints the joined problem to stderr, which agent hosts ignore. An event name outside
+an agent's vocabulary is itself recorded, so a vocabulary change is visible rather than
+silent. Store-open and stdin-read failures return before normalization and sweeping.
+The health log retains at most 50 problems, and a repeat of an identical problem refreshes
+its entry instead of evicting the other 49. Each problem carries a `kind` — `sink` with the
+consumer name, `ingest`, `sweep`, or `other` — which is what `doctor` classifies its
+last-sink-error check on; records written before the field read back as `other`.
+`observedAt` is parsed once, at deserialization, so an unparseable timestamp fails the
+health read and is reported rather than replaying forever as a current fault.
+`sessions --json` includes problems from the last ten minutes; `doctor` can still report an
+older last sink failure.
 Ledger writes use a lock and atomic replacement, with private state permissions.
 Session envelopes retain valid records and report unreadable or malformed records in
 `problems`; malformed health JSON is also reported, rather than treated as an empty log.

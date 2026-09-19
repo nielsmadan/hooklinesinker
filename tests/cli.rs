@@ -61,8 +61,13 @@ fn plain_version_prints_human_readable_line() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("hooklinesinker"));
-    assert!(stdout.contains('1'));
+    assert_eq!(
+        stdout,
+        format!(
+            "hooklinesinker {} (protocol 1)\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
 }
 
 #[test]
@@ -446,7 +451,7 @@ fn doctor_json_reports_ok_for_a_fresh_state_dir() {
         hook_status_check["detail"]
             .as_str()
             .unwrap()
-            .contains("Missing")
+            .contains("claude=missing")
     );
 }
 
@@ -472,30 +477,56 @@ fn doctor_does_not_fail_on_a_stale_sink_error() {
     std::fs::write(
         state_dir.join("health.json"),
         serde_json::json!([
-            {"observedAt": "2026-09-04T00:00:00Z", "message": "sink juggler failed: connection refused"}
+            {
+                "observedAt": "2026-09-04T00:00:00Z",
+                "message": "sink juggler failed: connection refused",
+                "kind": {"type": "sink", "consumer": "juggler"},
+            }
         ])
         .to_string(),
     )
     .unwrap();
 
-    let output = hooklinesinker_isolated(&temp)
+    let last_sink_error = doctor_last_sink_error(&temp);
+    assert!(last_sink_error.contains("sink juggler failed"));
+}
+
+// Records written before `kind` existed still parse; they classify as `other`, so doctor
+// reports no sink error rather than guessing from the message text.
+#[test]
+fn doctor_reads_a_health_record_that_predates_the_problem_kind() {
+    let temp = unique_temp_dir("doctor-legacy-health");
+    let state_dir = temp.join("hooklinesinker");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("health.json"),
+        serde_json::json!([
+            {"observedAt": "2026-09-04T00:00:00Z", "message": "sink juggler failed: refused"}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(doctor_last_sink_error(&temp), "none");
+}
+
+fn doctor_last_sink_error(temp: &std::path::Path) -> String {
+    let output = hooklinesinker_isolated(temp)
         .args(["doctor", "--json"])
         .output()
         .unwrap();
     assert!(output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["exitCode"], 0);
-    let checks = value["checks"].as_array().unwrap();
-    let last_sink_error = checks
+    value["checks"]
+        .as_array()
+        .unwrap()
         .iter()
         .find(|c| c["name"] == "last_sink_error")
-        .unwrap();
-    assert!(
-        last_sink_error["detail"]
-            .as_str()
-            .unwrap()
-            .contains("sink juggler failed")
-    );
+        .unwrap()["detail"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -768,4 +799,61 @@ fn json_envelopes_report_corrupt_store_files() {
         assert_eq!(problems.len(), 1);
         assert!(problems[0].to_string().contains("broken.json"));
     }
+}
+
+// The whole reason ingest swallows its failures: a hook that exits nonzero is a hook the
+// agent host reports as broken. Pinned at the binary, where the contract actually lives.
+#[test]
+fn malformed_ingest_stdin_exits_zero_and_records_health() {
+    let temp = unique_temp_dir("ingest-malformed-stdin");
+    let output = hooklinesinker_isolated(&temp)
+        .args(["ingest", "--agent", "claude", "--event", "SessionStart"])
+        .write_stdin("{not json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid native event JSON"), "{stderr}");
+
+    let health: Value =
+        serde_json::from_slice(&std::fs::read(temp.join("hooklinesinker/health.json")).unwrap())
+            .unwrap();
+    let problems = health.as_array().unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0]["kind"]["type"], "ingest");
+    assert!(
+        problems[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid native event JSON")
+    );
+    assert_eq!(
+        std::fs::read_dir(temp.join("hooklinesinker/status"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+// Oversized stdin is rejected before the store is even consulted, and still exits zero.
+#[test]
+fn oversized_ingest_stdin_exits_zero_and_records_health() {
+    let temp = unique_temp_dir("ingest-oversized-stdin");
+    let output = hooklinesinker_isolated(&temp)
+        .args(["ingest", "--agent", "claude", "--event", "SessionStart"])
+        .write_stdin("a".repeat(1_048_577))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let health: Value =
+        serde_json::from_slice(&std::fs::read(temp.join("hooklinesinker/health.json")).unwrap())
+            .unwrap();
+    assert!(
+        health.as_array().unwrap()[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stdin exceeded the 1048576-byte cap")
+    );
 }

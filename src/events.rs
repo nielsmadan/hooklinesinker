@@ -7,6 +7,16 @@ pub enum EventAction {
     Remove,
 }
 
+// The spec table stores `Option<EventAction>` because an installed hook may carry no
+// phase. A lookup has one more answer than that: the name may not be in the table at
+// all, which means the agent's event vocabulary moved and we are silently missing updates.
+#[derive(Clone, Copy)]
+pub enum EventLookup {
+    Mapped(EventAction),
+    Unmapped,
+    Unrecognized,
+}
+
 pub struct EventSpec {
     pub name: &'static str,
     pub matcher: Option<&'static str>,
@@ -119,28 +129,33 @@ pub const fn native_event_specs(agent: Agent) -> &'static [EventSpec] {
     }
 }
 
-pub fn native_event_action(
+pub fn native_event_lookup(
     agent: Agent,
     event: &str,
     tool_name: Option<&str>,
     notification_type: Option<&str>,
-) -> Option<EventAction> {
+) -> EventLookup {
+    use EventLookup::{Mapped, Unmapped, Unrecognized};
+    // A notification type outside the mapped set is unmapped, not unrecognized: the hook
+    // itself is installed and expected, only this instance carries no phase.
     match (agent, event) {
         (Agent::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
-            return Some(Update(Phase::Idle));
+            return Mapped(Update(Phase::Idle));
         }
         (Agent::Droid, "Notification") => {
             return match notification_type {
-                Some("permission_prompt" | "elicitation_dialog") => Some(Update(Phase::Permission)),
-                Some("idle_prompt") => Some(Update(Phase::Idle)),
-                _ => None,
+                Some("permission_prompt" | "elicitation_dialog") => {
+                    Mapped(Update(Phase::Permission))
+                }
+                Some("idle_prompt") => Mapped(Update(Phase::Idle)),
+                _ => Unmapped,
             };
         }
         (Agent::Qwen, "Notification") => {
             return match notification_type {
-                Some("permission_prompt") => Some(Update(Phase::Permission)),
-                Some("idle_prompt") => Some(Update(Phase::Idle)),
-                _ => None,
+                Some("permission_prompt") => Mapped(Update(Phase::Permission)),
+                Some("idle_prompt") => Mapped(Update(Phase::Idle)),
+                _ => Unmapped,
             };
         }
         _ => {}
@@ -148,6 +163,6 @@ pub fn native_event_action(
 
     native_event_specs(agent)
         .iter()
-        .find(|spec| spec.name == event)?
-        .action
+        .find(|spec| spec.name == event)
+        .map_or(Unrecognized, |spec| spec.action.map_or(Unmapped, Mapped))
 }

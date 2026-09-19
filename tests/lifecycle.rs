@@ -1,6 +1,6 @@
 use hooklinesinker::consumers::{Consumer, ConsumerStore};
 use hooklinesinker::normalize::{HookEnvironment, normalize};
-use hooklinesinker::processes::ProcessLookup;
+use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
 use hooklinesinker::protocol::{Agent, Phase, ProcessIdentity, StatusEvent};
 use hooklinesinker::sinks::HttpClient;
 use hooklinesinker::state::{IngestContext, StatusStore, handle_ingest};
@@ -16,13 +16,15 @@ struct Owner {
     shared: bool,
 }
 
+impl ProcessLiveness for Owner {
+    fn process_is_alive(&self, _: &ProcessIdentity) -> bool {
+        true
+    }
+}
+
 impl ProcessLookup for Owner {
     fn owner_of(&self, _: u32, _: Agent) -> Option<ProcessIdentity> {
         Some(self.identity.clone())
-    }
-
-    fn is_alive(&self, _: &ProcessIdentity) -> bool {
-        true
     }
 
     fn has_exclusive_session(&self, _: &ProcessIdentity, _: Agent) -> bool {
@@ -134,6 +136,7 @@ impl Fixture {
             Some(self.owner.identity.clone()),
         )
         .unwrap()
+        .into_event()
         .unwrap();
         let mut stored = serde_json::to_value(&event).unwrap();
         stored
@@ -469,10 +472,14 @@ fn invalid_lifecycle_metadata_preserves_the_current_session() {
             &HookEnvironment::default(),
             100,
         );
-        assert_eq!(
-            outcome.problem.as_deref(),
-            Some("invalid lifecycle metadata")
+        let problem = outcome.problem.unwrap();
+        assert!(
+            problem.starts_with("invalid lifecycle metadata at line "),
+            "{problem}"
         );
+        // The offending value never reaches the diagnostic.
+        assert!(!problem.contains("private"), "{problem}");
+        assert!(!problem.contains("payload"), "{problem}");
         assert_eq!(fixture.ids(), ["a"]);
         assert_eq!(fixture.bodies(), before);
     }

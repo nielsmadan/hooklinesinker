@@ -18,6 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `--experimental-strip-types` landed in 22.6; the adapters are `.ts`.
 const MIN_NODE: (u32, u32) = (22, 6);
 
+// Both adapters set HOOK_TIMEOUT_MS to this; a regression in either shows up as a hang.
+const ADAPTER_HOOK_TIMEOUT_MS: u64 = 2_000;
+// The adapter's own timeout plus process spawn and kill on a loaded CI box.
+const HANG_BUDGET_MS: u64 = ADAPTER_HOOK_TIMEOUT_MS + 3_000;
+
 const PI_ADAPTER: &str = "adapters/pi-hooklinesinker.ts";
 const OPENCODE_ADAPTER: &str = "adapters/opencode-hooklinesinker.ts";
 
@@ -368,8 +373,8 @@ fn pi_a_hanging_binary_cannot_block_the_adapter() {
     // can end the call, and the harness watchdog fails the run if they don't.
     assert_eq!(run.events(), ["session_start"]);
     assert!(
-        run.elapsed_ms < 9_000,
-        "adapter took {}ms to give up on a hanging binary",
+        run.elapsed_ms < HANG_BUDGET_MS,
+        "adapter took {}ms to give up on a hanging binary, budget is {HANG_BUDGET_MS}ms",
         run.elapsed_ms
     );
 }
@@ -465,8 +470,8 @@ fn opencode_a_hanging_binary_cannot_block_the_adapter() {
     };
     assert_eq!(run.events(), ["session.created"]);
     assert!(
-        run.elapsed_ms < 9_000,
-        "adapter took {}ms to give up on a hanging binary",
+        run.elapsed_ms < HANG_BUDGET_MS,
+        "adapter took {}ms to give up on a hanging binary, budget is {HANG_BUDGET_MS}ms",
         run.elapsed_ms
     );
 }

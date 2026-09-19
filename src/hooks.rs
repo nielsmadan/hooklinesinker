@@ -23,6 +23,17 @@ pub enum HookState {
     Unsupported,
 }
 
+impl HookState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Installed => "installed",
+            Self::Drifted => "drifted",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookEntry {

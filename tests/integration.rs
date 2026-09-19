@@ -2,13 +2,13 @@ use hooklinesinker::consumers::{Consumer, ConsumerStore};
 use hooklinesinker::environment::{self, EnvSource};
 use hooklinesinker::hooks::{HookManager, HookRoots, HookState};
 use hooklinesinker::install::{Candidate, Installer, SemVer};
-use hooklinesinker::normalize::{HookEnvironment, normalize};
-use hooklinesinker::processes::ProcessLookup;
+use hooklinesinker::normalize::{HookEnvironment, Normalized, normalize};
+use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
 use hooklinesinker::protocol::{
     Agent, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity, StatusEvent,
 };
 use hooklinesinker::sinks::{HttpClient, SinkFanout};
-use hooklinesinker::state::{self, StatusStore};
+use hooklinesinker::state::{self, HealthKind, HealthProblem, StatusStore};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -141,12 +141,15 @@ fn status(session_id: &str, pid: u32, started_at: u64) -> StatusEvent {
 
 struct AllAlive;
 
+impl ProcessLiveness for AllAlive {
+    fn process_is_alive(&self, _identity: &ProcessIdentity) -> bool {
+        true
+    }
+}
+
 impl ProcessLookup for AllAlive {
     fn owner_of(&self, _hook_pid: u32, _agent: Agent) -> Option<ProcessIdentity> {
         None
-    }
-    fn is_alive(&self, _identity: &ProcessIdentity) -> bool {
-        true
     }
 }
 
@@ -186,16 +189,19 @@ impl FakeProcessLookup {
     }
 }
 
-impl ProcessLookup for FakeProcessLookup {
-    fn owner_of(&self, _hook_pid: u32, _agent: Agent) -> Option<ProcessIdentity> {
-        self.owner.clone()
-    }
-    fn is_alive(&self, identity: &ProcessIdentity) -> bool {
+impl ProcessLiveness for FakeProcessLookup {
+    fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
         self.alive
             .lock()
             .unwrap()
             .get(&identity.pid)
             .is_some_and(|started_at| started_at == &identity.started_at)
+    }
+}
+
+impl ProcessLookup for FakeProcessLookup {
+    fn owner_of(&self, _hook_pid: u32, _agent: Agent) -> Option<ProcessIdentity> {
+        self.owner.clone()
     }
 }
 
@@ -266,6 +272,15 @@ fn test_process() -> ProcessIdentity {
 }
 
 fn normalize_for_test(agent: Agent, event: &str, native: &str) -> StatusEvent {
+    match normalized_for_test(agent, event, native) {
+        Normalized::Recordable(event) | Normalized::ForwardOnly(event) => event,
+        Normalized::Ignored | Normalized::Unrecognized => {
+            panic!("{agent:?} {event} should map to a status event")
+        }
+    }
+}
+
+fn normalized_for_test(agent: Agent, event: &str, native: &str) -> Normalized {
     normalize(
         agent,
         event,
@@ -274,7 +289,6 @@ fn normalize_for_test(agent: Agent, event: &str, native: &str) -> StatusEvent {
         Some(test_process()),
     )
     .expect("normalize should succeed")
-    .expect("event should not be ignored")
 }
 
 const fn generic_native_json() -> &'static str {
@@ -503,16 +517,10 @@ fn codex_stop_remains_idle_and_running_rather_than_ending() {
 }
 
 #[test]
-fn claude_subagent_stop_is_ignored_to_avoid_racing_the_parent_stop() {
-    let result = normalize(
-        Agent::Claude,
-        "SubagentStop",
-        generic_native_json(),
-        &test_environment(),
-        Some(test_process()),
-    )
-    .unwrap();
-    assert!(result.is_none());
+fn claude_subagent_stop_is_outside_the_installed_vocabulary() {
+    // Never installed, so it only arrives hand-wired; either way it must not race the parent Stop.
+    let result = normalized_for_test(Agent::Claude, "SubagentStop", generic_native_json());
+    assert!(matches!(result, Normalized::Unrecognized));
 }
 
 #[test]
@@ -532,28 +540,15 @@ fn droid_notification_type_selects_the_right_phase() {
 #[test]
 fn droid_notification_auth_success_is_ignored() {
     let native = r#"{"session_id":"s","notification_type":"auth_success"}"#;
-    let result = normalize(
-        Agent::Droid,
-        "Notification",
-        native,
-        &test_environment(),
-        Some(test_process()),
-    )
-    .unwrap();
-    assert!(result.is_none());
+    let result = normalized_for_test(Agent::Droid, "Notification", native);
+    // The hook is installed and expected; only this notification type carries no phase.
+    assert!(matches!(result, Normalized::Ignored));
 }
 
 #[test]
-fn droid_subagent_stop_is_ignored() {
-    let result = normalize(
-        Agent::Droid,
-        "SubagentStop",
-        generic_native_json(),
-        &test_environment(),
-        Some(test_process()),
-    )
-    .unwrap();
-    assert!(result.is_none());
+fn droid_subagent_stop_is_outside_the_installed_vocabulary() {
+    let result = normalized_for_test(Agent::Droid, "SubagentStop", generic_native_json());
+    assert!(matches!(result, Normalized::Unrecognized));
 }
 
 #[test]
@@ -572,32 +567,22 @@ fn qwen_notification_type_selects_the_right_phase() {
 #[test]
 fn qwen_notification_auth_success_is_ignored() {
     let native = r#"{"session_id":"s","notification_type":"auth_success"}"#;
-    let result = normalize(
-        Agent::Qwen,
-        "Notification",
-        native,
-        &test_environment(),
-        Some(test_process()),
-    )
-    .unwrap();
-    assert!(result.is_none());
+    let result = normalized_for_test(Agent::Qwen, "Notification", native);
+    assert!(matches!(result, Normalized::Ignored));
 }
 
 #[test]
-fn qwen_session_delete_is_ignored_since_it_names_a_different_sessions_id() {
-    let result = normalize(
+fn qwen_session_delete_is_not_tracked_since_it_names_a_different_sessions_id() {
+    let result = normalized_for_test(
         Agent::Qwen,
         "SessionDelete",
         r#"{"deleted_session_id":"some-other-session"}"#,
-        &test_environment(),
-        Some(test_process()),
-    )
-    .unwrap();
-    assert!(result.is_none());
+    );
+    assert!(matches!(result, Normalized::Unrecognized));
 }
 
 #[test]
-fn qwen_unregistered_events_are_ignored() {
+fn qwen_unregistered_events_are_reported_as_unrecognized() {
     let events = [
         "MessageDisplay",
         "TodoCreated",
@@ -606,20 +591,13 @@ fn qwen_unregistered_events_are_ignored() {
         "SubagentStop",
     ];
     for event in events {
-        let result = normalize(
-            Agent::Qwen,
-            event,
-            generic_native_json(),
-            &test_environment(),
-            Some(test_process()),
-        )
-        .unwrap();
-        assert!(result.is_none(), "{event}");
+        let result = normalized_for_test(Agent::Qwen, event, generic_native_json());
+        assert!(matches!(result, Normalized::Unrecognized), "{event}");
     }
 }
 
 #[test]
-fn kimi_unregistered_events_are_ignored() {
+fn kimi_unregistered_events_are_reported_as_unrecognized() {
     let events = [
         "UserPromptQueued",
         "TaskStarted",
@@ -629,29 +607,15 @@ fn kimi_unregistered_events_are_ignored() {
         "SessionHeartbeat",
     ];
     for event in events {
-        let result = normalize(
-            Agent::Kimi,
-            event,
-            generic_native_json(),
-            &test_environment(),
-            Some(test_process()),
-        )
-        .unwrap();
-        assert!(result.is_none(), "{event}");
+        let result = normalized_for_test(Agent::Kimi, event, generic_native_json());
+        assert!(matches!(result, Normalized::Unrecognized), "{event}");
     }
 }
 
 #[test]
-fn unknown_events_are_ignored() {
-    let result = normalize(
-        Agent::Claude,
-        "TotallyUnknownEvent",
-        generic_native_json(),
-        &test_environment(),
-        Some(test_process()),
-    )
-    .unwrap();
-    assert!(result.is_none());
+fn unknown_events_are_reported_as_unrecognized() {
+    let result = normalized_for_test(Agent::Claude, "TotallyUnknownEvent", generic_native_json());
+    assert!(matches!(result, Normalized::Unrecognized));
 }
 
 #[test]
@@ -686,6 +650,23 @@ fn stdin_at_or_under_the_cap_is_accepted() {
     let mut reader = std::io::Cursor::new(b"{}".to_vec());
     let result = state::read_capped(&mut reader, 1_048_576).unwrap();
     assert_eq!(result, "{}");
+}
+
+// The two sides of the cap, so an off-by-one in `take`/`>` cannot pass both.
+#[test]
+fn stdin_of_exactly_the_cap_is_accepted() {
+    const LIMIT: usize = 1_048_576;
+    let mut reader = std::io::Cursor::new(vec![b'a'; LIMIT]);
+    let result = state::read_capped(&mut reader, LIMIT as u64).unwrap();
+    assert_eq!(result.len(), LIMIT);
+}
+
+#[test]
+fn stdin_one_byte_over_the_cap_is_rejected() {
+    const LIMIT: usize = 1_048_576;
+    let mut reader = std::io::Cursor::new(vec![b'a'; LIMIT + 1]);
+    let result = state::read_capped(&mut reader, LIMIT as u64);
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -1082,6 +1063,7 @@ fn a_populated_environment_lands_on_the_normalized_status_event() {
         Some(test_process()),
     )
     .unwrap()
+    .into_event()
     .unwrap();
 
     assert_eq!(
@@ -1135,7 +1117,12 @@ fn sessions_envelope_omits_a_dead_binding_but_leaves_it_for_the_sweep() {
 #[test]
 fn sessions_envelope_includes_recorded_health_problems() {
     let store = store();
-    store.record_health("a prior operational failure").unwrap();
+    store
+        .record_health(HealthProblem::new(
+            HealthKind::Other,
+            "a prior operational failure",
+        ))
+        .unwrap();
     let liveness = all_alive();
     let envelope = store.sessions_envelope(&liveness);
     assert_eq!(envelope.problems.len(), 1);
@@ -1541,12 +1528,14 @@ fn claude_foreground_activity_preserves_fork_startups() {
 #[test]
 fn claude_replacement_preserves_other_bindings() {
     struct OwnerAlive(ProcessIdentity);
+    impl ProcessLiveness for OwnerAlive {
+        fn process_is_alive(&self, _: &ProcessIdentity) -> bool {
+            true
+        }
+    }
     impl ProcessLookup for OwnerAlive {
         fn owner_of(&self, _: u32, _: Agent) -> Option<ProcessIdentity> {
             Some(self.0.clone())
-        }
-        fn is_alive(&self, _: &ProcessIdentity) -> bool {
-            true
         }
     }
 
@@ -1852,10 +1841,13 @@ fn claude_end_retains_a_guard_until_process_exit_without_duplicate_removals() {
     liveness.set_dead(process.pid);
     assert_eq!(store.dead_records(&liveness).unwrap(), 0);
     assert_eq!(ledger_files(&root), 1);
+    // An event outside Claude's vocabulary is reported, and still drives the sweep.
+    let outcome = ingest(&ctx, Agent::Claude, "Unknown", "{}", process.pid);
     assert!(
-        ingest(&ctx, Agent::Claude, "Unknown", "{}", process.pid)
+        outcome
             .problem
-            .is_none()
+            .unwrap()
+            .contains("unrecognized claude event")
     );
     assert_eq!(client.bodies(), before);
     assert_eq!(ledger_files(&root), 0);
@@ -2232,6 +2224,7 @@ fn opencode_adapter_stdin_shape_normalizes_with_its_explicit_cwd() {
         Some(test_process()),
     )
     .unwrap()
+    .into_event()
     .unwrap();
     assert_eq!(event.phase, Phase::Working);
     assert_eq!(event.session.id, "opencode-session");
@@ -2240,16 +2233,10 @@ fn opencode_adapter_stdin_shape_normalizes_with_its_explicit_cwd() {
 
 #[test]
 fn opencode_adapter_synthetic_session_created_has_no_session_id_yet() {
-    let native = "{}";
-    let event = normalize(
-        Agent::Opencode,
-        "session.created",
-        native,
-        &test_environment(),
-        Some(test_process()),
-    )
-    .unwrap()
-    .unwrap();
+    let result = normalized_for_test(Agent::Opencode, "session.created", "{}");
+    let Normalized::ForwardOnly(event) = result else {
+        panic!("an event without a session id must never be recordable");
+    };
     assert_eq!(event.phase, Phase::Idle);
     assert_eq!(event.session.id, "");
 }
@@ -2265,6 +2252,7 @@ fn pi_adapter_stdin_shape_omits_cwd_and_falls_back_to_the_hook_environment() {
         Some(test_process()),
     )
     .unwrap()
+    .into_event()
     .unwrap();
     assert_eq!(event.phase, Phase::Working);
     assert_eq!(event.session.id, "pi-session");
@@ -2409,7 +2397,9 @@ fn partial_sweep_failure_still_delivers_successful_removals() {
         fn owner_of(&self, _: u32, _: Agent) -> Option<ProcessIdentity> {
             None
         }
-        fn is_alive(&self, identity: &ProcessIdentity) -> bool {
+    }
+    impl ProcessLiveness for FailingUnlink {
+        fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
             let check = self.checks.get();
             self.checks.set(check + 1);
             if check == 1 {
@@ -2460,6 +2450,13 @@ fn partial_sweep_failure_still_delivers_successful_removals() {
             .unwrap()
             .contains("failed to remove status record")
     );
+    let problems = store.health_problems().unwrap();
+    assert_eq!(problems.len(), 2);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.message.contains("unrecognized claude event"))
+    );
     let bodies = client.bodies();
     assert_eq!(bodies.len(), 2);
     let mut delivered: Vec<_> = bodies
@@ -2476,7 +2473,6 @@ fn partial_sweep_failure_still_delivers_successful_removals() {
         assert_eq!(event["running"], false);
         assert_eq!(event["event"], "swept");
     }
-    assert_eq!(store.health_problems().unwrap().len(), 1);
     assert_eq!(ledger_files(&root), 1);
 }
 
@@ -2514,5 +2510,148 @@ fn damaged_consumer_record_reports_health_while_valid_sink_receives_event() {
         store.health_problems().unwrap()[0]
             .message
             .contains("broken.json")
+    );
+}
+
+#[test]
+fn an_identical_repeated_problem_refreshes_its_entry_instead_of_evicting_others() {
+    let store = store();
+    store
+        .record_health(HealthProblem::new(HealthKind::Ingest, "a recurring fault"))
+        .unwrap();
+    store
+        .record_health(HealthProblem::new(HealthKind::Other, "something else"))
+        .unwrap();
+    for _ in 0..80 {
+        store
+            .record_health(HealthProblem::new(HealthKind::Ingest, "a recurring fault"))
+            .unwrap();
+    }
+
+    let problems = store.health_problems().unwrap();
+    let messages: Vec<&str> = problems.iter().map(|p| p.message.as_str()).collect();
+    assert_eq!(messages, ["something else", "a recurring fault"]);
+}
+
+#[test]
+fn the_same_message_under_a_different_kind_is_a_separate_problem() {
+    let store = store();
+    store
+        .record_health(HealthProblem::new(HealthKind::Ingest, "same words"))
+        .unwrap();
+    store
+        .record_health(HealthProblem::new(HealthKind::Sweep, "same words"))
+        .unwrap();
+    assert_eq!(store.health_problems().unwrap().len(), 2);
+}
+
+#[test]
+fn a_sink_failure_is_classified_by_kind_not_by_its_message_wording() {
+    let store = store();
+    store
+        .record_health(HealthProblem::new(
+            HealthKind::Sink {
+                consumer: "juggler".into(),
+            },
+            "anything at all",
+        ))
+        .unwrap();
+    store
+        .record_health(HealthProblem::new(
+            HealthKind::Ingest,
+            "sink juggler failed: a message that only looks like one",
+        ))
+        .unwrap();
+
+    let problems = store.health_problems().unwrap();
+    let sink: Vec<&str> = problems
+        .iter()
+        .filter(|p| p.is_sink_failure())
+        .map(|p| p.message.as_str())
+        .collect();
+    assert_eq!(sink, ["anything at all"]);
+}
+
+// A timestamp is parsed once, at deserialization. An unparseable one fails the read and is
+// reported, rather than defaulting to "recent" and replaying as a current fault forever.
+#[test]
+fn a_malformed_health_timestamp_is_reported_instead_of_replaying_as_current() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    std::fs::write(
+        root.join("health.json"),
+        r#"[{"observedAt":"not a timestamp","message":"ancient fault"}]"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.health_problems().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    let envelope = store.sessions_envelope(&all_alive());
+    assert_eq!(envelope.problems.len(), 1);
+    assert!(
+        envelope.problems[0]
+            .message
+            .contains("failed to read health problems")
+    );
+}
+
+// A sweep backlog is unbounded and each send costs real time, so fan-out stops at its budget
+// rather than holding the editor hostage inside a 3s hook window.
+#[test]
+fn a_slow_sink_cannot_stretch_a_sweep_backlog_past_the_fanout_budget() {
+    struct SlowHttpClient {
+        calls: Mutex<usize>,
+    }
+
+    impl HttpClient for SlowHttpClient {
+        fn post_json(&self, _url: &str, _body: &[u8]) -> Result<u16, String> {
+            *self.calls.lock().unwrap() += 1;
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Ok(200)
+        }
+    }
+
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    let liveness = FakeProcessLookup::new();
+    for pid in 900..940 {
+        store.record(&status("backlog", pid, 90)).unwrap();
+    }
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "sink",
+            &["status"],
+            Some("http://localhost/hook"),
+        ))
+        .unwrap();
+    let client = SlowHttpClient {
+        calls: Mutex::new(0),
+    };
+    let ctx = state::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+
+    let started = std::time::Instant::now();
+    ingest(&ctx, Agent::Claude, "Stop", r#"{"session_id":"live"}"#, 1);
+    let elapsed = started.elapsed();
+
+    let sent = *client.calls.lock().unwrap();
+    assert!(sent < 40, "every one of 40 swept events was delivered");
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "fan-out took {elapsed:?}, which no longer fits a hook budget"
+    );
+    let problems = store.health_problems().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.message.contains("swept event(s) were not delivered")),
+        "the dropped events were not recorded: {problems:?}"
     );
 }

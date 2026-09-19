@@ -33,7 +33,16 @@ impl SessionContext {
     }
 
     pub(crate) fn parse(agent: Agent, event: &str, input: &str) -> io::Result<Self> {
-        let invalid = |_| io::Error::new(io::ErrorKind::InvalidData, "invalid lifecycle metadata");
+        let invalid = |e: serde_json::Error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid lifecycle metadata at line {} column {}",
+                    e.line(),
+                    e.column()
+                ),
+            )
+        };
         match agent {
             Agent::Pi => {
                 let context: PiContext = serde_json::from_str(input).map_err(invalid)?;
