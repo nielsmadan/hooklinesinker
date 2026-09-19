@@ -19,13 +19,12 @@ fn main() {
     match cli.command {
         Command::Version { json } => print_version(json),
         Command::Ingest { agent, event } => run_ingest(agent, &event),
-        Command::Sessions { json: true } => run_sessions_json(),
-        Command::Consumers { json: true } => run_consumers_json(),
+        Command::Sessions { json } => run_sessions(json),
+        Command::Consumers { json } => run_consumers(json),
         Command::Doctor { json } => run_doctor(json),
         Command::Install { consumer, sink } => run_install(&consumer, sink.as_deref()),
         Command::Uninstall { consumer } => run_uninstall(&consumer),
         Command::Hooks { command } => run_hooks(command),
-        _ => not_implemented(),
     }
 }
 
@@ -92,7 +91,7 @@ fn run_ingest(agent: Agent, event: &str) {
     std::process::exit(0);
 }
 
-fn run_sessions_json() {
+fn run_sessions(json: bool) {
     let envelope = match StatusStore::open(paths::state_root()) {
         Ok(store) => {
             let liveness = SystemProcessLookup::new();
@@ -106,15 +105,34 @@ fn run_sessions_json() {
             }],
         },
     };
-    let json = serde_json::json!({
-        "protocol": PROTOCOL_VERSION,
-        "sessions": envelope.sessions,
-        "problems": envelope.problems,
-    });
-    println!("{json}");
+    if json {
+        let json = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "sessions": envelope.sessions,
+            "problems": envelope.problems,
+        });
+        println!("{json}");
+        return;
+    }
+    if envelope.sessions.is_empty() {
+        println!("no running sessions");
+    } else {
+        for session in envelope.sessions {
+            println!(
+                "{}\t{}\t{:?}\t{}",
+                session.agent.as_str(),
+                session.session.id,
+                session.phase,
+                session.session.cwd
+            );
+        }
+    }
+    for problem in envelope.problems {
+        eprintln!("problem: {}", problem.message);
+    }
 }
 
-fn run_consumers_json() {
+fn run_consumers(json: bool) {
     let (consumers, problems) = match ConsumerStore::open(paths::state_root()) {
         Ok(store) => match store.snapshot() {
             Ok(snapshot) => (snapshot.consumers, snapshot.problems),
@@ -125,12 +143,31 @@ fn run_consumers_json() {
             vec![format!("failed to open consumer store: {e}")],
         ),
     };
-    let json = serde_json::json!({
-        "protocol": PROTOCOL_VERSION,
-        "consumers": consumers,
-        "problems": problems,
-    });
-    println!("{json}");
+    if json {
+        let json = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "consumers": consumers,
+            "problems": problems,
+        });
+        println!("{json}");
+        return;
+    }
+    if consumers.is_empty() {
+        println!("no registered consumers");
+    } else {
+        for consumer in consumers {
+            let sink = consumer.sink.as_deref().unwrap_or("poll");
+            println!(
+                "{}\tprotocol {}\t{}\t{sink}",
+                consumer.name,
+                consumer.protocol,
+                consumer.capabilities.join(",")
+            );
+        }
+    }
+    for problem in problems {
+        eprintln!("problem: {problem}");
+    }
 }
 
 fn run_install(consumer_name: &str, sink: Option<&str>) {
@@ -438,11 +475,6 @@ fn permissions_check(_root: &std::path::Path) -> DoctorCheck {
         ok: true,
         detail: "permission checks apply only on unix".to_string(),
     }
-}
-
-fn not_implemented() -> ! {
-    eprintln!("not implemented yet");
-    std::process::exit(2);
 }
 
 fn doctor_hook_status() -> DoctorCheck {

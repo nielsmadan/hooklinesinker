@@ -66,23 +66,27 @@ fn plain_version_prints_human_readable_line() {
 }
 
 #[test]
-fn unimplemented_subcommands_exit_two_with_stderr_message() {
-    let cases: &[&[&str]] = &[&["sessions"], &["consumers"]];
+fn plain_sessions_and_consumers_report_empty_state() {
+    let temp = unique_temp_dir("plain-empty");
+    let sessions = hooklinesinker_isolated(&temp)
+        .args(["sessions"])
+        .output()
+        .unwrap();
+    assert!(sessions.status.success());
+    assert_eq!(
+        String::from_utf8(sessions.stdout).unwrap(),
+        "no running sessions\n"
+    );
 
-    for args in cases {
-        let output = Command::cargo_bin("hooklinesinker")
-            .unwrap()
-            .args(*args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
-        assert_eq!(
-            String::from_utf8(output.stderr).unwrap(),
-            "not implemented yet\n",
-            "args: {args:?}"
-        );
-        assert!(output.stdout.is_empty(), "args: {args:?}");
-    }
+    let consumers = hooklinesinker_isolated(&temp)
+        .args(["consumers"])
+        .output()
+        .unwrap();
+    assert!(consumers.status.success());
+    assert_eq!(
+        String::from_utf8(consumers.stdout).unwrap(),
+        "no registered consumers\n"
+    );
 }
 
 #[test]

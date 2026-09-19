@@ -49,14 +49,17 @@ See [installation](docs/installation.md) for the three installation lifecycles.
 
 ```sh
 hooklinesinker version [--json]                  # version + protocol major
-hooklinesinker sessions --json                   # every live session (the point of all this)
-hooklinesinker consumers --json                  # who is registered
+hooklinesinker sessions [--json]                 # every live session (the point of all this)
+hooklinesinker consumers [--json]                # who is registered
 hooklinesinker doctor [--json]                   # every self-check; nonzero on a real fault
 hooklinesinker install --consumer NAME [--sink URL]
 hooklinesinker uninstall --consumer NAME
 hooklinesinker hooks install|status|uninstall --agent claude|codex|opencode|pi|droid|qwen|kimi
 hooklinesinker ingest --agent AGENT --event EVENT   # what the installed hooks call
 ```
+
+`sessions` and `consumers` print a human-readable summary by default. Use `--json` for the
+versioned consumer interface.
 
 ## Protocol 1
 
