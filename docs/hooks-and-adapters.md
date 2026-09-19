@@ -84,7 +84,8 @@ Session starts forward their native `reason` so resumes can reactivate retired b
 new and fork starts replace the previous foreground binding. `agent_settled` marks idle;
 manual compaction returns to idle, other compaction to working. Permission prompts stay pending until eligible decisions clear them all;
 settlement clears pending prompts. Only a shutdown with reason `quit` emits
-removal. Every shutdown drains hooks and unsubscribes permission listeners.
+removal. Every shutdown drains hooks and clears pending prompts; permission listeners remain
+registered so new, resumed, forked and reloaded sessions continue reporting permission state.
 
 ## Validation
 

@@ -119,14 +119,14 @@ export default function (pi: PiHost) {
     ].includes(event.resolution);
   }
 
-  const unsubscribePermissionPrompt = pi.events.on("permissions:ui_prompt", (event) => {
+  pi.events.on("permissions:ui_prompt", (event) => {
     if (!isUISession) return;
     const requestId = permissionRequestId(event);
     if (!requestId) return;
     pendingPermissionRequestIds.add(requestId);
     void queueHook("permission_prompt", currentSessionId);
   });
-  const unsubscribePermissionDecision = pi.events.on("permissions:decision", (event) => {
+  pi.events.on("permissions:decision", (event) => {
     if (!isUISession || !isPromptDecision(event)) return;
     const requestId = pendingPermissionRequestIds.values().next().value;
     if (typeof requestId !== "string") return;
@@ -169,8 +169,6 @@ export default function (pi: PiHost) {
   // Session switches are reconciled by the next session_start.
   pi.on("session_shutdown", async (event, ctx) => {
     const id = isUISession ? rememberSessionId(ctx) : undefined;
-    unsubscribePermissionPrompt();
-    unsubscribePermissionDecision();
     pendingPermissionRequestIds.clear();
     currentSessionId = undefined;
     if (isUISession && event?.reason === "quit") {

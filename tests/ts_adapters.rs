@@ -265,8 +265,27 @@ fn pi_prompt_and_decision_produce_the_permission_lifecycle() {
         run.registered_channels,
         ["permissions:ui_prompt", "permissions:decision"]
     );
-    // Shutdown unsubscribes both channels, so a later prompt cannot reach a dead session.
-    assert!(run.subscribed_channels.is_empty());
+    assert_eq!(
+        run.subscribed_channels,
+        ["permissions:ui_prompt", "permissions:decision"]
+    );
+}
+
+#[test]
+fn pi_permission_lifecycle_survives_session_switches() {
+    let Some(run) = run("pi:permission_after_switch") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "session_start",
+            "permission_prompt",
+            "permission_resolved"
+        ]
+    );
+    assert_eq!(run.stdin(2)["session_id"], "pi-resumed");
 }
 
 #[test]

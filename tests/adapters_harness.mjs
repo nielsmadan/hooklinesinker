@@ -126,6 +126,20 @@ async function runPi(scenario, adapterPath, invocations) {
       await shutdown("reload");
       break;
 
+    case "pi:permission_after_switch": {
+      await start();
+      await shutdown("resume");
+      const resumed = {
+        hasUI: true,
+        sessionManager: { getSessionId: () => "pi-resumed" },
+      };
+      await start(resumed, "resume");
+      prompt("prompt-1");
+      decide("user_approved");
+      await shutdown("reload", resumed);
+      break;
+    }
+
     case "pi:malformed_permission_payloads":
       await start();
       for (const event of [null, 1, "prompt", [], { requestId: 42 }]) {
@@ -273,6 +287,7 @@ const SCENARIOS = [
   [PI_ADAPTER, "pi:session_switches"],
   [PI_ADAPTER, "pi:start_without_reason"],
   [PI_ADAPTER, "pi:permission_lifecycle"],
+  [PI_ADAPTER, "pi:permission_after_switch"],
   [PI_ADAPTER, "pi:malformed_permission_payloads"],
   [PI_ADAPTER, "pi:silent_and_orphan_decisions"],
   [PI_ADAPTER, "pi:settled_discards_prompts"],
