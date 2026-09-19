@@ -6,21 +6,11 @@ pub trait ProcessLiveness {
     fn process_is_alive(&self, identity: &ProcessIdentity) -> bool;
 }
 
-pub trait ProcessOwnerResolver {
-    fn resolve_owner(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
-}
-
 pub trait ProcessLookup {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
     fn is_alive(&self, identity: &ProcessIdentity) -> bool;
     fn has_exclusive_session(&self, _identity: &ProcessIdentity, _agent: Agent) -> bool {
         true
-    }
-}
-
-impl<T: ProcessLookup + ?Sized> ProcessOwnerResolver for T {
-    fn resolve_owner(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity> {
-        ProcessLookup::owner_of(self, hook_pid, agent)
     }
 }
 

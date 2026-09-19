@@ -224,6 +224,7 @@ impl Installer {
         consumers: &ConsumerStore,
         consumer: &Consumer,
     ) -> io::Result<InstalledVersion> {
+        consumer.validate()?;
         let current_exe = std::env::current_exe()?;
         let candidate = Candidate::current(current_exe)?;
         let _guard = self.lock()?;
@@ -437,6 +438,20 @@ mod tests {
         install.install_current(&consumers, &consumer).unwrap();
         assert!(install.binary_path().exists());
         assert_eq!(consumers.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn install_current_validates_the_consumer_before_activation() {
+        let install = installation();
+        let consumers = ConsumerStore::open(temp_root("consumers-invalid")).unwrap();
+        let consumer = Consumer {
+            name: "Invalid".to_string(),
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            capabilities: vec!["status".to_string()],
+            sink: None,
+        };
+        assert!(install.install_current(&consumers, &consumer).is_err());
+        assert!(!install.binary_path().exists());
     }
 
     #[test]

@@ -71,6 +71,19 @@ pub struct SweepOutcome {
     pub problems: Vec<String>,
 }
 
+struct IngestSessionOutcome {
+    forward: bool,
+    retired: SweepOutcome,
+}
+
+enum SessionDisposition {
+    Ignore,
+    Store {
+        parallel: bool,
+        retire_superseded: bool,
+    },
+}
+
 pub struct StatusStore {
     bindings_dir: PathBuf,
     lock_path: PathBuf,
@@ -110,53 +123,72 @@ impl StatusStore {
         &self,
         event: &mut StatusEvent,
         context: SessionContext,
-    ) -> io::Result<(bool, SweepOutcome)> {
+    ) -> io::Result<IngestSessionOutcome> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
-        let mut outcome = SweepOutcome {
-            events: Vec::new(),
-            problems: snapshot.problems,
-        };
         let previous = snapshot.records.iter().find_map(|(_, stored)| {
             (stored.status.binding_id == event.binding_id).then_some(stored)
         });
-        let resume = matches!(
+        let disposition = session_disposition(event, previous, context);
+        let SessionDisposition::Store {
+            parallel,
+            retire_superseded,
+        } = disposition
+        else {
+            return Ok(IngestSessionOutcome {
+                forward: false,
+                retired: SweepOutcome {
+                    events: Vec::new(),
+                    problems: snapshot.problems,
+                },
+            });
+        };
+        if matches!(
             context,
             SessionContext::Selected | SessionContext::SelectedParallel
-        );
-        if previous.is_some_and(|stored| stored.retired) && !resume {
-            return Ok((false, outcome));
-        }
-        let parallel = matches!(context, SessionContext::SelectedParallel)
-            || !resume
-                && (previous.is_some_and(StoredStatus::is_parallel)
-                    || (previous.is_none() && matches!(context, SessionContext::Background))
-                    || matches!(context, SessionContext::Parallel));
-        if resume
-            && event.agent == Agent::Opencode
+        ) && event.agent == Agent::Opencode
             && let Some(previous) = previous
         {
             event.phase = previous.status.phase;
         }
+        self.persist_session(event, parallel)?;
+        let retired = if retire_superseded {
+            Self::retire_superseded(event, snapshot.records, snapshot.problems)
+        } else {
+            SweepOutcome {
+                events: Vec::new(),
+                problems: snapshot.problems,
+            }
+        };
+        Ok(IngestSessionOutcome {
+            forward: true,
+            retired,
+        })
+    }
+
+    fn persist_session(&self, event: &StatusEvent, parallel: bool) -> io::Result<()> {
         let stored = StoredStatus {
             status: event.clone(),
             parallel: Some(parallel),
             retired: !event.running && event.process.is_some(),
         };
         if !event.running && event.process.is_none() {
-            self.remove_binding(&event.binding_id)?;
+            self.remove_binding(&event.binding_id)
         } else {
-            stored.write(&self.binding_path(&event.binding_id))?;
+            stored.write(&self.binding_path(&event.binding_id))
         }
+    }
 
-        if parallel
-            || matches!(context, SessionContext::Background)
-            || !event.running
-            || event.process.is_none()
-        {
-            return Ok((true, outcome));
-        }
-        for (path, mut stored) in snapshot.records {
+    fn retire_superseded(
+        event: &StatusEvent,
+        records: Vec<(PathBuf, StoredStatus)>,
+        problems: Vec<String>,
+    ) -> SweepOutcome {
+        let mut outcome = SweepOutcome {
+            events: Vec::new(),
+            problems,
+        };
+        for (path, mut stored) in records {
             let previous = &stored.status;
             if !stored.is_parallel()
                 && !stored.retired
@@ -181,7 +213,7 @@ impl StatusStore {
                 }
             }
         }
-        Ok((true, outcome))
+        outcome
     }
 
     pub fn end(&self, binding_id: &str) -> io::Result<()> {
@@ -390,6 +422,32 @@ impl StatusStore {
     }
 }
 
+fn session_disposition(
+    event: &StatusEvent,
+    previous: Option<&StoredStatus>,
+    context: SessionContext,
+) -> SessionDisposition {
+    let resume = matches!(
+        context,
+        SessionContext::Selected | SessionContext::SelectedParallel
+    );
+    if previous.is_some_and(|stored| stored.retired) && !resume {
+        return SessionDisposition::Ignore;
+    }
+    let parallel = matches!(context, SessionContext::SelectedParallel)
+        || !resume
+            && (previous.is_some_and(StoredStatus::is_parallel)
+                || (previous.is_none() && matches!(context, SessionContext::Background))
+                || matches!(context, SessionContext::Parallel));
+    SessionDisposition::Store {
+        parallel,
+        retire_superseded: !parallel
+            && !matches!(context, SessionContext::Background)
+            && event.running
+            && event.process.is_some(),
+    }
+}
+
 fn health_problem(message: String) -> HealthProblem {
     HealthProblem {
         observed_at: now_rfc3339(),
@@ -511,11 +569,11 @@ pub fn handle_ingest(
                 {
                     context = context.in_shared_process();
                 }
-                let forward;
-                (forward, retired) = store.ingest_session(&mut status_event, context)?;
-                if forward {
+                let session_outcome = store.ingest_session(&mut status_event, context)?;
+                if session_outcome.forward {
                     normalized_event = Some(status_event);
                 }
+                retired = session_outcome.retired;
                 Ok(())
             }
             None => Ok(()),

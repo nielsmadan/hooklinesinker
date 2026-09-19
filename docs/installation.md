@@ -29,8 +29,9 @@ installation if promotion is needed, then writes the named consumer's registrati
 
 The version comes from the candidate's compiled Cargo package version. Rebuilding an equal
 version does not replace the shared binary; see [local iteration](development-and-releases.md).
-Old version directories survive promotion. Activation happens before registration validation,
-so an invalid consumer name or sink can fail after the binary has already been activated.
+Old version directories survive promotion. Consumer names, protocols, capabilities and sink
+URLs are validated before activation, so a rejected registration leaves the active binary
+unchanged.
 An installation-wide file lock spans version selection, activation and registration, and
 also spans consumer removal through shared cleanup. Concurrent consumers cannot downgrade
 a newer activation or register between the last-consumer check and teardown.
@@ -40,10 +41,10 @@ to finish before inspecting the symlink.
 [`ConsumerStore`](../src/consumers.rs) replaces only the registration for the same name;
 other names remain registered. Names start with a lowercase letter or digit and otherwise
 contain lowercase letters, digits, `_` or `-`. The CLI requests the `status` capability with
-its own protocol major. `--sink URL` enables HTTP(S) delivery; omitting it on re-registration
-clears that consumer's sink. Use `consumers --json` to inspect registrations; valid records
-remain visible alongside read/parse diagnostics in `problems`. Removal validates the same
-name rules as registration before constructing any file path.
+its own protocol major. `--sink URL` requires an absolute HTTP(S) URL; omitting it on
+re-registration clears that consumer's sink. Use `consumers --json` to inspect registrations;
+records that fail syntax or semantic validation are excluded and reported in `problems`.
+Removal validates the same name rules as registration before constructing any file path.
 
 ## Install or refresh hooks
 

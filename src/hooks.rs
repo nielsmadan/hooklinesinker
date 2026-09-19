@@ -95,152 +95,123 @@ pub struct HookManager {
     roots: HookRoots,
 }
 
+enum HookBackend {
+    Json {
+        path: PathBuf,
+        location: HooksLocation,
+    },
+    Toml {
+        path: PathBuf,
+    },
+    TypeScript {
+        path: PathBuf,
+        legacy_path: PathBuf,
+        template: &'static str,
+    },
+}
+
 impl HookManager {
     pub const fn new(roots: HookRoots) -> Self {
         Self { roots }
     }
 
     pub fn install(&self, agent: Agent) -> io::Result<HookStatus> {
-        match agent {
-            Agent::Claude => self.json_hooks().reconcile(
+        match self.backend(agent) {
+            HookBackend::Json { path, location } => self.json_hooks().reconcile(
                 agent,
-                &self.claude_settings_path(),
+                &path,
                 native_event_specs(agent),
                 ReconcileMode::Install,
-                HooksLocation::Nested("hooks"),
+                location,
             ),
-            Agent::Codex => self.json_hooks().reconcile(
+            HookBackend::Toml { path } => self.toml_hooks().reconcile(
                 agent,
-                &self.codex_hooks_path(),
-                native_event_specs(agent),
-                ReconcileMode::Install,
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Opencode => self.typescript_hooks().install(
-                agent,
-                &self.opencode_plugin_path(),
-                OPENCODE_TEMPLATE,
-                &self.opencode_legacy_path(),
-            ),
-            Agent::Pi => self.typescript_hooks().install(
-                agent,
-                &self.pi_extension_path(),
-                PI_TEMPLATE,
-                &self.pi_legacy_path(),
-            ),
-            Agent::Droid => self.json_hooks().reconcile(
-                agent,
-                &self.droid_hooks_path(),
-                native_event_specs(agent),
-                ReconcileMode::Install,
-                HooksLocation::TopLevel,
-            ),
-            Agent::Qwen => self.json_hooks().reconcile(
-                agent,
-                &self.qwen_settings_path(),
-                native_event_specs(agent),
-                ReconcileMode::Install,
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Kimi => self.toml_hooks().reconcile(
-                agent,
-                &self.kimi_config_path(),
+                &path,
                 native_event_specs(agent),
                 ReconcileMode::Install,
             ),
+            HookBackend::TypeScript {
+                path,
+                legacy_path,
+                template,
+            } => self
+                .typescript_hooks()
+                .install(agent, &path, template, &legacy_path),
         }
     }
 
     pub fn status(&self, agent: Agent) -> io::Result<HookStatus> {
-        match agent {
-            Agent::Claude => self.json_hooks().status(
-                agent,
-                &self.claude_settings_path(),
-                native_event_specs(agent),
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Codex => self.json_hooks().status(
-                agent,
-                &self.codex_hooks_path(),
-                native_event_specs(agent),
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Opencode => self.typescript_hooks().status(
-                agent,
-                &self.opencode_plugin_path(),
-                OPENCODE_TEMPLATE,
-            ),
-            Agent::Pi => {
-                self.typescript_hooks()
-                    .status(agent, &self.pi_extension_path(), PI_TEMPLATE)
+        match self.backend(agent) {
+            HookBackend::Json { path, location } => {
+                self.json_hooks()
+                    .status(agent, &path, native_event_specs(agent), location)
             }
-            Agent::Droid => self.json_hooks().status(
-                agent,
-                &self.droid_hooks_path(),
-                native_event_specs(agent),
-                HooksLocation::TopLevel,
-            ),
-            Agent::Qwen => self.json_hooks().status(
-                agent,
-                &self.qwen_settings_path(),
-                native_event_specs(agent),
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Kimi => {
+            HookBackend::Toml { path } => {
                 self.toml_hooks()
-                    .status(agent, &self.kimi_config_path(), native_event_specs(agent))
+                    .status(agent, &path, native_event_specs(agent))
+            }
+            HookBackend::TypeScript { path, template, .. } => {
+                self.typescript_hooks().status(agent, &path, template)
             }
         }
     }
 
     pub fn uninstall(&self, agent: Agent) -> io::Result<HookStatus> {
+        match self.backend(agent) {
+            HookBackend::Json { path, location } => self.json_hooks().reconcile(
+                agent,
+                &path,
+                native_event_specs(agent),
+                ReconcileMode::Uninstall,
+                location,
+            ),
+            HookBackend::Toml { path } => self.toml_hooks().reconcile(
+                agent,
+                &path,
+                native_event_specs(agent),
+                ReconcileMode::Uninstall,
+            ),
+            HookBackend::TypeScript {
+                path,
+                legacy_path,
+                template,
+            } => self
+                .typescript_hooks()
+                .uninstall(agent, &path, template, &legacy_path),
+        }
+    }
+
+    fn backend(&self, agent: Agent) -> HookBackend {
         match agent {
-            Agent::Claude => self.json_hooks().reconcile(
-                agent,
-                &self.claude_settings_path(),
-                native_event_specs(agent),
-                ReconcileMode::Uninstall,
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Codex => self.json_hooks().reconcile(
-                agent,
-                &self.codex_hooks_path(),
-                native_event_specs(agent),
-                ReconcileMode::Uninstall,
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Opencode => self.typescript_hooks().uninstall(
-                agent,
-                &self.opencode_plugin_path(),
-                OPENCODE_TEMPLATE,
-                &self.opencode_legacy_path(),
-            ),
-            Agent::Pi => self.typescript_hooks().uninstall(
-                agent,
-                &self.pi_extension_path(),
-                PI_TEMPLATE,
-                &self.pi_legacy_path(),
-            ),
-            Agent::Droid => self.json_hooks().reconcile(
-                agent,
-                &self.droid_hooks_path(),
-                native_event_specs(agent),
-                ReconcileMode::Uninstall,
-                HooksLocation::TopLevel,
-            ),
-            Agent::Qwen => self.json_hooks().reconcile(
-                agent,
-                &self.qwen_settings_path(),
-                native_event_specs(agent),
-                ReconcileMode::Uninstall,
-                HooksLocation::Nested("hooks"),
-            ),
-            Agent::Kimi => self.toml_hooks().reconcile(
-                agent,
-                &self.kimi_config_path(),
-                native_event_specs(agent),
-                ReconcileMode::Uninstall,
-            ),
+            Agent::Claude => HookBackend::Json {
+                path: self.claude_settings_path(),
+                location: HooksLocation::Nested("hooks"),
+            },
+            Agent::Codex => HookBackend::Json {
+                path: self.codex_hooks_path(),
+                location: HooksLocation::Nested("hooks"),
+            },
+            Agent::Opencode => HookBackend::TypeScript {
+                path: self.opencode_plugin_path(),
+                legacy_path: self.opencode_legacy_path(),
+                template: OPENCODE_TEMPLATE,
+            },
+            Agent::Pi => HookBackend::TypeScript {
+                path: self.pi_extension_path(),
+                legacy_path: self.pi_legacy_path(),
+                template: PI_TEMPLATE,
+            },
+            Agent::Droid => HookBackend::Json {
+                path: self.droid_hooks_path(),
+                location: HooksLocation::TopLevel,
+            },
+            Agent::Qwen => HookBackend::Json {
+                path: self.qwen_settings_path(),
+                location: HooksLocation::Nested("hooks"),
+            },
+            Agent::Kimi => HookBackend::Toml {
+                path: self.kimi_config_path(),
+            },
         }
     }
 

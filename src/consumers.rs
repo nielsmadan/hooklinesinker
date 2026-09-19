@@ -16,6 +16,15 @@ pub struct Consumer {
     pub sink: Option<String>,
 }
 
+impl Consumer {
+    pub fn validate(&self) -> io::Result<()> {
+        validate_name(&self.name)?;
+        validate_protocol(self.protocol)?;
+        validate_capabilities(&self.capabilities)?;
+        validate_sink(self.sink.as_deref())
+    }
+}
+
 pub struct ConsumerSnapshot {
     pub consumers: Vec<Consumer>,
     pub problems: Vec<String>,
@@ -47,10 +56,7 @@ impl ConsumerStore {
     }
 
     pub fn register(&self, consumer: &Consumer) -> io::Result<()> {
-        validate_name(&consumer.name)?;
-        validate_protocol(consumer.protocol)?;
-        validate_capabilities(&consumer.capabilities)?;
-        validate_sink(consumer.sink.as_deref())?;
+        consumer.validate()?;
 
         let _guard = self.lock()?;
         let path = self.consumer_path(&consumer.name);
@@ -132,7 +138,12 @@ impl ConsumerStore {
                 }
             };
             match serde_json::from_slice::<Consumer>(&bytes) {
-                Ok(consumer) => out.push(consumer),
+                Ok(consumer) => match consumer.validate() {
+                    Ok(()) => out.push(consumer),
+                    Err(e) => {
+                        problems.push(format!("invalid consumer record {}: {e}", path.display()));
+                    }
+                },
                 Err(e) => {
                     problems.push(format!(
                         "failed to parse consumer record {}: {e}",
@@ -198,15 +209,21 @@ fn validate_sink(sink: Option<&str>) -> io::Result<()> {
     let Some(sink) = sink else {
         return Ok(());
     };
-    match sink.split_once("://") {
-        Some((scheme, _))
+    let uri = sink.parse::<ureq::http::Uri>().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid sink URL {sink}: {e}"),
+        )
+    })?;
+    match (uri.scheme_str(), uri.authority()) {
+        (Some(scheme), Some(_))
             if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
         {
             Ok(())
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unsupported sink scheme: {sink}"),
+            format!("sink must be an absolute HTTP(S) URL: {sink}"),
         )),
     }
 }
@@ -263,11 +280,14 @@ mod tests {
     #[test]
     fn invalid_sink_scheme_is_rejected() {
         let store = store();
-        assert!(
-            store
-                .register(&consumer("juggler", &["status"], Some("ftp://example.com")))
-                .is_err()
-        );
+        for sink in ["ftp://example.com", "http://", "https:///hook"] {
+            assert!(
+                store
+                    .register(&consumer("juggler", &["status"], Some(sink)))
+                    .is_err(),
+                "accepted {sink}"
+            );
+        }
     }
 
     #[test]
@@ -325,12 +345,23 @@ mod tests {
             .register(&consumer("valid", &["status"], None))
             .unwrap();
         fs::write(root.join("consumers/broken.json"), "{").unwrap();
+        fs::write(
+            root.join("consumers/unsupported.json"),
+            r#"{"name":"unsupported","protocol":2,"capabilities":["status"],"sink":null}"#,
+        )
+        .unwrap();
         fs::create_dir(root.join("consumers/unreadable.json")).unwrap();
         let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.consumers.len(), 1);
         assert_eq!(snapshot.consumers[0].name, "valid");
-        assert_eq!(snapshot.problems.len(), 2);
+        assert_eq!(snapshot.problems.len(), 3);
         assert!(snapshot.problems.iter().any(|p| p.contains("broken.json")));
+        assert!(
+            snapshot
+                .problems
+                .iter()
+                .any(|p| p.contains("unsupported.json"))
+        );
         assert!(
             snapshot
                 .problems
