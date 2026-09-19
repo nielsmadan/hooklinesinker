@@ -1,21 +1,10 @@
 # hooklinesinker
 
-I am working on an app ([Juggler](https://github.com/nielsmadan/juggler)) and a CLI
-([ringleader](https://github.com/nielsmadan/ringleader)) that both consume agent status hook
-events for multiple agents. I did not want to register both the app and the CLI in every hook
-config of every agent. Every problem can be solved with another layer of abstraction, so I built
-this little plumbing CLI tool. Hook events from any supported agent (Claude Code, Codex,
-OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI) get sent to hooklinesinker, which keeps
-its own queryable state on session status and forwards normalized events. Other apps can register
-with hooklinesinker to receive the forwarded events.
+I am working on an app ([Juggler](https://github.com/nielsmadan/juggler)) and a CLI ([ringleader](https://github.com/nielsmadan/ringleader)) that both consume agent status hook events from multiple agents. I did not want to register both the app and the CLI in every hook config for every agent. So I built this little CLI utility. Hook events from any supported agent (Claude Code, Codex, OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI) get sent to hooklinesinker, which keeps its own queryable state on session status and forwards normalized events. Other apps can register with hooklinesinker to receive the the events directly as well.
 
-This is just a little piece of plumbing, but if you're building anything that needs agent status
-hook events, it might save you some time. It can be installed standalone or integrated into your
-own app; see [Integrating](#integrating).
+This is just a little piece of plumbing, but if you're building anything that needs agent lifecycle status hook events, it might save you some time. It can be installed standalone or integrated into your own app. See [Integrating](#integrating).
 
-In the future it might support more than status events
-([why only status events for now](docs/decisions/0001-status-events-only.md)). Let me know if you have a
-use case and which events you would be interested in.
+Before long I will probably need some other hook event and add it here as well, but so far it's status only. If you have a use case, let me know and it might motivate me to add it.
 
 Today's consumers:
 
