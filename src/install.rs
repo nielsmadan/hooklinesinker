@@ -680,7 +680,17 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while fs::metadata(install.binary_path()).unwrap().len() != current_binary_len {
+        loop {
+            match fs::metadata(install.binary_path()) {
+                Ok(metadata) if metadata.len() == current_binary_len => break,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+                    ) => {}
+                Err(e) => panic!("failed to inspect active binary: {e}"),
+            }
             assert!(Instant::now() < deadline, "installation did not activate");
             std::thread::sleep(Duration::from_millis(5));
         }
