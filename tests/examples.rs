@@ -1,13 +1,6 @@
-//! End-to-end coverage for the runnable examples in `examples/`, which the README's
-//! `## Integrating` section points readers at.
-//!
-//! Proving a session is genuinely "live" needs a real OS process an agent name can be
-//! matched against (`SystemProcessLookup` in src/processes.rs walks real process ancestry).
-//! Copying a signed system shell to a fake name gets killed by macOS on exec, so these tests
-//! instead lean on the same script-runtime argv fallback the adapters rely on: a node process
-//! whose script file is literally named after the agent (e.g. `claude`) satisfies
-//! `is_owning_process` without needing a renamed system binary. That means the live-session
-//! tests need node, same as `tests/ts_adapters.rs`, and skip themselves when it is missing.
+//! End-to-end tests for README examples. Live-session cases use Node scripts named after agents
+//! because renamed signed macOS binaries cannot execute; Node also exercises the adapters'
+//! process-ancestry fallback.
 
 #![cfg(unix)]
 

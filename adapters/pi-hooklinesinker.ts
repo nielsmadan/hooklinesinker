@@ -52,7 +52,7 @@ function runHook(event: string, sessionId?: string, reason?: string): Promise<vo
         try {
           child.kill();
         } catch {
-          // already exited
+          // Timeout cancellation is best-effort.
         }
         finish();
       }, HOOK_TIMEOUT_MS);
@@ -144,11 +144,11 @@ export default function (pi: PiHost) {
     }
   });
 
-  // agent_settled fires after automatic retries and compaction finish.
   pi.on("agent_start", async (_event, ctx) => {
     if (!isUISession) return;
     await queueHook("agent_start", rememberSessionId(ctx));
   });
+  // agent_settled fires after automatic retries and compaction complete.
   pi.on("agent_settled", async (_event, ctx) => {
     if (!isUISession) return;
     pendingPermissionRequestIds.clear();

@@ -40,7 +40,7 @@ function runHook(event: string, sessionId?: string, cwd?: string): Promise<void>
         try {
           child.kill();
         } catch {
-          // already exited
+          // Timeout cancellation is best-effort.
         }
         finish();
       }, HOOK_TIMEOUT_MS);

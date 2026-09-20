@@ -518,7 +518,7 @@ fn codex_stop_remains_idle_and_running_rather_than_ending() {
 
 #[test]
 fn claude_subagent_stop_is_outside_the_installed_vocabulary() {
-    // Never installed, so it only arrives hand-wired; either way it must not race the parent Stop.
+    // A hand-wired SubagentStop must remain unrecognized so it cannot race the parent Stop.
     let result = normalized_for_test(Agent::Claude, "SubagentStop", generic_native_json());
     assert!(matches!(result, Normalized::Unrecognized));
 }
@@ -541,7 +541,7 @@ fn droid_notification_type_selects_the_right_phase() {
 fn droid_notification_auth_success_is_ignored() {
     let native = r#"{"session_id":"s","notification_type":"auth_success"}"#;
     let result = normalized_for_test(Agent::Droid, "Notification", native);
-    // The hook is installed and expected; only this notification type carries no phase.
+    // auth_success is recognized but carries no phase.
     assert!(matches!(result, Normalized::Ignored));
 }
 
@@ -859,9 +859,7 @@ fn unrelated_ingest_sweeps_a_dead_binding() {
     };
     let other_liveness = FakeProcessLookup::with_owner(other_process);
     other_liveness.set_alive(701, "71");
-    // pid 700 is unknown to `other_liveness`, so it reads as dead: this
-    // simulates the dying session's process having exited by the time the
-    // unrelated session's ingest runs.
+    // Omitting pid 700 simulates its exit before the unrelated ingest.
 
     let outcome = ingest(
         &state::IngestContext {
@@ -1148,8 +1146,7 @@ fn sessions_envelope_omits_stale_problems_but_keeps_recent_ones() {
         .collect();
     assert_eq!(messages, ["just now"]);
 
-    // The replay is filtered, but the health log itself is untouched, so doctor's last-sink-error
-    // diagnostic still sees the older entry.
+    // Replay filtering must not prune history used by doctor diagnostics.
     assert_eq!(store.health_problems().unwrap().len(), 2);
     assert!(
         std::fs::read_to_string(root.join("health.json"))
@@ -1962,8 +1959,7 @@ fn a_dead_binding_swept_during_an_unrelated_ingest_produces_a_running_false_post
     };
     let other_liveness = FakeProcessLookup::with_owner(other_process);
     other_liveness.set_alive(711, "72");
-    // pid 710 is unknown to `other_liveness`, so the dying session reads as
-    // dead and is swept by this unrelated ingest.
+    // Omitting pid 710 makes the unrelated ingest sweep it as dead.
 
     let outcome = ingest(
         &state::IngestContext {
@@ -2029,8 +2025,7 @@ fn a_read_between_the_kill_and_the_next_ingest_still_lets_the_sweep_fan_out() {
     };
     let other_liveness = FakeProcessLookup::with_owner(other_process);
     other_liveness.set_alive(731, "76");
-    // The `sessions --json` / `doctor` poll that lands between the kill and the
-    // next hook event: it must not consume the dead binding.
+    // Read-only polls must leave dead bindings for the next ingest sweep.
     let envelope = store.sessions_envelope(&other_liveness);
     assert!(envelope.sessions.is_empty());
     assert_eq!(store.dead_records(&other_liveness).unwrap(), 1);
@@ -2572,8 +2567,7 @@ fn a_sink_failure_is_classified_by_kind_not_by_its_message_wording() {
     assert_eq!(sink, ["anything at all"]);
 }
 
-// A timestamp is parsed once, at deserialization. An unparseable one fails the read and is
-// reported, rather than defaulting to "recent" and replaying as a current fault forever.
+// Reject malformed timestamps so stale faults cannot replay as recent forever.
 #[test]
 fn a_malformed_health_timestamp_is_reported_instead_of_replaying_as_current() {
     let root = temp_home();
@@ -2597,8 +2591,7 @@ fn a_malformed_health_timestamp_is_reported_instead_of_replaying_as_current() {
     );
 }
 
-// A sweep backlog is unbounded and each send costs real time, so fan-out stops at its budget
-// rather than holding the editor hostage inside a 3s hook window.
+// Bound fan-out so an unbounded backlog cannot exhaust the editor's 3-second hook window.
 #[test]
 fn a_slow_sink_cannot_stretch_a_sweep_backlog_past_the_fanout_budget() {
     struct SlowHttpClient {

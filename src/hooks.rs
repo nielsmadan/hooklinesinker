@@ -446,10 +446,8 @@ struct TomlHooks<'a> {
 }
 
 impl TomlHooks<'_> {
-    // Kimi's config.toml bricks entirely on one malformed [[hooks]] entry, so
-    // this only ever removes exact-command matches, only ever writes entries
-    // with the schema's plain {event, command, timeout} shape, and re-parses
-    // its own rendering before it ever touches disk.
+    // Kimi rejects its entire config if any hook is malformed, so reconcile only removes exact
+    // matches, writes strict entries, and verifies the rendered TOML before replacing the file.
     fn reconcile(
         &self,
         agent: Agent,
@@ -703,8 +701,6 @@ enum ReconcileMode {
     Uninstall,
 }
 
-// Claude/Codex/Qwen nest their hook groups under a top-level "hooks" key;
-// Droid's hooks.json is itself the event map, with no wrapper.
 #[derive(Clone, Copy)]
 enum HooksLocation {
     Nested(&'static str),
@@ -1650,7 +1646,6 @@ mod tests {
 
         let doc: DocumentMut = text.parse().unwrap();
         let array = doc["hooks"].as_array_of_tables().unwrap();
-        // Our 14 managed entries plus the one foreign "notify Stop" entry.
         assert_eq!(array.iter().count(), 15);
     }
 

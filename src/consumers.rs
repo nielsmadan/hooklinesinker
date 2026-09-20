@@ -17,7 +17,6 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    // The only constructor that enforces the invariants `register` relies on.
     pub fn new(
         name: impl Into<String>,
         capabilities: Vec<String>,

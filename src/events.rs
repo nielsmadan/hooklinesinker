@@ -7,9 +7,7 @@ pub enum EventAction {
     Remove,
 }
 
-// The spec table stores `Option<EventAction>` because an installed hook may carry no
-// phase. A lookup has one more answer than that: the name may not be in the table at
-// all, which means the agent's event vocabulary moved and we are silently missing updates.
+// Unmapped is a known hook without a phase; Unrecognized is outside the agent's event vocabulary.
 #[derive(Clone, Copy)]
 pub enum EventLookup {
     Mapped(EventAction),
@@ -136,8 +134,6 @@ pub fn native_event_lookup(
     notification_type: Option<&str>,
 ) -> EventLookup {
     use EventLookup::{Mapped, Unmapped, Unrecognized};
-    // A notification type outside the mapped set is unmapped, not unrecognized: the hook
-    // itself is installed and expected, only this instance carries no phase.
     match (agent, event) {
         (Agent::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
             return Mapped(Update(Phase::Idle));

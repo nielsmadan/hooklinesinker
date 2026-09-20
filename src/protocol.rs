@@ -3,9 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
-// Agent has no deserialization fallback and cannot get a meaningful one: an unknown
-// agent has no hook table, no executable names and no lifecycle mapping. Adding a
-// variant is additive, but accepting an unknown one is a protocol-major bump.
+// Unknown agents lack hook and lifecycle mappings; accepting them requires a protocol-major bump.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Agent {

@@ -44,7 +44,6 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     ))
 }
 
-/// `Some(version)` when a usable node is on PATH, `None` (with a printed reason) otherwise.
 fn usable_node() -> Option<String> {
     let Ok(output) = Command::new("node").arg("--version").output() else {
         eprintln!(
@@ -106,7 +105,6 @@ impl Run {
             .collect()
     }
 
-    /// The native JSON the adapter piped to the binary's stdin.
     fn stdin(&self, index: usize) -> &Value {
         &self.invocations[index]["stdin"]
     }
@@ -320,7 +318,6 @@ fn pi_settled_session_discards_pending_prompts() {
     let Some(run) = run("pi:settled_discards_prompts") else {
         return;
     };
-    // The decision after agent_settled resolves nothing: settling already cleared the prompt.
     assert_eq!(
         run.events(),
         ["session_start", "permission_prompt", "agent_settled"]
@@ -476,7 +473,7 @@ fn opencode_a_hanging_binary_cannot_block_the_adapter() {
     );
 }
 
-/// Guards the harness itself: a stale `Path` here would make every assertion above vacuous.
+/// Prevent stale asset paths from silently skipping adapter assertions.
 #[test]
 fn harness_and_adapters_exist() {
     for path in ["tests/adapters_harness.mjs", PI_ADAPTER, OPENCODE_ADAPTER] {

@@ -35,9 +35,8 @@ enum MappedAction {
     Unrecognized,
 }
 
-// Empty session IDs reach terminal-keyed sinks but cannot be paired with a conversation's
-// end event, so they are forwarded without ever entering the ledger. Keeping that in the
-// return type means a second ingestion path cannot record one by omission.
+// Sessionless events may reach terminal-keyed sinks but cannot enter the ledger; the variant
+// enforces this across ingestion paths.
 #[derive(Debug)]
 pub enum Normalized {
     Recordable(StatusEvent),
@@ -47,8 +46,6 @@ pub enum Normalized {
 }
 
 impl Normalized {
-    // The event to forward to sinks, if this maps to one. Whether it may also be recorded
-    // stays in the variant.
     pub fn into_event(self) -> Option<StatusEvent> {
         match self {
             Self::Recordable(event) | Self::ForwardOnly(event) => Some(event),

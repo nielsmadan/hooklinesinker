@@ -801,8 +801,7 @@ fn json_envelopes_report_corrupt_store_files() {
     }
 }
 
-// The whole reason ingest swallows its failures: a hook that exits nonzero is a hook the
-// agent host reports as broken. Pinned at the binary, where the contract actually lives.
+// Ingest must exit zero because agent hosts treat nonzero hooks as broken.
 #[test]
 fn malformed_ingest_stdin_exits_zero_and_records_health() {
     let temp = unique_temp_dir("ingest-malformed-stdin");
@@ -836,7 +835,6 @@ fn malformed_ingest_stdin_exits_zero_and_records_health() {
     );
 }
 
-// Oversized stdin is rejected before the store is even consulted, and still exits zero.
 #[test]
 fn oversized_ingest_stdin_exits_zero_and_records_health() {
     let temp = unique_temp_dir("ingest-oversized-stdin");

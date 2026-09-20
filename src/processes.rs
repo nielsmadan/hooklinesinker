@@ -418,7 +418,6 @@ mod tests {
 
     #[test]
     fn a_thread_named_process_that_is_not_a_runtime_never_matches() {
-        // Fails if "MainThread" is ever added to is_script_runtime instead.
         let argv = os_string_argv(&["bash", "-c", "qwen"]);
         assert!(!is_owning_process("MainThread", &argv, &["qwen"]));
     }
