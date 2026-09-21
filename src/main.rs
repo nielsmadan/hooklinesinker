@@ -30,11 +30,11 @@ fn main() {
 }
 
 fn open_installer() -> io::Result<Installer> {
-    Installer::open(paths::data_root())
+    Installer::open(paths::data_root()?)
 }
 
-fn hook_manager(installer: &Installer) -> HookManager {
-    HookManager::new(HookRoots::from_env(installer.binary_path()))
+fn hook_manager(installer: &Installer) -> io::Result<HookManager> {
+    HookRoots::from_env(installer.binary_path()).map(HookManager::new)
 }
 
 fn print_version(json: bool) {
@@ -54,7 +54,10 @@ fn print_version(json: bool) {
 }
 
 fn run_ingest(agent: Agent, event: &str) {
-    let Ok(store) = StatusStore::open(paths::state_root()) else {
+    let Ok(state_root) = paths::state_root() else {
+        std::process::exit(0);
+    };
+    let Ok(store) = StatusStore::open(&state_root) else {
         std::process::exit(0);
     };
 
@@ -69,7 +72,7 @@ fn run_ingest(agent: Agent, event: &str) {
         }
     };
 
-    let consumers = match ConsumerStore::open(paths::state_root()) {
+    let consumers = match ConsumerStore::open(&state_root) {
         Ok(consumers) => Some(consumers),
         Err(e) => {
             let _ = store.record_health(HealthProblem::new(
@@ -104,7 +107,7 @@ fn run_ingest(agent: Agent, event: &str) {
 }
 
 fn run_sessions(json: bool) {
-    let envelope = match StatusStore::open(paths::state_root()) {
+    let envelope = match paths::state_root().and_then(StatusStore::open) {
         Ok(store) => store.sessions_envelope(&SystemProcessLiveness),
         Err(e) => SessionsEnvelope {
             sessions: Vec::new(),
@@ -142,7 +145,7 @@ fn run_sessions(json: bool) {
 }
 
 fn run_consumers(json: bool) {
-    let (consumers, problems) = match ConsumerStore::open(paths::state_root()) {
+    let (consumers, problems) = match paths::state_root().and_then(ConsumerStore::open) {
         Ok(store) => match store.snapshot() {
             Ok(snapshot) => (snapshot.consumers, snapshot.problems),
             Err(e) => (Vec::new(), vec![format!("failed to list consumers: {e}")]),
@@ -187,7 +190,7 @@ fn run_install(consumer_name: &str, sink: Option<&str>) {
             sink.map(str::to_string),
         )?;
         let installer = open_installer()?;
-        let consumers = ConsumerStore::open(paths::state_root())?;
+        let consumers = ConsumerStore::open(paths::state_root()?)?;
         installer.install_current(&consumers, &consumer)
     })();
     match result {
@@ -207,8 +210,8 @@ fn run_install(consumer_name: &str, sink: Option<&str>) {
 fn run_uninstall(consumer_name: &str) {
     let result = (|| -> io::Result<UninstallOutcome> {
         let installer = open_installer()?;
-        let consumers = ConsumerStore::open(paths::state_root())?;
-        let hooks = hook_manager(&installer);
+        let consumers = ConsumerStore::open(paths::state_root()?)?;
+        let hooks = hook_manager(&installer)?;
         installer.uninstall_consumer(&consumers, &hooks, consumer_name)
     })();
     match result {
@@ -270,7 +273,7 @@ fn with_hook_manager(
     f: impl FnOnce(&HookManager) -> io::Result<HookStatus>,
 ) -> io::Result<HookStatus> {
     let installer = open_installer()?;
-    let hooks = hook_manager(&installer);
+    let hooks = hook_manager(&installer)?;
     f(&hooks)
 }
 
@@ -353,15 +356,11 @@ fn run_doctor(json: bool) {
         ),
     });
 
-    let state_root = paths::state_root();
-    let permissions = permissions_check(&state_root);
+    let (permissions, status_store, consumer_store) = open_doctor_stores();
     if !permissions.ok {
         fatal = true;
     }
     checks.push(permissions);
-
-    let status_store = StatusStore::open(&state_root);
-    let consumer_store = ConsumerStore::open(&state_root);
 
     let active_version_check = doctor_active_version();
     if !active_version_check.ok {
@@ -452,6 +451,32 @@ fn run_doctor(json: bool) {
     std::process::exit(exit_code);
 }
 
+fn open_doctor_stores() -> (
+    DoctorCheck,
+    io::Result<StatusStore>,
+    io::Result<ConsumerStore>,
+) {
+    match paths::state_root() {
+        Ok(state_root) => (
+            permissions_check(&state_root),
+            StatusStore::open(&state_root),
+            ConsumerStore::open(&state_root),
+        ),
+        Err(e) => {
+            let detail = format!("invalid state root: {e}");
+            (
+                DoctorCheck {
+                    name: "permissions",
+                    ok: false,
+                    detail: detail.clone(),
+                },
+                Err(io::Error::new(io::ErrorKind::InvalidInput, detail.clone())),
+                Err(io::Error::new(io::ErrorKind::InvalidInput, detail)),
+            )
+        }
+    }
+}
+
 #[cfg(unix)]
 fn permissions_check(root: &std::path::Path) -> DoctorCheck {
     use std::os::unix::fs::PermissionsExt;
@@ -490,7 +515,16 @@ fn permissions_check(_root: &std::path::Path) -> DoctorCheck {
 fn doctor_hook_status() -> DoctorCheck {
     match open_installer() {
         Ok(installer) => {
-            let hooks = hook_manager(&installer);
+            let hooks = match hook_manager(&installer) {
+                Ok(hooks) => hooks,
+                Err(e) => {
+                    return DoctorCheck {
+                        name: "hook_status",
+                        ok: false,
+                        detail: format!("failed to resolve hook roots: {e}"),
+                    };
+                }
+            };
             let mut summaries = Vec::new();
             let mut problems = Vec::new();
             for agent in Agent::ALL {

@@ -1,10 +1,11 @@
 use crate::events::{EventSpec, native_event_specs};
+use crate::persistence::{LockGuard, write_preserving_atomic};
 use crate::protocol::Agent;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value as toml_value};
 
@@ -64,28 +65,27 @@ pub struct HookRoots {
 }
 
 impl HookRoots {
-    pub fn from_env(binary_path: PathBuf) -> Self {
-        let home = crate::paths::home_dir().unwrap_or_else(|| ".".to_string());
-        let claude_dir = PathBuf::from(&home).join(".claude");
-        let codex_dir = PathBuf::from(&home).join(".codex");
-        let opencode_config_dir = nonempty_env("OPENCODE_CONFIG_DIR").map_or_else(
-            || {
-                nonempty_env("XDG_CONFIG_HOME").map_or_else(
-                    || PathBuf::from(&home).join(".config/opencode"),
-                    |dir| PathBuf::from(dir).join("opencode"),
-                )
-            },
-            PathBuf::from,
-        );
-        let pi_agent_dir = nonempty_env("PI_CODING_AGENT_DIR")
-            .map_or_else(|| PathBuf::from(&home).join(".pi/agent"), PathBuf::from);
+    pub fn from_env(binary_path: PathBuf) -> io::Result<Self> {
+        let home = crate::paths::home_dir()?;
+        let claude_dir = home.join(".claude");
+        let codex_dir = home.join(".codex");
+        let opencode_config_dir =
+            if let Some(path) = crate::paths::absolute_env_path("OPENCODE_CONFIG_DIR")? {
+                path
+            } else if let Some(path) = crate::paths::absolute_env_path("XDG_CONFIG_HOME")? {
+                path.join("opencode")
+            } else {
+                home.join(".config/opencode")
+            };
+        let pi_agent_dir = crate::paths::absolute_env_path("PI_CODING_AGENT_DIR")?
+            .unwrap_or_else(|| home.join(".pi/agent"));
         // Droid has no documented home-relocation env var.
-        let factory_dir = PathBuf::from(&home).join(".factory");
-        let qwen_config_dir = nonempty_env("QWEN_HOME")
-            .map_or_else(|| PathBuf::from(&home).join(".qwen"), PathBuf::from);
-        let kimi_code_dir = nonempty_env("KIMI_CODE_HOME")
-            .map_or_else(|| PathBuf::from(&home).join(".kimi-code"), PathBuf::from);
-        Self {
+        let factory_dir = home.join(".factory");
+        let qwen_config_dir =
+            crate::paths::absolute_env_path("QWEN_HOME")?.unwrap_or_else(|| home.join(".qwen"));
+        let kimi_code_dir = crate::paths::absolute_env_path("KIMI_CODE_HOME")?
+            .unwrap_or_else(|| home.join(".kimi-code"));
+        Ok(Self {
             claude_dir,
             codex_dir,
             opencode_config_dir,
@@ -94,12 +94,8 @@ impl HookRoots {
             qwen_config_dir,
             kimi_code_dir,
             binary_path,
-        }
+        })
     }
-}
-
-fn nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 pub struct HookManager {
@@ -127,7 +123,9 @@ impl HookManager {
     }
 
     pub fn install(&self, agent: Agent) -> io::Result<HookStatus> {
-        match self.backend(agent) {
+        let backend = self.backend(agent);
+        let _guard = LockGuard::acquire_for(backend.path())?;
+        match backend {
             HookBackend::Json { path, location } => self.json_hooks().reconcile(
                 agent,
                 &path,
@@ -168,7 +166,9 @@ impl HookManager {
     }
 
     pub fn uninstall(&self, agent: Agent) -> io::Result<HookStatus> {
-        match self.backend(agent) {
+        let backend = self.backend(agent);
+        let _guard = LockGuard::acquire_for(backend.path())?;
+        match backend {
             HookBackend::Json { path, location } => self.json_hooks().reconcile(
                 agent,
                 &path,
@@ -289,6 +289,14 @@ impl HookManager {
     fn typescript_hooks(&self) -> TypeScriptHooks<'_> {
         TypeScriptHooks {
             binary_path: &self.roots.binary_path,
+        }
+    }
+}
+
+impl HookBackend {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Json { path, .. } | Self::Toml { path } | Self::TypeScript { path, .. } => path,
         }
     }
 }
@@ -613,8 +621,9 @@ struct TypeScriptHooks<'a> {
 impl TypeScriptHooks<'_> {
     fn generated_content(&self, template: &str) -> String {
         let marker = format!("{MARKER_PREFIX}{}\n", crate::protocol::PROTOCOL_VERSION);
-        let bin = escape_ts_string(&self.binary_path.display().to_string());
-        let body = template.replace(BIN_PLACEHOLDER, &bin);
+        let bin = serde_json::to_string(&self.binary_path.display().to_string())
+            .expect("a path string always serializes");
+        let body = template.replace(&format!("\"{BIN_PLACEHOLDER}\""), &bin);
         format!("{marker}{body}")
     }
 
@@ -787,10 +796,18 @@ fn reconcile_managed_events(
 fn canonical_command(binary_path: &Path, agent: Agent, event: &str) -> String {
     format!(
         "{} ingest --agent {} --event {}",
-        binary_path.display(),
+        shell_quote(&binary_path.display().to_string()),
         agent.as_str(),
         event
     )
+}
+
+fn shell_quote(word: &str) -> String {
+    if is_unquoted_shell_word(word) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 fn is_legacy_command(command: &str) -> bool {
@@ -863,8 +880,8 @@ fn classify_command(command: &str, canonical: &str, agent: Agent, event: &str) -
     }
     let suffix = format!(" ingest --agent {} --event {}", agent.as_str(), event);
     if command.strip_suffix(&suffix).is_some_and(|binary| {
-        (binary == "hooklinesinker" || binary.ends_with("/hooklinesinker"))
-            && is_unquoted_shell_word(binary)
+        decode_shell_word(binary)
+            .is_some_and(|binary| binary == "hooklinesinker" || binary.ends_with("/hooklinesinker"))
     }) {
         return GroupOwnership::Ours { exact: false };
     }
@@ -946,32 +963,14 @@ fn write_agent_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("hooklinesinker-tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    #[cfg(unix)]
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    write_preserving_atomic(path, bytes)
 }
 
 fn write_generated_file(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("hooklinesinker-tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    write_preserving_atomic(path, contents.as_bytes())
 }
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {
@@ -991,8 +990,29 @@ fn file_protocol(text: &str) -> Option<u16> {
         .ok()
 }
 
-fn escape_ts_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+fn decode_shell_word(word: &str) -> Option<String> {
+    let mut decoded = String::new();
+    let mut chars = word.chars();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '\'' {
+                quoted = false;
+            } else {
+                decoded.push(c);
+            }
+        } else {
+            match c {
+                '\'' => quoted = true,
+                '\\' => decoded.push(chars.next()?),
+                c if c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~') => {
+                    decoded.push(c);
+                }
+                _ => return None,
+            }
+        }
+    }
+    (!quoted && !decoded.is_empty()).then_some(decoded)
 }
 
 #[cfg(test)]
@@ -1851,6 +1871,70 @@ mod tests {
                 .unwrap()
                 .starts_with("// hooklinesinker-generated protocol=1\n")
         );
+    }
+
+    #[test]
+    fn concurrent_hook_installs_serialize_without_torn_configuration() {
+        let (manager, base) = manager();
+        let manager = std::sync::Arc::new(manager);
+        let workers = 12;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let manager = std::sync::Arc::clone(&manager);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.install(Agent::Claude)
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap().state, HookState::Installed);
+        }
+
+        let status = manager.status(Agent::Claude).unwrap();
+        assert_eq!(status.state, HookState::Installed);
+        let value: Value =
+            serde_json::from_slice(&fs::read(manager.claude_settings_path()).unwrap()).unwrap();
+        assert_eq!(
+            value["hooks"].as_object().unwrap().len(),
+            native_event_specs(Agent::Claude).len()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn command_paths_are_shell_quoted_and_remain_recognizable() {
+        let path = Path::new("/Applications/Hook line's/bin/hooklinesinker");
+        let command = canonical_command(path, Agent::Claude, "Stop");
+        assert_eq!(
+            command,
+            "'/Applications/Hook line'\\''s/bin/hooklinesinker' ingest --agent claude --event Stop"
+        );
+        assert!(matches!(
+            classify_command(&command, &command, Agent::Claude, "Stop"),
+            GroupOwnership::Ours { exact: true }
+        ));
+
+        let moved = canonical_command(
+            Path::new("/Applications/Older Hook/hooklinesinker"),
+            Agent::Claude,
+            "Stop",
+        );
+        assert!(matches!(
+            classify_command(&moved, &command, Agent::Claude, "Stop"),
+            GroupOwnership::Ours { exact: false }
+        ));
+    }
+
+    #[test]
+    fn generated_typescript_uses_a_complete_string_literal_escape() {
+        let path = Path::new("/tmp/hook\"line\n\u{2028}sinker");
+        let hooks = TypeScriptHooks { binary_path: path };
+        let content = hooks.generated_content("const bin = \"__HOOKLINESINKER_BIN__\";");
+        let encoded = serde_json::to_string(&path.display().to_string()).unwrap();
+        assert!(content.contains(&format!("const bin = {encoded};")));
     }
 
     #[test]

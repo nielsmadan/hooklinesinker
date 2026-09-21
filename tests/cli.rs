@@ -195,6 +195,34 @@ fn hooks_install_honors_kimi_code_home_override() {
 }
 
 #[test]
+fn relative_configuration_roots_are_rejected() {
+    let temp = unique_temp_dir("relative-roots");
+    let sessions = hooklinesinker_isolated(&temp)
+        .env("XDG_STATE_HOME", "relative-state")
+        .args(["sessions"])
+        .output()
+        .unwrap();
+    assert!(sessions.status.success());
+    assert!(
+        String::from_utf8(sessions.stderr)
+            .unwrap()
+            .contains("XDG_STATE_HOME must be an absolute path")
+    );
+
+    let hooks = hooklinesinker_isolated(&temp)
+        .env("QWEN_HOME", "relative-qwen")
+        .args(["hooks", "status", "--agent", "qwen"])
+        .output()
+        .unwrap();
+    assert!(!hooks.status.success());
+    assert!(
+        String::from_utf8(hooks.stderr)
+            .unwrap()
+            .contains("QWEN_HOME must be an absolute path")
+    );
+}
+
+#[test]
 fn hooks_uninstall_removes_what_hooks_install_wrote() {
     let temp = unique_temp_dir("hooks-uninstall");
     hooklinesinker_isolated(&temp)
