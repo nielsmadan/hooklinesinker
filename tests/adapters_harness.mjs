@@ -46,7 +46,7 @@ stdin=$(cat)
 args=""
 for arg in "$@"; do args="$args\${args:+,}\\"$arg\\""; done
 printf '{"args":[%s],"stdin":%s}\\n' "$args" "\${stdin:-null}" >> ${JSON.stringify(recordLog)}
-${scenario.endsWith(":hang") ? "sleep 3600" : "exit 0"}
+${scenario.endsWith(":hang") ? "sleep 3600" : scenario.endsWith(":slow") ? "sleep 0.05" : "exit 0"}
 `;
   writeFileSync(binPath, recorder);
   chmodSync(binPath, 0o755);
@@ -197,6 +197,14 @@ async function runPi(scenario, adapterPath, invocations) {
       await shutdown("reload");
       break;
 
+    case "pi:queue_bound:slow":
+      await start();
+      for (let index = 0; index < 100; index += 1) {
+        prompt(`prompt-${index}`);
+      }
+      await shutdown("reload");
+      break;
+
     default:
       throw new Error(`unknown pi scenario ${scenario}`);
   }
@@ -228,6 +236,19 @@ async function runOpenCode(scenario, adapterPath) {
 
     case "opencode:load_posts_created":
     case "opencode:hanging_binary:hang":
+      break;
+
+    case "opencode:queue_bound:slow":
+      await Promise.all(
+        Array.from({ length: 100 }, (_, index) =>
+          plugin.event({
+            event: {
+              type: "session.idle",
+              properties: { sessionID: `oc-${index}` },
+            },
+          }),
+        ),
+      );
       break;
 
     case "opencode:status_becomes_event_suffix":
@@ -298,6 +319,7 @@ const SCENARIOS = [
   [PI_ADAPTER, "pi:shutdown_resume"],
   [PI_ADAPTER, "pi:shutdown_fork"],
   [PI_ADAPTER, "pi:hanging_binary:hang"],
+  [PI_ADAPTER, "pi:queue_bound:slow"],
   [OPENCODE_ADAPTER, "opencode:load_posts_created"],
   [OPENCODE_ADAPTER, "opencode:selection_and_status_are_serialized"],
   [OPENCODE_ADAPTER, "opencode:status_becomes_event_suffix"],
@@ -306,6 +328,7 @@ const SCENARIOS = [
   [OPENCODE_ADAPTER, "opencode:malformed_events_are_dropped"],
   [OPENCODE_ADAPTER, "opencode:session_id_fallbacks"],
   [OPENCODE_ADAPTER, "opencode:hanging_binary:hang"],
+  [OPENCODE_ADAPTER, "opencode:queue_bound:slow"],
 ];
 
 const report = {};

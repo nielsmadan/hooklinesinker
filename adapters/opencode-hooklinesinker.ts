@@ -15,6 +15,7 @@ const TRACKED_EVENTS = new Set([
 ]);
 
 const HOOK_TIMEOUT_MS = 2000;
+const MAX_PENDING_HOOKS = 32;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -69,9 +70,15 @@ export const HooklinesinkerPlugin = async ({
   directory: string;
 }) => {
   let hookQueue: Promise<void> = Promise.resolve();
+  let pendingHooks = 0;
   function queueHook(event: string, sessionId?: string): Promise<void> {
-    hookQueue = hookQueue.then(() => runHook(event, sessionId, directory));
-    return hookQueue;
+    if (pendingHooks >= MAX_PENDING_HOOKS) return Promise.resolve();
+    pendingHooks += 1;
+    const queued = hookQueue.then(() => runHook(event, sessionId, directory));
+    hookQueue = queued.finally(() => {
+      pendingHooks -= 1;
+    });
+    return queued;
   }
 
   // Resuming a session can skip the native session.created event.

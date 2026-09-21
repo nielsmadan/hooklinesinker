@@ -1,6 +1,6 @@
 use crate::consumers::Consumer;
 use crate::protocol::StatusEvent;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub trait HttpClient {
     fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String>;
@@ -18,6 +18,11 @@ pub struct SinkProblem {
     pub message: String,
 }
 
+pub struct FanoutOutcome {
+    pub problems: Vec<SinkProblem>,
+    pub undelivered: usize,
+}
+
 pub struct SinkFanout<C: HttpClient> {
     client: C,
 }
@@ -28,38 +33,60 @@ impl<C: HttpClient> SinkFanout<C> {
     }
 
     pub fn send(&self, event: &StatusEvent, consumers: &[Consumer]) -> Vec<SinkProblem> {
-        let mut problems = Vec::new();
+        self.send_until(event, consumers, None).problems
+    }
+
+    pub fn send_until(
+        &self,
+        event: &StatusEvent,
+        consumers: &[Consumer],
+        deadline: Option<Instant>,
+    ) -> FanoutOutcome {
+        let mut outcome = FanoutOutcome {
+            problems: Vec::new(),
+            undelivered: 0,
+        };
         let body = match serde_json::to_vec(event) {
             Ok(bytes) => bytes,
             Err(e) => {
-                problems.push(SinkProblem {
+                outcome.problems.push(SinkProblem {
                     consumer: "*".to_string(),
                     message: format!("failed to encode status event: {e}"),
                 });
-                return problems;
+                return outcome;
             }
         };
-        for consumer in consumers {
-            if !consumer.capabilities.iter().any(|c| c == "status") {
-                continue;
-            }
-            let Some(sink) = &consumer.sink else {
+        for (index, consumer) in consumers.iter().enumerate() {
+            let Some(sink) = status_sink(consumer) else {
                 continue;
             };
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                outcome.undelivered += consumers[index..].iter().filter_map(status_sink).count();
+                break;
+            }
             match self.client.post_json(sink, &body) {
                 Ok(status) if (200..300).contains(&status) => {}
-                Ok(status) => problems.push(SinkProblem {
+                Ok(status) => outcome.problems.push(SinkProblem {
                     consumer: consumer.name.clone(),
                     message: format!("sink responded with status {status}"),
                 }),
-                Err(message) => problems.push(SinkProblem {
+                Err(message) => outcome.problems.push(SinkProblem {
                     consumer: consumer.name.clone(),
                     message,
                 }),
             }
         }
-        problems
+        outcome
     }
+}
+
+fn status_sink(consumer: &Consumer) -> Option<&str> {
+    consumer
+        .capabilities
+        .iter()
+        .any(|capability| capability == "status")
+        .then_some(consumer.sink.as_deref())
+        .flatten()
 }
 
 pub struct UreqHttpClient {
@@ -105,6 +132,7 @@ mod tests {
     use super::*;
     use crate::protocol::{Agent, PROTOCOL_VERSION, Phase, SessionIdentity};
     use std::cell::RefCell;
+    use std::thread;
 
     fn event() -> StatusEvent {
         StatusEvent {
@@ -207,5 +235,37 @@ mod tests {
         let problems = SinkFanout::new(&client).send(&event(), &consumers);
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("connection refused"));
+    }
+
+    #[test]
+    fn a_deadline_skips_remaining_sink_deliveries() {
+        struct SlowClient {
+            calls: RefCell<usize>,
+        }
+
+        impl HttpClient for SlowClient {
+            fn post_json(&self, _url: &str, _body: &[u8]) -> Result<u16, String> {
+                *self.calls.borrow_mut() += 1;
+                thread::sleep(Duration::from_millis(30));
+                Ok(200)
+            }
+        }
+
+        let client = SlowClient {
+            calls: RefCell::new(0),
+        };
+        let consumers = vec![
+            consumer("one", &["status"], Some("http://one")),
+            consumer("two", &["status"], Some("http://two")),
+            consumer("three", &["status"], Some("http://three")),
+        ];
+        let outcome = SinkFanout::new(&client).send_until(
+            &event(),
+            &consumers,
+            Some(Instant::now() + Duration::from_millis(10)),
+        );
+        assert_eq!(*client.calls.borrow(), 1);
+        assert_eq!(outcome.undelivered, 2);
+        assert!(outcome.problems.is_empty());
     }
 }

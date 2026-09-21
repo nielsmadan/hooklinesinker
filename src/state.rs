@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 const MAX_HEALTH_PROBLEMS: usize = 50;
 // Expired diagnostics must not replay as current faults on every read.
 const HEALTH_PROBLEM_TTL_SECS: u64 = 600;
+const UNVERIFIABLE_RECORD_TTL_SECS: u64 = 24 * 60 * 60;
 
 // Doctor recovers the last sink failure from the health log, so the failing subsystem is
 // part of the record rather than a prefix on its message.
@@ -373,10 +374,11 @@ impl StatusStore {
 
     pub fn dead_records<L: ProcessLiveness + ?Sized>(&self, liveness: &L) -> io::Result<usize> {
         let _guard = self.lock()?;
+        let now = Timestamp::now();
         Ok(self
             .read_complete()?
             .iter()
-            .filter(|(_, event)| is_dead(event, liveness))
+            .filter(|(_, event)| is_sweepable(event, liveness, now))
             .count())
     }
 
@@ -387,9 +389,10 @@ impl StatusStore {
             events: Vec::new(),
             problems: snapshot.problems,
         };
+        let now = Timestamp::now();
         for (path, stored) in snapshot.records {
             let mut event = stored.status;
-            if is_dead(&event, liveness) {
+            if is_sweepable(&event, liveness, now) {
                 match fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -401,7 +404,7 @@ impl StatusStore {
                         continue;
                     }
                 }
-                if !stored.retired {
+                if event.process.is_some() && !stored.retired {
                     event.running = false;
                     outcome.events.push(event);
                 }
@@ -528,7 +531,6 @@ pub struct SessionsEnvelope {
     pub problems: Vec<HealthProblem>,
 }
 
-// Unverifiable process identities qualify for neither live results nor dead-record cleanup.
 fn is_live(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> bool {
     event
         .process
@@ -541,4 +543,16 @@ fn is_dead(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> b
         .process
         .as_ref()
         .is_some_and(|identity| !liveness.process_is_alive(identity))
+}
+
+fn is_sweepable(
+    event: &StatusEvent,
+    liveness: &(impl ProcessLiveness + ?Sized),
+    now: Timestamp,
+) -> bool {
+    is_dead(event, liveness)
+        || event.process.is_none()
+            && Timestamp::parse(&event.observed_at).is_none_or(|observed| {
+                observed > now || now.seconds_since(observed) > UNVERIFIABLE_RECORD_TTL_SECS
+            })
 }

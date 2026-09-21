@@ -29,8 +29,9 @@ table at all.
 
 Ancestor detection accepts executable names and script paths under Node, Bun,
 or Deno. An unrecognized launcher can leave `process` null. A nonempty-session
-record with no process identity is retained as unverifiable diagnostic state;
-it is excluded from running results and dead counts, and a sweep leaves it alone.
+record with no process identity is retained as unverifiable diagnostic state for
+up to 24 hours. It is excluded from running results, then the next ingest sweep
+removes it without emitting a synthetic removal event.
 
 An empty session ID is different: `normalize` returns it as forward-only, so the event
 reaches sinks but cannot enter the ledger. OpenCode's load-time event uses this path so consumers can
@@ -140,12 +141,12 @@ through CLI JSON commands; the private files are an implementation detail.
 consumers with the `status` capability and a sink. Delivery is best effort and
 never retried. Ureq configures separate 200 ms connection, response-receive, and
 body-receive timeouts; these are not a 200 ms total ingest deadline. A failed sink
-does not undo ledger updates or stop delivery attempts to the remaining sinks.
+does not undo ledger updates or stop delivery attempts while budget remains.
 
-The live event is always sent. A sweep backlog is unbounded — the first ingest after a
-sleep, or a crash pile-up — so the swept events that follow share a one-second fan-out
-budget, and whatever does not fit is dropped and recorded as a health problem rather than
-stalling the editor inside the host's hook timeout.
+Live and swept events share a one-second fan-out budget, with the live event attempted
+first. Delivery attempts that do not fit are skipped and recorded as a health problem
+rather than stalling the editor inside the host's hook timeout. The OpenCode and Pi
+adapters also retain at most 32 pending ingest calls.
 
 ## Privacy and failures
 

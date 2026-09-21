@@ -376,6 +376,21 @@ fn pi_a_hanging_binary_cannot_block_the_adapter() {
     );
 }
 
+#[test]
+fn pi_adapter_bounds_its_pending_hook_queue() {
+    let Some(run) = run("pi:queue_bound:slow") else {
+        return;
+    };
+    assert_eq!(run.events().len(), 33);
+    assert_eq!(
+        run.events()
+            .iter()
+            .filter(|event| event.as_str() == "permission_prompt")
+            .count(),
+        32
+    );
+}
+
 // MARK: - OpenCode
 
 #[test]
@@ -470,6 +485,21 @@ fn opencode_a_hanging_binary_cannot_block_the_adapter() {
         run.elapsed_ms < HANG_BUDGET_MS,
         "adapter took {}ms to give up on a hanging binary, budget is {HANG_BUDGET_MS}ms",
         run.elapsed_ms
+    );
+}
+
+#[test]
+fn opencode_adapter_bounds_its_pending_hook_queue() {
+    let Some(run) = run("opencode:queue_bound:slow") else {
+        return;
+    };
+    assert_eq!(run.events().len(), 33);
+    assert_eq!(
+        run.events()
+            .iter()
+            .filter(|event| event.as_str() == "session.idle")
+            .count(),
+        32
     );
 }
 

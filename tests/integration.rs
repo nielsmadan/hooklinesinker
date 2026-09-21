@@ -797,12 +797,27 @@ fn records_without_process_identity_are_diagnostics_not_running() {
     let store = StatusStore::open(root.clone()).unwrap();
     let mut event = status("orphan-session", 500, 50);
     event.process = None;
+    event.observed_at = hooklinesinker::processes::now_rfc3339();
     store.record(&event).unwrap();
     assert!(store.running(&all_alive()).unwrap().is_empty());
     assert_eq!(store.dead_records(&all_alive()).unwrap(), 0);
     assert!(store.sweep(&all_alive()).unwrap().events.is_empty());
     assert!(store.running(&all_alive()).unwrap().is_empty());
     assert_eq!(ledger_files(&root), 1);
+}
+
+#[test]
+fn unverifiable_records_expire_without_emitting_removal_events() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let mut event = status("expired-orphan", 501, 51);
+    event.process = None;
+    event.observed_at = "2020-01-01T00:00:00Z".to_string();
+    store.record(&event).unwrap();
+
+    assert_eq!(store.dead_records(&all_alive()).unwrap(), 1);
+    assert!(store.sweep(&all_alive()).unwrap().events.is_empty());
+    assert_eq!(ledger_files(&root), 0);
 }
 
 #[test]
@@ -2679,7 +2694,7 @@ fn a_slow_sink_cannot_stretch_a_sweep_backlog_past_the_fanout_budget() {
     assert!(
         problems
             .iter()
-            .any(|p| p.message.contains("swept event(s) were not delivered")),
+            .any(|p| p.message.contains("sink delivery attempt(s) were skipped")),
         "the dropped events were not recorded: {problems:?}"
     );
 }

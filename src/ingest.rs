@@ -180,25 +180,28 @@ fn fan_out_to_sinks(
         }
     };
 
-    // The live event is one send and always goes out; only the sweep backlog is bounded.
-    if let Some(event) = forwarded {
-        record_problems(fanout.send(event, &status_consumers));
-    }
     let deadline = Instant::now() + SINK_FANOUT_BUDGET;
     let mut undelivered = 0usize;
+    if let Some(event) = forwarded {
+        let outcome = fanout.send_until(event, &status_consumers, Some(deadline));
+        undelivered += outcome.undelivered;
+        record_problems(outcome.problems);
+    }
     for swept_event in swept {
-        if Instant::now() >= deadline {
-            undelivered += 1;
-            continue;
-        }
-        record_problems(fanout.send(&synthetic_swept_event(swept_event), &status_consumers));
+        let outcome = fanout.send_until(
+            &synthetic_swept_event(swept_event),
+            &status_consumers,
+            Some(deadline),
+        );
+        undelivered += outcome.undelivered;
+        record_problems(outcome.problems);
     }
     if undelivered > 0 {
         record(
             store,
             HealthKind::Sweep,
             format!(
-                "sink fan-out exceeded its {}ms budget; {undelivered} swept event(s) were not delivered",
+                "sink fan-out exceeded its {}ms budget; {undelivered} sink delivery attempt(s) were skipped",
                 SINK_FANOUT_BUDGET.as_millis()
             ),
         );

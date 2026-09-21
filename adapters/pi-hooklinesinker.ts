@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 const HOOKLINESINKER_BIN = "__HOOKLINESINKER_BIN__";
 
 const HOOK_TIMEOUT_MS = 2000;
+const MAX_PENDING_HOOKS = 32;
 
 interface PiContext {
   hasUI?: boolean;
@@ -80,10 +81,16 @@ export default function (pi: PiHost) {
   let isUISession = false;
   const pendingPermissionRequestIds = new Set<string>();
   let hookQueue: Promise<void> = Promise.resolve();
+  let pendingHooks = 0;
 
   function queueHook(event: string, sessionId?: string, reason?: string): Promise<void> {
-    hookQueue = hookQueue.then(() => runHook(event, sessionId, reason));
-    return hookQueue;
+    if (pendingHooks >= MAX_PENDING_HOOKS) return Promise.resolve();
+    pendingHooks += 1;
+    const queued = hookQueue.then(() => runHook(event, sessionId, reason));
+    hookQueue = queued.finally(() => {
+      pendingHooks -= 1;
+    });
+    return queued;
   }
 
   function sessionId(ctx: PiContext): string | undefined {
