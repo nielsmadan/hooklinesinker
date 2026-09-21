@@ -126,7 +126,7 @@ even if another record could not be read or deleted.
 
 [`protocol.rs`](../src/protocol.rs) defines the wire contract: camelCase keys,
 kebab-case agent names, and snake_case phases. One protocol major versions all
-consumer-facing envelopes and status records. Consumers must reject unknown
+consumer-facing envelopes, capability registrations, and status records. Consumers must reject unknown
 envelope majors, skip records with unsupported majors, and surface `problems`.
 An unrecognized phase string deserializes to `unknown` rather than failing the record,
 so a future phase added in a protocol minor degrades instead of breaking. `Agent` has no
@@ -136,6 +136,8 @@ executable names or lifecycle mapping — so accepting one is a protocol-major b
 Optional additive fields preserve compatibility. Other wire changes need a
 protocol bump and coordinated Juggler and ringleader changes. Consumers read state
 through CLI JSON commands; the private files are an implementation detail.
+The crate exports only this protocol model and the CLI entry point; stores, hook
+reconciliation, normalization, and lifecycle operations remain internal.
 
 [`SinkFanout`](../src/sinks.rs) posts one event per request, sequentially across
 consumers with the `status` capability and a sink. Delivery is best effort and

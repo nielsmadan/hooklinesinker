@@ -59,6 +59,11 @@ it idle; `request_user_input` also maps to idle. Claude's `SubagentStop` is igno
 finishing cannot mark its still-working parent idle. Qwen's `SessionDelete` is ignored because
 it names a different conversation.
 
+[`agents.rs`](../src/agents.rs) is the inventory for adding an agent. Each profile ties the
+wire agent to its event source, hook backend, status-event table, executable names, shared-host
+markers, lifecycle flags, and timeout unit. Backend-specific parsing still lives in the modules
+named above, but a new agent cannot silently omit one of these cross-cutting choices.
+
 ## Embedded TypeScript
 
 [`opencode-hooklinesinker.ts`](../adapters/opencode-hooklinesinker.ts) and

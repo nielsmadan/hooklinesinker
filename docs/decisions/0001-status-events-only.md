@@ -22,8 +22,9 @@ and offer CLI snapshots plus best-effort sink delivery. Do not persist, log, or 
 native input. The original input does pass through a capped memory buffer; only the five
 fields in [NativeEvent](../../src/normalize.rs) are deserialized into the native event model.
 
-Capture a second event class only when a concrete consumer needs it. That addition must define
-a named capability, its own allowlisted schema, and explicit delivery semantics. Review
+Capture a second event class only when a concrete consumer needs it. That addition must add
+a `Capability` variant, its hook-event subscription, an allowlisted schema, and explicit
+delivery semantics. Review
 protocol compatibility against existing consumers rather than assuming every new capability
 fits protocol 1. At that point, derive installed hooks from the union of active subscriptions;
 the current [installers](../../src/hooks.rs) use a fixed status hook set.
@@ -39,5 +40,6 @@ the current [installers](../../src/hooks.rs) use a fixed status hook set.
 - New event capabilities require installer and consumer changes as well as a schema. Stronger
   delivery guarantees may justify a daemon, but status alone does not require one.
 
-The implemented capability boundary lives in [consumer validation](../../src/consumers.rs);
-the public event contract lives in [protocol.rs](../../src/protocol.rs).
+The capability and public event contracts live in [protocol.rs](../../src/protocol.rs).
+[events.rs](../../src/events.rs) maps each capability to the native hook events it requires,
+and sink dispatch matches the typed capability rather than comparing open-ended strings.

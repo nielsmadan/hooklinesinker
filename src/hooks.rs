@@ -1,6 +1,9 @@
-use crate::events::{EventSpec, native_event_specs};
+use crate::agents::{HookTarget, profile};
+#[cfg(test)]
+use crate::events::native_event_specs;
+use crate::events::{EventSpec, subscribed_event_specs};
 use crate::persistence::{LockGuard, write_preserving_atomic};
-use crate::protocol::Agent;
+use crate::protocol::{Agent, Capability};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -125,20 +128,16 @@ impl HookManager {
     pub fn install(&self, agent: Agent) -> io::Result<HookStatus> {
         let backend = self.backend(agent);
         let _guard = LockGuard::acquire_for(backend.path())?;
+        let events = subscribed_event_specs(agent, &Capability::ALL);
         match backend {
-            HookBackend::Json { path, location } => self.json_hooks().reconcile(
-                agent,
-                &path,
-                native_event_specs(agent),
-                ReconcileMode::Install,
-                location,
-            ),
-            HookBackend::Toml { path } => self.toml_hooks().reconcile(
-                agent,
-                &path,
-                native_event_specs(agent),
-                ReconcileMode::Install,
-            ),
+            HookBackend::Json { path, location } => {
+                self.json_hooks()
+                    .reconcile(agent, &path, &events, ReconcileMode::Install, location)
+            }
+            HookBackend::Toml { path } => {
+                self.toml_hooks()
+                    .reconcile(agent, &path, &events, ReconcileMode::Install)
+            }
             HookBackend::TypeScript {
                 path,
                 legacy_path,
@@ -150,15 +149,12 @@ impl HookManager {
     }
 
     pub fn status(&self, agent: Agent) -> io::Result<HookStatus> {
+        let events = subscribed_event_specs(agent, &Capability::ALL);
         match self.backend(agent) {
             HookBackend::Json { path, location } => {
-                self.json_hooks()
-                    .status(agent, &path, native_event_specs(agent), location)
+                self.json_hooks().status(agent, &path, &events, location)
             }
-            HookBackend::Toml { path } => {
-                self.toml_hooks()
-                    .status(agent, &path, native_event_specs(agent))
-            }
+            HookBackend::Toml { path } => self.toml_hooks().status(agent, &path, &events),
             HookBackend::TypeScript { path, template, .. } => {
                 self.typescript_hooks().status(agent, &path, template)
             }
@@ -168,20 +164,19 @@ impl HookManager {
     pub fn uninstall(&self, agent: Agent) -> io::Result<HookStatus> {
         let backend = self.backend(agent);
         let _guard = LockGuard::acquire_for(backend.path())?;
+        let events = subscribed_event_specs(agent, &Capability::ALL);
         match backend {
             HookBackend::Json { path, location } => self.json_hooks().reconcile(
                 agent,
                 &path,
-                native_event_specs(agent),
+                &events,
                 ReconcileMode::Uninstall,
                 location,
             ),
-            HookBackend::Toml { path } => self.toml_hooks().reconcile(
-                agent,
-                &path,
-                native_event_specs(agent),
-                ReconcileMode::Uninstall,
-            ),
+            HookBackend::Toml { path } => {
+                self.toml_hooks()
+                    .reconcile(agent, &path, &events, ReconcileMode::Uninstall)
+            }
             HookBackend::TypeScript {
                 path,
                 legacy_path,
@@ -193,34 +188,34 @@ impl HookManager {
     }
 
     fn backend(&self, agent: Agent) -> HookBackend {
-        match agent {
-            Agent::Claude => HookBackend::Json {
+        match profile(agent).hook_target {
+            HookTarget::ClaudeJson => HookBackend::Json {
                 path: self.claude_settings_path(),
                 location: HooksLocation::Nested("hooks"),
             },
-            Agent::Codex => HookBackend::Json {
+            HookTarget::CodexJson => HookBackend::Json {
                 path: self.codex_hooks_path(),
                 location: HooksLocation::Nested("hooks"),
             },
-            Agent::Opencode => HookBackend::TypeScript {
+            HookTarget::OpenCodeTypeScript => HookBackend::TypeScript {
                 path: self.opencode_plugin_path(),
                 legacy_path: self.opencode_legacy_path(),
                 template: OPENCODE_TEMPLATE,
             },
-            Agent::Pi => HookBackend::TypeScript {
+            HookTarget::PiTypeScript => HookBackend::TypeScript {
                 path: self.pi_extension_path(),
                 legacy_path: self.pi_legacy_path(),
                 template: PI_TEMPLATE,
             },
-            Agent::Droid => HookBackend::Json {
+            HookTarget::DroidJson => HookBackend::Json {
                 path: self.droid_hooks_path(),
                 location: HooksLocation::TopLevel,
             },
-            Agent::Qwen => HookBackend::Json {
+            HookTarget::QwenJson => HookBackend::Json {
                 path: self.qwen_settings_path(),
                 location: HooksLocation::Nested("hooks"),
             },
-            Agent::Kimi => HookBackend::Toml {
+            HookTarget::KimiToml => HookBackend::Toml {
                 path: self.kimi_config_path(),
             },
         }
@@ -893,11 +888,10 @@ fn build_group(spec: &EventSpec, canonical: &str, agent: Agent) -> Value {
     handler.insert("type".to_string(), Value::String("command".to_string()));
     handler.insert("command".to_string(), Value::String(canonical.to_string()));
     // Qwen's settings.json timeout is milliseconds, unlike Claude/Codex's seconds.
-    let timeout = match agent {
-        Agent::Qwen => {
-            u64::try_from(spec.timeout.as_millis()).expect("hook timeout fits u64 milliseconds")
-        }
-        _ => spec.timeout.as_secs(),
+    let timeout = if profile(agent).timeout_is_milliseconds {
+        u64::try_from(spec.timeout.as_millis()).expect("hook timeout fits u64 milliseconds")
+    } else {
+        spec.timeout.as_secs()
     };
     handler.insert("timeout".to_string(), Value::from(timeout));
     let mut group = Map::new();

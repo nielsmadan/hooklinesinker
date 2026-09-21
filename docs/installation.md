@@ -38,6 +38,24 @@ a newer activation or register between the last-consumer check and teardown.
 Active-version reads also take this lock, so `doctor` waits for installation or removal
 to finish before inspecting the symlink.
 
+### Change protocol major
+
+Protocol majors cannot coexist in the shared installation. For a coordinated migration:
+
+1. Stop every consumer and save `hooklinesinker consumers --json` plus the agents whose
+   `hooks status` is installed.
+2. Use the old-major CLI to run `uninstall --consumer NAME` for every registration. The final
+   removal clears owned hooks and the active symlink.
+3. Use a new-major binary to run `install --consumer NAME [--sink URL]` for each compatible
+   consumer.
+4. Invoke the new active binary's `hooks install --agent AGENT` for each saved agent.
+5. Verify `version --json`, `consumers --json`, every `hooks status --json`, and `doctor`.
+
+If verification fails, remove all new-major registrations, invoke a retained old-major binary
+from `versions/` to restore the old registrations, reinstall its hooks, and repeat the checks.
+Never repoint the active symlink manually or leave registrations from different majors; the
+installer's refusal is the protection against running consumers against an incompatible helper.
+
 [`ConsumerStore`](../src/consumers.rs) replaces only the registration for the same name;
 other names remain registered. Names start with a lowercase letter or digit and otherwise
 contain lowercase letters, digits, `_` or `-`. The CLI requests the `status` capability with
@@ -45,6 +63,8 @@ its own protocol major. `--sink URL` requires an absolute HTTP(S) URL; omitting 
 re-registration clears that consumer's sink. Use `consumers --json` to inspect registrations;
 records that fail syntax or semantic validation are excluded and reported in `problems`.
 Removal validates the same name rules as registration before constructing any file path.
+Capabilities are a closed wire enum in [`protocol.rs`](../src/protocol.rs); adding one requires
+an explicit protocol and delivery review rather than accepting arbitrary strings.
 
 ## Install or refresh hooks
 

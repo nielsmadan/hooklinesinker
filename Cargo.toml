@@ -2,6 +2,7 @@
 name = "hooklinesinker"
 version = "1.0.3"
 edition = "2024"
+autotests = false
 
 [lints.clippy]
 nursery = { level = "warn", priority = -1 }
@@ -16,6 +17,18 @@ path = "src/lib.rs"
 [[bin]]
 name = "hooklinesinker"
 path = "src/main.rs"
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+
+[[test]]
+name = "examples"
+path = "tests/examples.rs"
+
+[[test]]
+name = "ts_adapters"
+path = "tests/ts_adapters.rs"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }

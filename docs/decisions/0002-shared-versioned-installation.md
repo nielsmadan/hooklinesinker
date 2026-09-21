@@ -21,6 +21,17 @@ Keep consumer registrations separate from hook configuration. Removing a consume
 the shared hooks and binary while another registration exists. When the last registration
 leaves, remove owned hooks and the active symlink, while retaining version directories.
 
+An incompatible protocol major is a coordinated migration, not an in-place upgrade. Stop
+consumers, record the current registrations and hook agents, then unregister every old-major
+consumer. The last removal clears owned hooks and the active symlink. Register the new-major
+consumers with compatible binaries, reinstall hooks for each recorded agent from the new active
+binary, and verify `version --json`, `consumers --json`, hook status, and `doctor`.
+
+Do not mix majors behind one active symlink. To roll back, unregister every new-major consumer,
+invoke a retained old-major binary to register the old consumers again, reinstall its hooks,
+and repeat the same checks. Retained version directories provide rollback material but are
+never selected automatically across a protocol-major boundary.
+
 ## Consequences
 
 - Installation order cannot downgrade a compatible active helper. A consumer must support the
@@ -29,6 +40,8 @@ leaves, remove owned hooks and the active symlink, while retaining version direc
   changed binaries under a new version; use `just refresh-active` only for local iteration.
 - Updating the active executable does not install new hook entries or refresh copied adapters.
   Hook reconciliation and host trust remain explicit steps.
+- A major migration has a deliberate interruption between removing the old hooks and installing
+  the new ones; consumers must coordinate that maintenance window.
 - Deactivation does not erase all stored data. Old binaries, ledger/health data, and directories
   can remain after the last consumer is removed.
 

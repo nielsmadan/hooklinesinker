@@ -1,5 +1,4 @@
-use crate::consumers::Consumer;
-use crate::protocol::StatusEvent;
+use crate::protocol::{Capability, Consumer, StatusEvent};
 use std::time::{Duration, Instant};
 
 pub trait HttpClient {
@@ -32,6 +31,7 @@ impl<C: HttpClient> SinkFanout<C> {
         Self { client }
     }
 
+    #[cfg(test)]
     pub fn send(&self, event: &StatusEvent, consumers: &[Consumer]) -> Vec<SinkProblem> {
         self.send_until(event, consumers, None).problems
     }
@@ -83,8 +83,7 @@ impl<C: HttpClient> SinkFanout<C> {
 fn status_sink(consumer: &Consumer) -> Option<&str> {
     consumer
         .capabilities
-        .iter()
-        .any(|capability| capability == "status")
+        .contains(&Capability::Status)
         .then_some(consumer.sink.as_deref())
         .flatten()
 }
@@ -160,7 +159,13 @@ mod tests {
         Consumer {
             name: name.to_string(),
             protocol: PROTOCOL_VERSION,
-            capabilities: capabilities.iter().map(ToString::to_string).collect(),
+            capabilities: capabilities
+                .iter()
+                .map(|capability| match *capability {
+                    "status" => Capability::Status,
+                    other => panic!("unsupported test capability {other}"),
+                })
+                .collect(),
             sink: sink.map(str::to_string),
         }
     }
@@ -204,15 +209,6 @@ mod tests {
     fn consumers_without_a_sink_are_skipped() {
         let client = StubClient::ok();
         let consumers = vec![consumer("ringleader", &["status"], None)];
-        let problems = SinkFanout::new(&client).send(&event(), &consumers);
-        assert!(problems.is_empty());
-        assert!(client.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_consumer_without_the_status_capability_is_skipped() {
-        let client = StubClient::ok();
-        let consumers = vec![consumer("future", &["raw"], Some("http://sink"))];
         let problems = SinkFanout::new(&client).send(&event(), &consumers);
         assert!(problems.is_empty());
         assert!(client.calls.borrow().is_empty());

@@ -1,25 +1,15 @@
 use crate::persistence::{LockGuard, write_private_atomic};
-use serde::{Deserialize, Serialize};
+pub use crate::protocol::{Capability, Consumer};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub const SUPPORTED_PROTOCOL_MAJOR: u16 = crate::protocol::PROTOCOL_VERSION;
-pub const SUPPORTED_CAPABILITIES: &[&str] = &["status"];
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Consumer {
-    pub name: String,
-    pub protocol: u16,
-    pub capabilities: Vec<String>,
-    pub sink: Option<String>,
-}
 
 impl Consumer {
     pub fn new(
         name: impl Into<String>,
-        capabilities: Vec<String>,
+        capabilities: Vec<Capability>,
         sink: Option<String>,
     ) -> io::Result<Self> {
         let consumer = Self {
@@ -32,7 +22,7 @@ impl Consumer {
         Ok(consumer)
     }
 
-    pub(crate) fn validate(&self) -> io::Result<()> {
+    pub fn validate(&self) -> io::Result<()> {
         validate_name(&self.name)?;
         validate_protocol(self.protocol)?;
         validate_capabilities(&self.capabilities)?;
@@ -106,11 +96,12 @@ impl ConsumerStore {
         Ok(snapshot.consumers)
     }
 
-    pub fn requested_capabilities(&self, capability: &str) -> io::Result<Vec<Consumer>> {
+    #[cfg(test)]
+    pub fn requested_capabilities(&self, capability: Capability) -> io::Result<Vec<Consumer>> {
         Ok(self
             .list()?
             .into_iter()
-            .filter(|c| c.capabilities.iter().any(|cap| cap == capability))
+            .filter(|consumer| consumer.capabilities.contains(&capability))
             .collect())
     }
 
@@ -200,23 +191,14 @@ fn validate_protocol(protocol: u16) -> io::Result<()> {
     }
 }
 
-fn validate_capabilities(capabilities: &[String]) -> io::Result<()> {
+fn validate_capabilities(capabilities: &[Capability]) -> io::Result<()> {
     if capabilities.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "consumer must request at least one capability",
-        ));
-    }
-    if capabilities
-        .iter()
-        .all(|c| SUPPORTED_CAPABILITIES.contains(&c.as_str()))
-    {
-        Ok(())
-    } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unsupported capability in {capabilities:?}"),
+            "consumer must request at least one capability",
         ))
+    } else {
+        Ok(())
     }
 }
 
@@ -270,7 +252,13 @@ mod tests {
         Consumer {
             name: name.to_string(),
             protocol: SUPPORTED_PROTOCOL_MAJOR,
-            capabilities: capabilities.iter().map(ToString::to_string).collect(),
+            capabilities: capabilities
+                .iter()
+                .map(|capability| match *capability {
+                    "status" => Capability::Status,
+                    other => panic!("unsupported test capability {other}"),
+                })
+                .collect(),
             sink: sink.map(str::to_string),
         }
     }
@@ -323,10 +311,9 @@ mod tests {
                 Some("http://127.0.0.1/hook"),
             ))
             .unwrap();
-        let matches = store.requested_capabilities("status").unwrap();
+        let matches = store.requested_capabilities(Capability::Status).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "juggler");
-        assert!(store.requested_capabilities("raw").unwrap().is_empty());
     }
 
     #[test]

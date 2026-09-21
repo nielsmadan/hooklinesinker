@@ -1,3 +1,4 @@
+use crate::agents::profile;
 use crate::protocol::{Agent, ProcessIdentity};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
@@ -23,14 +24,6 @@ pub struct Timestamp(u64);
 impl Timestamp {
     pub fn now() -> Self {
         Self(epoch_now())
-    }
-
-    pub const fn from_epoch_seconds(seconds: u64) -> Self {
-        Self(seconds)
-    }
-
-    pub const fn epoch_seconds(self) -> u64 {
-        self.0
     }
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -196,17 +189,8 @@ impl SystemProcessLookup {
         Self { system }
     }
 
-    // Accept Kimi's launcher name and its self-assigned process title.
-    const fn expected_executables(agent: Agent) -> &'static [&'static str] {
-        match agent {
-            Agent::Claude => &["claude"],
-            Agent::Codex => &["codex"],
-            Agent::Opencode => &["opencode"],
-            Agent::Pi => &["pi"],
-            Agent::Droid => &["droid"],
-            Agent::Qwen => &["qwen"],
-            Agent::Kimi => &["kimi", "kimi-code"],
-        }
+    fn expected_executables(agent: Agent) -> &'static [&'static str] {
+        profile(agent).executable_names
     }
 }
 
@@ -243,12 +227,7 @@ fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &[&str]) 
 }
 
 fn is_shared_session_host(agent: Agent, cmd: &[std::ffi::OsString]) -> bool {
-    let markers: &[&str] = match agent {
-        Agent::Codex => &["app-server", "mcp-server"],
-        Agent::Qwen => &["--acp", "--experimental-acp", "serve"],
-        Agent::Kimi => &["acp", "--acp", "web", "--wire"],
-        Agent::Claude | Agent::Opencode | Agent::Pi | Agent::Droid => &[],
-    };
+    let markers = profile(agent).shared_host_markers;
     cmd.iter().skip(1).any(|arg| {
         let arg = arg.to_string_lossy();
         markers.iter().any(|marker| {

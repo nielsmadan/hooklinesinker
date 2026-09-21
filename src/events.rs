@@ -1,4 +1,4 @@
-use crate::protocol::{Agent, Phase};
+use crate::protocol::{Agent, Capability, Phase};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
@@ -15,6 +15,7 @@ pub enum EventLookup {
     Unrecognized,
 }
 
+#[derive(Clone, Copy)]
 pub struct EventSpec {
     pub name: &'static str,
     pub matcher: Option<&'static str>,
@@ -35,7 +36,7 @@ macro_rules! event {
 
 use EventAction::{Remove, Update};
 
-const CLAUDE: &[EventSpec] = &[
+pub const CLAUDE: &[EventSpec] = &[
     event!("SessionStart", None, 5, Update(Phase::Idle)),
     event!("SessionEnd", None, 5, Remove),
     event!("UserPromptSubmit", None, 5, Update(Phase::Working)),
@@ -49,7 +50,7 @@ const CLAUDE: &[EventSpec] = &[
     event!("PreCompact", Some("*"), 5, Update(Phase::Compacting)),
 ];
 
-const CODEX: &[EventSpec] = &[
+pub const CODEX: &[EventSpec] = &[
     event!("SessionStart", None, 5, Update(Phase::Idle)),
     event!("UserPromptSubmit", None, 5, Update(Phase::Working)),
     event!("PreToolUse", None, 5, Update(Phase::Working)),
@@ -62,7 +63,7 @@ const CODEX: &[EventSpec] = &[
     event!("SessionEnd", None, 3, Remove),
 ];
 
-const DROID: &[EventSpec] = &[
+pub const DROID: &[EventSpec] = &[
     event!("SessionStart", None, 5, Update(Phase::Idle)),
     event!("UserPromptSubmit", None, 5, Update(Phase::Working)),
     event!("PreToolUse", Some("*"), 5, Update(Phase::Working)),
@@ -78,7 +79,7 @@ const DROID: &[EventSpec] = &[
     event!("SessionEnd", None, 3, Remove),
 ];
 
-const QWEN: &[EventSpec] = &[
+pub const QWEN: &[EventSpec] = &[
     event!("SessionStart", None, 5, Update(Phase::Idle)),
     event!("UserPromptSubmit", None, 5, Update(Phase::Working)),
     event!("PreToolUse", Some("*"), 5, Update(Phase::Working)),
@@ -99,7 +100,7 @@ const QWEN: &[EventSpec] = &[
     event!("SessionEnd", None, 3, Remove),
 ];
 
-const KIMI: &[EventSpec] = &[
+pub const KIMI: &[EventSpec] = &[
     event!("SessionStart", None, 5, Update(Phase::Idle)),
     event!("TurnStarted", None, 5, Update(Phase::Working)),
     event!("UserPromptSubmit", None, 5, Update(Phase::Working)),
@@ -116,15 +117,18 @@ const KIMI: &[EventSpec] = &[
     event!("SessionEnd", None, 3, Remove),
 ];
 
-pub const fn native_event_specs(agent: Agent) -> &'static [EventSpec] {
-    match agent {
-        Agent::Claude => CLAUDE,
-        Agent::Codex => CODEX,
-        Agent::Droid => DROID,
-        Agent::Qwen => QWEN,
-        Agent::Kimi => KIMI,
-        Agent::Opencode | Agent::Pi => &[],
+pub fn native_event_specs(agent: Agent) -> &'static [EventSpec] {
+    crate::agents::profile(agent).status_events
+}
+
+pub fn subscribed_event_specs(agent: Agent, capabilities: &[Capability]) -> Vec<EventSpec> {
+    let mut events = Vec::new();
+    for capability in capabilities {
+        match capability {
+            Capability::Status => events.extend_from_slice(native_event_specs(agent)),
+        }
     }
+    events
 }
 
 pub fn native_event_lookup(

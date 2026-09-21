@@ -1,3 +1,4 @@
+use crate::agents::{EventSource, profile};
 use crate::events::{EventAction, EventLookup, native_event_lookup};
 use crate::processes::now_rfc3339;
 use crate::protocol::{
@@ -46,6 +47,7 @@ pub enum Normalized {
 }
 
 impl Normalized {
+    #[cfg(test)]
     pub fn into_event(self) -> Option<StatusEvent> {
         match self {
             Self::Recordable(event) | Self::ForwardOnly(event) => Some(event),
@@ -61,8 +63,8 @@ fn map_event(
     notification_type: Option<&str>,
 ) -> MappedAction {
     use MappedAction::{Ignore, Remove, Unrecognized, Update};
-    match agent {
-        Agent::Pi => match event {
+    match profile(agent).event_source {
+        EventSource::Pi => match event {
             "session_start" | "agent_settled" | "session_compact_idle" => Update(Phase::Idle),
             "agent_start" | "session_compact_working" | "permission_resolved" => {
                 Update(Phase::Working)
@@ -72,7 +74,7 @@ fn map_event(
             "session_shutdown" => Remove,
             _ => Unrecognized,
         },
-        Agent::Opencode => match event {
+        EventSource::OpenCode => match event {
             "session.created"
             | "session.status.idle"
             | "session.idle"
@@ -84,7 +86,7 @@ fn map_event(
             "session.deleted" | "server.instance.disposed" => Remove,
             _ => Unrecognized,
         },
-        Agent::Claude | Agent::Codex | Agent::Droid | Agent::Qwen | Agent::Kimi => {
+        EventSource::Native => {
             match native_event_lookup(agent, event, tool_name, notification_type) {
                 EventLookup::Mapped(EventAction::Update(phase)) => Update(phase),
                 EventLookup::Mapped(EventAction::Remove) => Remove,

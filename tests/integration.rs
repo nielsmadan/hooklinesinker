@@ -1,4 +1,4 @@
-use hooklinesinker::consumers::{Consumer, ConsumerStore};
+use hooklinesinker::consumers::ConsumerStore;
 use hooklinesinker::environment::{self, EnvSource};
 use hooklinesinker::hooks::{HookManager, HookRoots, HookState};
 use hooklinesinker::ingest;
@@ -6,7 +6,8 @@ use hooklinesinker::install::{Candidate, Installer, SemVer};
 use hooklinesinker::normalize::{HookEnvironment, Normalized, normalize};
 use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
 use hooklinesinker::protocol::{
-    Agent, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity, StatusEvent,
+    Agent, Capability, Consumer, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity,
+    StatusEvent,
 };
 use hooklinesinker::sinks::{HttpClient, SinkFanout};
 use hooklinesinker::state::{HealthKind, HealthProblem, StatusStore};
@@ -52,7 +53,13 @@ fn consumer(name: &str, capabilities: &[&str], sink: Option<&str>) -> Consumer {
     Consumer {
         name: name.to_string(),
         protocol: PROTOCOL_VERSION,
-        capabilities: capabilities.iter().map(ToString::to_string).collect(),
+        capabilities: capabilities
+            .iter()
+            .map(|capability| match *capability {
+                "status" => Capability::Status,
+                other => panic!("unsupported test capability {other}"),
+            })
+            .collect(),
         sink: sink.map(str::to_string),
     }
 }
@@ -1214,12 +1221,18 @@ fn fanout_sends_only_to_status_consumers() {
 }
 
 #[test]
-fn unsupported_capability_does_not_change_registration() {
+fn unknown_capability_cannot_be_registered() {
     let store = consumer_store();
     store
         .register(&consumer("juggler", &["status"], None))
         .unwrap();
-    assert!(store.register(&consumer("future", &["raw"], None)).is_err());
+    let unknown = serde_json::from_value::<Consumer>(serde_json::json!({
+        "name": "future",
+        "protocol": PROTOCOL_VERSION,
+        "capabilities": ["raw"],
+        "sink": null
+    }));
+    assert!(unknown.is_err());
     assert_eq!(store.list().unwrap().len(), 1);
 }
 
@@ -2359,10 +2372,18 @@ fn two_consumers_share_one_activation_and_both_still_receive_sink_fanout() {
         .unwrap();
 
     assert_eq!(installed.active_version, installed_again.active_version);
-    assert_eq!(consumers.requested_capabilities("status").unwrap().len(), 2);
+    assert_eq!(
+        consumers
+            .requested_capabilities(Capability::Status)
+            .unwrap()
+            .len(),
+        2
+    );
 
     let client = RecordingHttpClient::default();
-    let status_consumers = consumers.requested_capabilities("status").unwrap();
+    let status_consumers = consumers
+        .requested_capabilities(Capability::Status)
+        .unwrap();
     SinkFanout::new(&client).send(&status_event(), &status_consumers);
     assert_eq!(client.urls(), ["http://127.0.0.1:7483/hook"]);
 }

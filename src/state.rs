@@ -115,9 +115,9 @@ pub struct SweepOutcome {
     pub problems: Vec<String>,
 }
 
-pub(crate) struct IngestSessionOutcome {
-    pub(crate) forward: bool,
-    pub(crate) retired: SweepOutcome,
+pub struct IngestSessionOutcome {
+    pub forward: bool,
+    pub retired: SweepOutcome,
 }
 
 enum SessionDisposition {
@@ -183,6 +183,7 @@ impl StatusStore {
         Ok(self.bindings_dir.join(format!("{binding_id}.json")))
     }
 
+    #[cfg(test)]
     pub fn record(&self, event: &StatusEvent) -> io::Result<()> {
         let _guard = self.lock()?;
         let path = self.binding_path(&event.binding_id)?;
@@ -191,7 +192,7 @@ impl StatusStore {
         write_private_atomic(&path, &bytes)
     }
 
-    pub(crate) fn ingest_session(
+    pub fn ingest_session(
         &self,
         event: &mut StatusEvent,
         context: SessionContext,
@@ -283,6 +284,7 @@ impl StatusStore {
         outcome
     }
 
+    #[cfg(test)]
     pub fn end(&self, binding_id: &str) -> io::Result<()> {
         let _guard = self.lock()?;
         self.remove_binding(binding_id)
@@ -359,6 +361,7 @@ impl StatusStore {
     }
 
     // Leave deletion to ingest so polling cannot swallow a sink's removal event.
+    #[cfg(test)]
     pub fn running<L: ProcessLiveness + ?Sized>(
         &self,
         liveness: &L,

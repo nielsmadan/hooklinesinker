@@ -3,6 +3,67 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    Status,
+}
+
+impl Capability {
+    pub const ALL: [Self; 1] = [Self::Status];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Consumer {
+    pub name: String,
+    pub protocol: u16,
+    pub capabilities: Vec<Capability>,
+    pub sink: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct VersionResponse {
+    pub protocol: u16,
+    pub version: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct SessionsResponse<'a, Problem> {
+    pub protocol: u16,
+    pub sessions: &'a [StatusEvent],
+    pub problems: &'a [Problem],
+}
+
+#[derive(Serialize)]
+pub struct ConsumersResponse<'a> {
+    pub protocol: u16,
+    pub consumers: &'a [Consumer],
+    pub problems: &'a [String],
+}
+
+#[derive(Serialize)]
+pub struct ProtocolResponse<'a, Payload> {
+    pub protocol: u16,
+    #[serde(flatten)]
+    pub payload: &'a Payload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorResponse<'a, Check> {
+    pub protocol: u16,
+    pub version: &'static str,
+    pub checks: &'a [Check],
+    pub exit_code: i32,
+}
+
 // Unknown agents lack hook and lifecycle mappings; accepting them requires a protocol-major bump.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -149,6 +210,11 @@ mod tests {
             "compacting"
         );
         assert_eq!(serde_json::to_value(Phase::Unknown).unwrap(), "unknown");
+    }
+
+    #[test]
+    fn capability_spellings_are_snake_case() {
+        assert_eq!(serde_json::to_value(Capability::Status).unwrap(), "status");
     }
 
     fn sample_event() -> StatusEvent {

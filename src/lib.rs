@@ -1,14 +1,32 @@
-pub mod consumers;
-pub mod environment;
+mod agents;
+mod app;
+mod consumers;
+mod environment;
 mod events;
-pub mod hooks;
-pub mod ingest;
-pub mod install;
+mod hooks;
+mod ingest;
+mod install;
 mod lifecycle;
-pub mod normalize;
-pub mod paths;
+mod normalize;
+mod paths;
 mod persistence;
-pub mod processes;
+mod processes;
 pub mod protocol;
-pub mod sinks;
-pub mod state;
+mod sinks;
+mod state;
+
+pub use app::run;
+
+#[cfg(test)]
+mod integration_tests {
+    use crate as hooklinesinker;
+
+    include!("../tests/integration.rs");
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use crate as hooklinesinker;
+
+    include!("../tests/lifecycle.rs");
+}

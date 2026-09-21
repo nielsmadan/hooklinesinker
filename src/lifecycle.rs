@@ -1,3 +1,4 @@
+use crate::agents::{EventSource, profile};
 use crate::protocol::Agent;
 use serde::Deserialize;
 use std::io;
@@ -25,14 +26,14 @@ struct PiContext {
 }
 
 impl SessionContext {
-    pub(crate) const fn in_shared_process(self) -> Self {
+    pub const fn in_shared_process(self) -> Self {
         match self {
             Self::Selected | Self::SelectedParallel => Self::SelectedParallel,
             _ => Self::Parallel,
         }
     }
 
-    pub(crate) fn parse(agent: Agent, event: &str, input: &str) -> io::Result<Self> {
+    pub fn parse(agent: Agent, event: &str, input: &str) -> io::Result<Self> {
         let invalid = |e: serde_json::Error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -43,8 +44,9 @@ impl SessionContext {
                 ),
             )
         };
-        match agent {
-            Agent::Pi => {
+        let profile = profile(agent);
+        match profile.event_source {
+            EventSource::Pi => {
                 let context: PiContext = serde_json::from_str(input).map_err(invalid)?;
                 Ok(
                     if event == "session_start" && context.reason.as_deref() == Some("resume") {
@@ -54,18 +56,18 @@ impl SessionContext {
                     },
                 )
             }
-            Agent::Opencode => Ok(if event == "tui.session.select" {
+            EventSource::OpenCode => Ok(if event == "tui.session.select" {
                 Self::SelectedParallel
             } else {
                 Self::Background
             }),
-            Agent::Claude | Agent::Codex | Agent::Droid | Agent::Qwen | Agent::Kimi => {
+            EventSource::Native => {
                 let context: NativeContext = serde_json::from_str(input).map_err(invalid)?;
                 let role = if context.agent_id.is_some() {
                     Self::Background
                 } else if event == "SessionStart" && context.source.as_deref() == Some("resume") {
                     Self::Selected
-                } else if matches!(agent, Agent::Claude)
+                } else if profile.fork_starts_parallel
                     && event == "SessionStart"
                     && context.source.as_deref() == Some("fork")
                 {
@@ -74,7 +76,7 @@ impl SessionContext {
                     Self::Foreground
                 };
                 Ok(
-                    if agent == Agent::Qwen
+                    if profile.attributed_sessions_share_process
                         && (context.source_type.is_some() || context.source_id.is_some())
                     {
                         role.in_shared_process()

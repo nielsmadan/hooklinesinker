@@ -1,7 +1,9 @@
-use crate::consumers::{Consumer, ConsumerStore};
+use crate::consumers::ConsumerStore;
 use crate::hooks::HookManager;
 use crate::persistence::{LockGuard, write_private_atomic};
-use crate::protocol::Agent;
+#[cfg(test)]
+use crate::protocol::Capability;
+use crate::protocol::{Agent, Consumer};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -152,6 +154,7 @@ impl Installer {
         LockGuard::acquire(&self.data_root.join("install.lock"))
     }
 
+    #[cfg(test)]
     pub fn install_candidate(&self, candidate: &Candidate) -> io::Result<InstalledVersion> {
         let _guard = self.lock()?;
         self.install_candidate_locked(candidate)
@@ -432,7 +435,7 @@ mod tests {
         let consumer = Consumer {
             name: "juggler".to_string(),
             protocol: crate::protocol::PROTOCOL_VERSION,
-            capabilities: vec!["status".to_string()],
+            capabilities: vec![Capability::Status],
             sink: None,
         };
         install.install_current(&consumers, &consumer).unwrap();
@@ -447,7 +450,7 @@ mod tests {
         let consumer = Consumer {
             name: "Invalid".to_string(),
             protocol: crate::protocol::PROTOCOL_VERSION,
-            capabilities: vec!["status".to_string()],
+            capabilities: vec![Capability::Status],
             sink: None,
         };
         assert!(install.install_current(&consumers, &consumer).is_err());
@@ -464,7 +467,7 @@ mod tests {
                 &Consumer {
                     name: "juggler".to_string(),
                     protocol: crate::protocol::PROTOCOL_VERSION,
-                    capabilities: vec!["status".to_string()],
+                    capabilities: vec![Capability::Status],
                     sink: None,
                 },
             )
@@ -475,7 +478,7 @@ mod tests {
                 &Consumer {
                     name: "ringleader".to_string(),
                     protocol: crate::protocol::PROTOCOL_VERSION,
-                    capabilities: vec!["status".to_string()],
+                    capabilities: vec![Capability::Status],
                     sink: None,
                 },
             )
@@ -491,7 +494,7 @@ mod tests {
             .register(&Consumer {
                 name: "juggler".to_string(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
-                capabilities: vec!["status".to_string()],
+                capabilities: vec![Capability::Status],
                 sink: None,
             })
             .unwrap();
@@ -499,7 +502,7 @@ mod tests {
             .register(&Consumer {
                 name: "ringleader".to_string(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
-                capabilities: vec!["status".to_string()],
+                capabilities: vec![Capability::Status],
                 sink: None,
             })
             .unwrap();
@@ -520,7 +523,7 @@ mod tests {
             .register(&Consumer {
                 name: "juggler".to_string(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
-                capabilities: vec!["status".to_string()],
+                capabilities: vec![Capability::Status],
                 sink: None,
             })
             .unwrap();
@@ -553,7 +556,7 @@ mod tests {
                 .register(&Consumer {
                     name: "one".into(),
                     protocol: 1,
-                    capabilities: vec!["status".into()],
+                    capabilities: vec![Capability::Status],
                     sink: None,
                 })
                 .unwrap();
@@ -657,7 +660,7 @@ mod tests {
         let existing = Consumer {
             name: "existing".into(),
             protocol: crate::protocol::PROTOCOL_VERSION,
-            capabilities: vec!["status".into()],
+            capabilities: vec![Capability::Status],
             sink: None,
         };
         consumers.register(&existing).unwrap();
@@ -744,7 +747,7 @@ mod tests {
             .register(&Consumer {
                 name: "one".into(),
                 protocol: 1,
-                capabilities: vec!["status".into()],
+                capabilities: vec![Capability::Status],
                 sink: None,
             })
             .unwrap();
@@ -767,7 +770,7 @@ mod tests {
             .register(&Consumer {
                 name: "two".into(),
                 protocol: 1,
-                capabilities: vec!["status".into()],
+                capabilities: vec![Capability::Status],
                 sink: None,
             })
             .unwrap();

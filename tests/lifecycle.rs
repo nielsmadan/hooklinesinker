@@ -1,8 +1,8 @@
-use hooklinesinker::consumers::{Consumer, ConsumerStore};
+use hooklinesinker::consumers::ConsumerStore;
 use hooklinesinker::ingest::{IngestContext, handle_ingest};
 use hooklinesinker::normalize::{HookEnvironment, normalize};
 use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
-use hooklinesinker::protocol::{Agent, Phase, ProcessIdentity, StatusEvent};
+use hooklinesinker::protocol::{Agent, Capability, Consumer, Phase, ProcessIdentity, StatusEvent};
 use hooklinesinker::sinks::HttpClient;
 use hooklinesinker::state::StatusStore;
 use serde_json::{Value, json};
@@ -71,7 +71,7 @@ impl Fixture {
             .register(&Consumer {
                 name: "monitor".into(),
                 protocol: 1,
-                capabilities: vec!["status".into()],
+                capabilities: vec![Capability::Status],
                 sink: Some("http://127.0.0.1:7483/hook".into()),
             })
             .unwrap();
