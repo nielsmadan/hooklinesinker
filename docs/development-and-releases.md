@@ -22,13 +22,15 @@ same full checks and additionally builds the four release targets.
 
 [`Cargo.toml`](../Cargo.toml) enables Clippy's nursery and pedantic groups with lower
 priority than individual overrides. `missing_errors_doc` and `must_use_candidate` are
-allowed for the internal library. Scoped exceptions carry reasons at their use sites;
+allowed for the internal library. Rust also forbids unsafe code and warns on unreachable
+public items. Scoped exceptions carry reasons at their use sites;
 new nursery suggestions should be checked for false positives before applying them.
 
-[`package.json`](../package.json) has three development dependencies: TypeScript, Node types
-and Oxlint. Run `npm ci` after their lockfile changes. [`tsconfig.json`](../tsconfig.json)
-uses strict checking, `noEmit`, and erasable TypeScript syntax. Oxlint enables
-`typescript/no-explicit-any`. These tools add no runtime dependencies to the installed
+[`package.json`](../package.json) uses TypeScript, Node types, Oxlint, and its type-aware
+plugin. Run `npm ci` after their lockfile changes. [`tsconfig.json`](../tsconfig.json)
+uses strict checking, `noUncheckedIndexedAccess`, `noEmit`, and erasable TypeScript syntax.
+Oxlint runs type-aware correctness, suspicious, and performance rules and rejects explicit
+`any`. These tools add no runtime dependencies to the installed
 adapters, whose host interfaces cover the methods they use and validate dynamic payloads.
 
 [`tests/ts_adapters.rs`](../tests/ts_adapters.rs) drives the
@@ -90,11 +92,11 @@ After confirmation, it rechecks the checkout and remote state. Then
 Cargo metadata to update `Cargo.lock` with the existing resolution. The helper commits
 changed release files, creates an annotated tag and atomically pushes `main` and that tag.
 It prints a tag-filtered Actions URL and returns after the push.
-The [tag workflow](../.github/workflows/release.yml) builds all four targets, assembles the
+The [tag workflow](../.github/workflows/release.yml) first runs adapter, Python, formatting,
+Clippy, and Rust tests with locked dependencies. It then builds all four targets, assembles the
 three artifacts and checksum manifest, verifies the macOS binary's compiled version matches
-the tag, then automatically publishes with `gh release create --verify-tag` using CI's GitHub token. This
-workflow does not run the full test/lint suite; local release checks and the separate
-main/PR workflow provide those checks. Local success confirms the push, not finished artifacts.
+the tag, then automatically publishes with `gh release create --verify-tag` using a job-scoped
+contents-write token. Local success confirms the push, not finished artifacts.
 
 Wait for both CI and the release workflow to succeed, then verify the published assets. Consumers
 must separately update their helper version/source pins and verify release artifacts in their
