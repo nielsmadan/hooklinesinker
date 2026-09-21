@@ -37,11 +37,13 @@ function stage(assetPath, scenario) {
   const dir = join(workdir, scenario.replaceAll(":", "-"));
   mkdirSync(dir, { recursive: true });
   const recordLog = join(dir, "invocations.jsonl");
+  const pidLog = join(dir, "pids.txt");
   const binPath = join(dir, "fake-hooklinesinker");
 
   // Shell, not node: a second node runtime boot is slow enough to trip the adapter's own
   // HOOK_TIMEOUT_MS. `stdin` is already JSON, so it is embedded as a nested value.
   const recorder = `#!/bin/bash
+printf '%s\\n' "$$" >> ${JSON.stringify(pidLog)}
 stdin=$(cat)
 args=""
 for arg in "$@"; do args="$args\${args:+,}\\"$arg\\""; done
@@ -67,9 +69,37 @@ ${scenario.endsWith(":hang") ? "sleep 3600" : scenario.endsWith(":slow") ? "slee
       .filter((line) => line.length > 0)
       .map((line) => JSON.parse(line));
   };
+  const pids = () => {
+    if (!existsSync(pidLog)) return [];
+    return readFileSync(pidLog, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => Number.parseInt(line, 10));
+  };
   // A distinct path per scenario means a distinct module instance, so no adapter state leaks
   // between scenarios.
-  return { adapterPath, invocations };
+  return { adapterPath, invocations, pids };
+}
+
+function runningPids(pids) {
+  return pids.filter((pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function waitForPidsToExit(pids) {
+  const deadline = Date.now() + 1000;
+  let running = runningPids(pids);
+  while (running.length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    running = runningPids(pids);
+  }
+  return running;
 }
 
 // MARK: - Pi
@@ -102,7 +132,8 @@ async function runPi(scenario, adapterPath, invocations) {
   const start = (c = ctx, reason = "startup") => lifecycle.get("session_start")({ reason }, c);
   const shutdown = (reason, c = ctx) => lifecycle.get("session_shutdown")({ reason }, c);
   const prompt = (requestId) => events.get("permissions:ui_prompt")({ requestId });
-  const decide = (resolution) => events.get("permissions:decision")({ resolution });
+  const decide = (requestId, resolution) =>
+    events.get("permissions:decision")({ requestId, resolution });
 
   switch (scenario) {
     case "pi:session_switches":
@@ -122,7 +153,7 @@ async function runPi(scenario, adapterPath, invocations) {
     case "pi:permission_lifecycle":
       await start();
       prompt("prompt-1");
-      decide("user_denied");
+      decide("prompt-1", "user_denied");
       await shutdown("reload");
       break;
 
@@ -135,7 +166,7 @@ async function runPi(scenario, adapterPath, invocations) {
       };
       await start(resumed, "resume");
       prompt("prompt-1");
-      decide("user_approved");
+      decide("prompt-1", "user_approved");
       await shutdown("reload", resumed);
       break;
     }
@@ -149,20 +180,20 @@ async function runPi(scenario, adapterPath, invocations) {
       for (const event of [null, 1, "decision", [], { resolution: true }]) {
         events.get("permissions:decision")(event);
       }
-      decide("user_denied");
+      decide("prompt-1", "user_denied");
       await shutdown("reload");
       break;
 
     case "pi:silent_and_orphan_decisions":
       await start();
       // A decision with no pending prompt, then a non-user resolution: neither resolves.
-      decide("user_approved");
+      decide("orphan", "user_approved");
       prompt("prompt-1");
-      decide("policy_allow");
+      decide("prompt-1", "policy_allow");
       if (invocations().some((i) => i.args.includes("permission_resolved"))) {
         throw new Error("a silent or orphan decision resolved a pending prompt");
       }
-      decide("user_denied");
+      decide("prompt-1", "user_denied");
       await shutdown("reload");
       break;
 
@@ -170,7 +201,7 @@ async function runPi(scenario, adapterPath, invocations) {
       await start();
       prompt("prompt-1");
       await lifecycle.get("agent_settled")({}, ctx);
-      decide("user_denied");
+      decide("prompt-1", "user_denied");
       await shutdown("reload");
       break;
 
@@ -232,6 +263,19 @@ async function runOpenCode(scenario, adapterPath) {
         plugin.event({ event: { type: "tui.session.select", properties: { sessionID: "b" } } }),
         plugin.event({ event: { type: "session.deleted", properties: { info: { id: "a" } } } }),
       ]);
+      break;
+
+    case "opencode:instance_disposal_removes_known_sessions":
+      await plugin.event({
+        event: { type: "session.idle", properties: { sessionID: "a" } },
+      });
+      await plugin.event({
+        event: { type: "session.idle", properties: { sessionID: "b" } },
+      });
+      await plugin.event({
+        event: { type: "session.deleted", properties: { sessionID: "a" } },
+      });
+      await plugin.event({ event: { type: "server.instance.disposed" } });
       break;
 
     case "opencode:load_posts_created":
@@ -322,6 +366,7 @@ const SCENARIOS = [
   [PI_ADAPTER, "pi:queue_bound:slow"],
   [OPENCODE_ADAPTER, "opencode:load_posts_created"],
   [OPENCODE_ADAPTER, "opencode:selection_and_status_are_serialized"],
+  [OPENCODE_ADAPTER, "opencode:instance_disposal_removes_known_sessions"],
   [OPENCODE_ADAPTER, "opencode:status_becomes_event_suffix"],
   [OPENCODE_ADAPTER, "opencode:status_without_type_is_dropped"],
   [OPENCODE_ADAPTER, "opencode:untracked_event_is_dropped"],
@@ -333,13 +378,15 @@ const SCENARIOS = [
 
 const report = {};
 for (const [assetPath, scenario] of SCENARIOS) {
-  const { adapterPath, invocations } = stage(assetPath, scenario);
+  const { adapterPath, invocations, pids } = stage(assetPath, scenario);
   const started = Date.now();
   const result = scenario.startsWith("pi:")
     ? await runPi(scenario, adapterPath, invocations)
     : await runOpenCode(scenario, adapterPath);
+  const runningPids = await waitForPidsToExit(pids());
   report[scenario] = {
     invocations: invocations(),
+    runningPids,
     elapsedMs: Date.now() - started,
     ...result,
   };

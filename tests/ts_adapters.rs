@@ -72,13 +72,13 @@ fn usable_node() -> Option<String> {
 
 struct Run {
     invocations: Vec<Value>,
+    running_pids: Vec<u64>,
     registered_channels: Vec<String>,
     subscribed_channels: Vec<String>,
     elapsed_ms: u64,
 }
 
 impl Run {
-    /// The `--event` value of each fake-binary invocation, in order.
     fn events(&self) -> Vec<String> {
         self.invocations
             .iter()
@@ -169,6 +169,12 @@ fn run_harness() -> Option<HashMap<String, Run>> {
                             .as_array()
                             .cloned()
                             .unwrap_or_default(),
+                        running_pids: result["runningPids"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_u64)
+                            .collect(),
                         registered_channels: string_list(&result["registeredChannels"]),
                         subscribed_channels: string_list(&result["subscribedChannels"]),
                         elapsed_ms: result["elapsedMs"].as_u64().unwrap_or_default(),
@@ -374,6 +380,7 @@ fn pi_a_hanging_binary_cannot_block_the_adapter() {
         "adapter took {}ms to give up on a hanging binary, budget is {HANG_BUDGET_MS}ms",
         run.elapsed_ms
     );
+    assert!(run.running_pids.is_empty());
 }
 
 #[test]
@@ -381,14 +388,12 @@ fn pi_adapter_bounds_its_pending_hook_queue() {
     let Some(run) = run("pi:queue_bound:slow") else {
         return;
     };
-    assert_eq!(run.events().len(), 33);
-    assert_eq!(
-        run.events()
-            .iter()
-            .filter(|event| event.as_str() == "permission_prompt")
-            .count(),
-        32
-    );
+    let prompts = run
+        .events()
+        .iter()
+        .filter(|event| event.as_str() == "permission_prompt")
+        .count();
+    assert!((1..=32).contains(&prompts));
 }
 
 // MARK: - OpenCode
@@ -414,6 +419,25 @@ fn opencode_selection_and_status_hooks_keep_arrival_order() {
             &serde_json::json!({"session_id": id, "cwd": "/work/repo"})
         );
     }
+}
+
+#[test]
+fn opencode_instance_disposal_removes_each_known_live_session_once() {
+    let Some(run) = run("opencode:instance_disposal_removes_known_sessions") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session.created",
+            "session.idle",
+            "session.idle",
+            "session.deleted",
+            "session.deleted"
+        ]
+    );
+    assert_eq!(run.stdin(3)["session_id"], "a");
+    assert_eq!(run.stdin(4)["session_id"], "b");
 }
 
 #[test]
@@ -486,6 +510,7 @@ fn opencode_a_hanging_binary_cannot_block_the_adapter() {
         "adapter took {}ms to give up on a hanging binary, budget is {HANG_BUDGET_MS}ms",
         run.elapsed_ms
     );
+    assert!(run.running_pids.is_empty());
 }
 
 #[test]
@@ -493,14 +518,12 @@ fn opencode_adapter_bounds_its_pending_hook_queue() {
     let Some(run) = run("opencode:queue_bound:slow") else {
         return;
     };
-    assert_eq!(run.events().len(), 33);
-    assert_eq!(
-        run.events()
-            .iter()
-            .filter(|event| event.as_str() == "session.idle")
-            .count(),
-        32
-    );
+    let idle = run
+        .events()
+        .iter()
+        .filter(|event| event.as_str() == "session.idle")
+        .count();
+    assert!((1..=32).contains(&idle));
 }
 
 /// Prevent stale asset paths from silently skipping adapter assertions.

@@ -21,7 +21,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function runHook(event: string, sessionId?: string, cwd?: string): Promise<void> {
+function runHook(
+  event: string,
+  sessionId?: string,
+  cwd?: string,
+  timeoutMs = HOOK_TIMEOUT_MS,
+): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = () => {
@@ -34,17 +39,30 @@ function runHook(event: string, sessionId?: string, cwd?: string): Promise<void>
       const child = spawn(
         HOOKLINESINKER_BIN,
         ["ingest", "--agent", "opencode", "--event", event],
-        { stdio: ["pipe", "ignore", "ignore"] }
+        { detached: process.platform !== "win32", stdio: ["pipe", "ignore", "ignore"] }
       );
 
+      const kill = (signal: NodeJS.Signals) => {
+        if (process.platform !== "win32" && child.pid) {
+          process.kill(-child.pid, signal);
+        } else {
+          child.kill(signal);
+        }
+      };
       const timer = setTimeout(() => {
         try {
-          child.kill();
+          kill("SIGTERM");
         } catch {
-          // Timeout cancellation is best-effort.
+          finish();
         }
-        finish();
-      }, HOOK_TIMEOUT_MS);
+        const forceTimer = setTimeout(() => {
+          try {
+            kill("SIGKILL");
+          } catch {}
+          finish();
+        }, 100);
+        forceTimer.unref?.();
+      }, timeoutMs);
       timer.unref?.();
 
       child.on("error", finish);
@@ -69,12 +87,19 @@ export const HooklinesinkerPlugin = async ({
 }: {
   directory: string;
 }) => {
+  const knownSessionIds = new Set<string>();
   let hookQueue: Promise<void> = Promise.resolve();
   let pendingHooks = 0;
   function queueHook(event: string, sessionId?: string): Promise<void> {
     if (pendingHooks >= MAX_PENDING_HOOKS) return Promise.resolve();
+    const queuedAt = Date.now();
     pendingHooks += 1;
-    const queued = hookQueue.then(() => runHook(event, sessionId, directory));
+    const queued = hookQueue.then(() => {
+      const remaining = HOOK_TIMEOUT_MS - (Date.now() - queuedAt);
+      return remaining > 0
+        ? runHook(event, sessionId, directory, remaining)
+        : Promise.resolve();
+    });
     hookQueue = queued.finally(() => {
       pendingHooks -= 1;
     });
@@ -97,6 +122,18 @@ export const HooklinesinkerPlugin = async ({
       const info = isRecord(properties?.info) ? properties.info : undefined;
       const sessionId = [properties?.sessionID, info?.id, event.session_id, event.sessionID]
         .find((id): id is string => typeof id === "string" && id.length > 0);
+
+      if (event.type === "server.instance.disposed") {
+        const removals = [...knownSessionIds].map((id) => queueHook("session.deleted", id));
+        knownSessionIds.clear();
+        await Promise.all(removals);
+        return;
+      }
+      if (sessionId && event.type === "session.deleted") {
+        knownSessionIds.delete(sessionId);
+      } else if (sessionId) {
+        knownSessionIds.add(sessionId);
+      }
 
       let eventName = event.type;
       if (event.type === "session.status") {

@@ -7,12 +7,13 @@
   },
   "scripts": {
     "type-check": "tsc --noEmit",
-    "lint": "oxlint -A all -D typescript/no-explicit-any adapters/",
+    "lint": "oxlint --type-aware -D correctness -D suspicious -D perf -D typescript/no-explicit-any --deny-warnings adapters/",
     "check-all": "npm run type-check && npm run lint"
   },
   "devDependencies": {
     "@types/node": "24.13.4",
     "oxlint": "1.82.0",
+    "oxlint-tsgolint": "^7.0.2002",
     "typescript": "7.0.2"
   }
 }

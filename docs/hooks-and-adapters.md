@@ -35,9 +35,9 @@ that file. `hooks status --agent codex --json` exposes each owned entry's event,
 group index, and command so the host can compute trust for the installed group.
 Installing a group does not approve it.
 
-Hook status is an inspection aid, not a full host schema validator. JSON/TOML
-`installed` checks command coverage; it does not compare every matcher, timeout,
-or foreign field. TypeScript status compares the complete generated content.
+Hook status validates the complete canonical shape of each owned JSON/TOML entry,
+including matcher, timeout, command, and duplicate ownership. Foreign entries remain
+outside that comparison. TypeScript status compares the complete generated content.
 
 ## Runtime bounds and event semantics
 
@@ -48,7 +48,9 @@ in trust computation. [`hooks.rs`](../src/hooks.rs) stores event timeouts as `Du
 converts them to the host's units when rendering configuration.
 
 Both TypeScript adapters spawn with argument arrays, discard child output, and
-resolve failures. Each invocation schedules a kill after two seconds. The host
+resolve failures. Each invocation runs in its own process group and escalates from
+TERM to KILL within two seconds. Queued work uses the same deadline from enqueue time,
+so stale calls are dropped rather than starting late. The host
 timeouts and adapter timers bound waiting outside ingest; ingest's handled
 errors exit zero. See [status lifecycle](status-lifecycle.md) for sink deadlines.
 
@@ -83,12 +85,14 @@ selects the first valid session ID, and expands `session.status` with its status
 suffix before invoking ingest. It forwards only ID and directory metadata, and serializes
 invocations to preserve arrival order. `tui.session.select` forwards explicit selection
 requests without retiring other conversations; ordinary TUI navigation is not visible to
-this backend plugin.
+this backend plugin. Instance disposal emits deletion for every known session ID that was
+not already deleted.
 
 Pi queues hooks serially and suppresses sessions whose `hasUI` is false.
 Session starts forward their native `reason` so resumes can reactivate retired bindings;
 new and fork starts replace the previous foreground binding. `agent_settled` marks idle;
-manual compaction returns to idle, other compaction to working. Permission prompts stay pending until eligible decisions clear them all;
+manual compaction returns to idle, other compaction to working. Permission decisions clear
+only the pending prompt with the same request ID;
 settlement clears pending prompts. Only a shutdown with reason `quit` emits
 removal. Every shutdown drains hooks and clears pending prompts; permission listeners remain
 registered so new, resumed, forked and reloaded sessions continue reporting permission state.
@@ -96,8 +100,9 @@ registered so new, resumed, forked and reloaded sessions continue reporting perm
 ## Validation
 
 [`tsconfig.json`](../tsconfig.json) checks strict, erasable TypeScript without
-emitting JavaScript. [`package.json`](../package.json) also rejects explicit
-`any`. Host interfaces describe only the methods used locally; they do not prove
+emitting JavaScript and rejects unchecked indexed access. [`package.json`](../package.json)
+runs type-aware correctness, suspicious, and performance rules and rejects explicit `any`.
+Host interfaces describe only the methods used locally; they do not prove
 compatibility against installed host SDK types. Dynamic objects still require
 runtime validation before property access.
 

@@ -22,10 +22,9 @@ The flow starts in [`run_ingest`](../src/main.rs), which delegates to
 session ID, host, PID, and process start time. Resuming one conversation in two
 processes therefore produces two bindings. PID reuse does not preserve a binding:
 [`SystemProcessLookup`](../src/processes.rs) checks both PID and start time. Liveness checks
-refresh the requested PID while the ledger lock is held; the earlier ancestor-discovery
-snapshot cannot classify a newly started process as dead. Only ancestor discovery needs that
-snapshot, so `sessions` and `doctor` use `SystemProcessLiveness`, which holds no process
-table at all.
+reuse the ancestor-discovery snapshot during one ingest transaction, avoiding a second full
+process-table scan. `sessions` and `doctor` use `SystemProcessLiveness`, which refreshes only
+the requested PID and holds no process table.
 
 Ancestor detection accepts executable names and script paths under Node, Bun,
 or Deno. An unrecognized launcher can leave `process` null. A nonempty-session
@@ -54,7 +53,7 @@ ledger transaction in `state.rs`:
 |---|---|---|
 | Claude | Ordinary activity; `SessionStart source: resume` reactivates a retired binding | `source: fork` starts parallel; `agent_id` identifies child activity |
 | Codex | Ordinary activity, including a root `source: fork`; `source: resume` reactivates | `agent_id` identifies child activity; app-server and legacy mcp-server modes stay independent |
-| Droid | Ordinary activity; `SessionStart source: resume` reactivates | Distinct owner processes stay independent; no guaranteed native same-process child discriminator |
+| Droid | Ordinary activity; `SessionStart source: resume` reactivates | Distinct owner processes stay independent; ambiguous same-process sessions are retained conservatively |
 | Qwen | Ordinary activity, including `source: branch`; `source: resume` reactivates | ACP/serve modes and attributed `source_type`/`source_id` sessions stay independent |
 | Kimi | Ordinary activity; `SessionStart source: resume` reactivates | ACP, web and wire launch modes stay independent |
 | Pi | UI session activity, including new/fork; `session_start reason: resume` reactivates | Adapter suppresses contexts with `hasUI: false` |
@@ -75,8 +74,8 @@ display selection would require a separate TUI integration. See the
 [external identity and navigation evidence](reference/agent-hook-events.md#opencode-selection-is-navigation).
 
 **Unverified Droid case:** a child with a different ID, the same owner process, and no child
-marker currently looks like a replacement. Real child hook metadata/process ancestry still
-needs verification; conservative retention is the safe fallback if exclusivity is unknown.
+marker is retained as parallel because exclusivity is unknown. Real child hook
+metadata/process ancestry still needs verification.
 The [cross-agent reference](reference/agent-hook-events.md#session-identity-subagents-and-shared-processes)
 distinguishes documented contracts, inspected source, and unresolved behavior. Current
 regression tests exercise synthetic metadata; they do not verify real subagents across agents.
@@ -90,6 +89,8 @@ exits. They are excluded from session results and dead-binding counts. Subsequen
 for them, including delayed startup, status, and end hooks, are discarded without sink
 delivery. Explicit resume/selection reactivates them. Ingest sweeps discard markers after
 process exit without sending duplicate removals; reads never delete them.
+Parallel records sharing a long-lived host process expire after 24 hours without an update;
+the sweep emits one removal and prevents abandoned server sessions from accumulating forever.
 
 Lifecycle decisions follow ingest order. Native hooks provide no sequence number to
 distinguish a delayed resume from an intentional return, or an unseen delayed session
@@ -141,7 +142,8 @@ reconciliation, normalization, and lifecycle operations remain internal.
 
 [`SinkFanout`](../src/sinks.rs) posts one event per request, sequentially across
 consumers with the `status` capability and a sink. Delivery is best effort and
-never retried. Ureq configures separate 200 ms connection, response-receive, and
+never retried. Registration accepts plain HTTP only for loopback hosts; remote
+sinks require HTTPS. Ureq configures separate 200 ms connection, response-receive, and
 body-receive timeouts; these are not a 200 ms total ingest deadline. A failed sink
 does not undo ledger updates or stop delivery attempts while budget remains.
 

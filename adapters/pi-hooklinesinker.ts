@@ -33,7 +33,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function runHook(event: string, sessionId?: string, reason?: string): Promise<void> {
+function sessionIdFromContext(ctx: PiContext): string | undefined {
+  try {
+    return ctx?.sessionManager?.getSessionId?.() ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function runHook(
+  event: string,
+  sessionId?: string,
+  reason?: string,
+  timeoutMs = HOOK_TIMEOUT_MS,
+): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = () => {
@@ -46,17 +59,30 @@ function runHook(event: string, sessionId?: string, reason?: string): Promise<vo
       const child = spawn(
         HOOKLINESINKER_BIN,
         ["ingest", "--agent", "pi", "--event", event],
-        { stdio: ["pipe", "ignore", "ignore"] }
+        { detached: process.platform !== "win32", stdio: ["pipe", "ignore", "ignore"] }
       );
 
+      const kill = (signal: NodeJS.Signals) => {
+        if (process.platform !== "win32" && child.pid) {
+          process.kill(-child.pid, signal);
+        } else {
+          child.kill(signal);
+        }
+      };
       const timer = setTimeout(() => {
         try {
-          child.kill();
+          kill("SIGTERM");
         } catch {
-          // Timeout cancellation is best-effort.
+          finish();
         }
-        finish();
-      }, HOOK_TIMEOUT_MS);
+        const forceTimer = setTimeout(() => {
+          try {
+            kill("SIGKILL");
+          } catch {}
+          finish();
+        }, 100);
+        forceTimer.unref?.();
+      }, timeoutMs);
       timer.unref?.();
 
       child.on("error", finish);
@@ -85,24 +111,22 @@ export default function (pi: PiHost) {
 
   function queueHook(event: string, sessionId?: string, reason?: string): Promise<void> {
     if (pendingHooks >= MAX_PENDING_HOOKS) return Promise.resolve();
+    const queuedAt = Date.now();
     pendingHooks += 1;
-    const queued = hookQueue.then(() => runHook(event, sessionId, reason));
+    const queued = hookQueue.then(() => {
+      const remaining = HOOK_TIMEOUT_MS - (Date.now() - queuedAt);
+      return remaining > 0
+        ? runHook(event, sessionId, reason, remaining)
+        : Promise.resolve();
+    });
     hookQueue = queued.finally(() => {
       pendingHooks -= 1;
     });
     return queued;
   }
 
-  function sessionId(ctx: PiContext): string | undefined {
-    try {
-      return ctx?.sessionManager?.getSessionId?.() ?? undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
   function rememberSessionId(ctx: PiContext): string | undefined {
-    currentSessionId = sessionId(ctx) ?? currentSessionId;
+    currentSessionId = sessionIdFromContext(ctx) ?? currentSessionId;
     return currentSessionId;
   }
 
@@ -135,8 +159,8 @@ export default function (pi: PiHost) {
   });
   pi.events.on("permissions:decision", (event) => {
     if (!isUISession || !isPromptDecision(event)) return;
-    const requestId = pendingPermissionRequestIds.values().next().value;
-    if (typeof requestId !== "string") return;
+    const requestId = permissionRequestId(event);
+    if (!requestId || !pendingPermissionRequestIds.has(requestId)) return;
     pendingPermissionRequestIds.delete(requestId);
     queuePermissionResolvedIfNonePending();
   });
@@ -144,7 +168,7 @@ export default function (pi: PiHost) {
   pi.on("session_start", async (event, ctx) => {
     pendingPermissionRequestIds.clear();
     isUISession = ctx?.hasUI !== false;
-    currentSessionId = isUISession ? sessionId(ctx) : undefined;
+    currentSessionId = isUISession ? sessionIdFromContext(ctx) : undefined;
     if (isUISession) {
       const reason = typeof event?.reason === "string" ? event.reason : undefined;
       await queueHook("session_start", currentSessionId, reason);
