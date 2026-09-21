@@ -1,5 +1,7 @@
 use assert_cmd::Command;
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -472,8 +474,7 @@ fn doctor_human_output_has_one_line_per_check() {
 #[test]
 fn doctor_does_not_fail_on_a_stale_sink_error() {
     let temp = unique_temp_dir("doctor-sink-error");
-    let state_dir = temp.join("hooklinesinker");
-    std::fs::create_dir_all(&state_dir).unwrap();
+    let state_dir = private_state_dir(&temp);
     std::fs::write(
         state_dir.join("health.json"),
         serde_json::json!([
@@ -496,8 +497,7 @@ fn doctor_does_not_fail_on_a_stale_sink_error() {
 #[test]
 fn doctor_reads_a_health_record_that_predates_the_problem_kind() {
     let temp = unique_temp_dir("doctor-legacy-health");
-    let state_dir = temp.join("hooklinesinker");
-    std::fs::create_dir_all(&state_dir).unwrap();
+    let state_dir = private_state_dir(&temp);
     std::fs::write(
         state_dir.join("health.json"),
         serde_json::json!([
@@ -529,10 +529,18 @@ fn doctor_last_sink_error(temp: &std::path::Path) -> String {
         .to_string()
 }
 
+fn private_state_dir(temp: &std::path::Path) -> PathBuf {
+    let state_dir = temp.join("hooklinesinker");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    state_dir
+}
+
 #[test]
 fn doctor_fails_when_a_status_record_is_unparseable() {
     let temp = unique_temp_dir("doctor-corrupt-status");
-    let status_dir = temp.join("hooklinesinker/status");
+    let status_dir = private_state_dir(&temp).join("status");
     std::fs::create_dir_all(&status_dir).unwrap();
     std::fs::write(status_dir.join("broken.json"), b"not json").unwrap();
 
@@ -557,6 +565,68 @@ fn doctor_fails_when_a_status_record_is_unparseable() {
     assert_eq!(status_check["ok"], false);
 }
 
+#[test]
+fn doctor_fails_when_the_health_log_is_unparseable() {
+    let temp = unique_temp_dir("doctor-corrupt-health");
+    let state_dir = private_state_dir(&temp);
+    std::fs::write(state_dir.join("health.json"), b"not json").unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(value["exitCode"], 0);
+    let health_check = value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "last_sink_error")
+        .unwrap();
+    assert_eq!(health_check["ok"], false);
+    assert!(
+        health_check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("failed to read health problems")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_insecure_state_permissions_before_repairing_them() {
+    let temp = unique_temp_dir("doctor-permissions");
+    let state_dir = temp.join("hooklinesinker");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(value["exitCode"], 0);
+    let permissions_check = value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "permissions")
+        .unwrap();
+    assert_eq!(permissions_check["ok"], false);
+    assert!(
+        permissions_check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("755")
+    );
+    assert_eq!(
+        std::fs::metadata(state_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
 fn dead_ledger_record(session_id: &str) -> String {
     serde_json::json!({
         "protocol": 1,
@@ -579,7 +649,7 @@ fn dead_ledger_record(session_id: &str) -> String {
 #[test]
 fn doctor_counts_a_dead_record_without_removing_it() {
     let temp = unique_temp_dir("doctor-dead-record");
-    let status_dir = temp.join("hooklinesinker/status");
+    let status_dir = private_state_dir(&temp).join("status");
     std::fs::create_dir_all(&status_dir).unwrap();
     let record_path = status_dir.join("dead.json");
     std::fs::write(&record_path, dead_ledger_record("dead-session")).unwrap();

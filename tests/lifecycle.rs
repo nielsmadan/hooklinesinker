@@ -1,9 +1,10 @@
 use hooklinesinker::consumers::{Consumer, ConsumerStore};
+use hooklinesinker::ingest::{IngestContext, handle_ingest};
 use hooklinesinker::normalize::{HookEnvironment, normalize};
 use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
 use hooklinesinker::protocol::{Agent, Phase, ProcessIdentity, StatusEvent};
 use hooklinesinker::sinks::HttpClient;
-use hooklinesinker::state::{IngestContext, StatusStore, handle_ingest};
+use hooklinesinker::state::StatusStore;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Mutex;

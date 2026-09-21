@@ -1,22 +1,15 @@
-use crate::consumers::ConsumerStore;
 use crate::lifecycle::SessionContext;
-use crate::normalize::{HookEnvironment, Normalized, normalize};
-use crate::processes::{ProcessLiveness, ProcessLookup, Timestamp};
+use crate::persistence::{LockGuard, write_private_atomic};
+use crate::processes::{ProcessLiveness, Timestamp};
 use crate::protocol::{Agent, StatusEvent};
-use crate::sinks::{HttpClient, SinkFanout};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 const MAX_HEALTH_PROBLEMS: usize = 50;
 // Expired diagnostics must not replay as current faults on every read.
 const HEALTH_PROBLEM_TTL_SECS: u64 = 600;
-// A sweep backlog is unbounded, each sink send costs up to ~600ms of ureq timeouts, and
-// Codex caps a hook at 3s. Deliver what fits and record the rest as a health problem.
-const SINK_FANOUT_BUDGET: Duration = Duration::from_millis(1_000);
 
 // Doctor recovers the last sink failure from the health log, so the failing subsystem is
 // part of the record rather than a prefix on its message.
@@ -121,9 +114,9 @@ pub struct SweepOutcome {
     pub problems: Vec<String>,
 }
 
-struct IngestSessionOutcome {
-    forward: bool,
-    retired: SweepOutcome,
+pub(crate) struct IngestSessionOutcome {
+    pub(crate) forward: bool,
+    pub(crate) retired: SweepOutcome,
 }
 
 enum SessionDisposition {
@@ -175,19 +168,29 @@ impl StatusStore {
         LockGuard::acquire(&self.lock_path)
     }
 
-    fn binding_path(&self, binding_id: &str) -> PathBuf {
-        self.bindings_dir.join(format!("{binding_id}.json"))
+    fn binding_path(&self, binding_id: &str) -> io::Result<PathBuf> {
+        if binding_id.len() != 64
+            || !binding_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binding ID must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        Ok(self.bindings_dir.join(format!("{binding_id}.json")))
     }
 
     pub fn record(&self, event: &StatusEvent) -> io::Result<()> {
         let _guard = self.lock()?;
-        let path = self.binding_path(&event.binding_id);
+        let path = self.binding_path(&event.binding_id)?;
         let bytes = serde_json::to_vec_pretty(event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         write_private_atomic(&path, &bytes)
     }
 
-    fn ingest_session(
+    pub(crate) fn ingest_session(
         &self,
         event: &mut StatusEvent,
         context: SessionContext,
@@ -238,7 +241,7 @@ impl StatusStore {
         if !event.running && event.process.is_none() {
             self.remove_binding(&event.binding_id)
         } else {
-            stored.write(&self.binding_path(&event.binding_id))
+            stored.write(&self.binding_path(&event.binding_id)?)
         }
     }
 
@@ -285,7 +288,7 @@ impl StatusStore {
     }
 
     fn remove_binding(&self, binding_id: &str) -> io::Result<()> {
-        match fs::remove_file(self.binding_path(binding_id)) {
+        match fs::remove_file(self.binding_path(binding_id)?) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -538,252 +541,4 @@ fn is_dead(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> b
         .process
         .as_ref()
         .is_some_and(|identity| !liveness.process_is_alive(identity))
-}
-
-pub(crate) struct LockGuard {
-    file: File,
-}
-
-impl LockGuard {
-    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
-        let mut options = OpenOptions::new();
-        options.create(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(path)?;
-        file.lock_exclusive()?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp_path = path.with_extension("tmp");
-    {
-        let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, path)?;
-    Ok(())
-}
-
-pub fn read_capped(reader: &mut impl Read, limit: u64) -> io::Result<String> {
-    let mut buf = Vec::new();
-    reader.take(limit + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > limit {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("stdin exceeded the {limit}-byte cap"),
-        ));
-    }
-    String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-pub struct IngestOutcome {
-    pub problem: Option<String>,
-}
-
-pub struct IngestContext<'a> {
-    pub store: &'a StatusStore,
-    pub liveness: &'a dyn ProcessLookup,
-    pub consumers: Option<&'a ConsumerStore>,
-    pub http_client: &'a dyn HttpClient,
-}
-
-pub fn handle_ingest(
-    ctx: &IngestContext,
-    agent: Agent,
-    event: &str,
-    input: &str,
-    env: &HookEnvironment,
-    hook_pid: u32,
-) -> IngestOutcome {
-    let store = ctx.store;
-    let process = ctx.liveness.owner_of(hook_pid, agent);
-    let mut forwarded: Option<StatusEvent> = None;
-    let mut problems: Vec<HealthProblem> = Vec::new();
-    let mut retired = SweepOutcome::default();
-
-    let outcome =
-        normalize(agent, event, input, env, process).and_then(|normalized| match normalized {
-            Normalized::Ignored => Ok(()),
-            Normalized::Unrecognized => {
-                problems.push(HealthProblem::new(
-                    HealthKind::Ingest,
-                    format!(
-                        "unrecognized {} event \"{event}\"; no status was recorded",
-                        agent.as_str()
-                    ),
-                ));
-                Ok(())
-            }
-            Normalized::ForwardOnly(status_event) => {
-                forwarded = Some(status_event);
-                Ok(())
-            }
-            Normalized::Recordable(mut status_event) => {
-                let mut context = SessionContext::parse(agent, event, input)?;
-                if status_event
-                    .process
-                    .as_ref()
-                    .is_some_and(|process| !ctx.liveness.has_exclusive_session(process, agent))
-                {
-                    context = context.in_shared_process();
-                }
-                let session_outcome = store.ingest_session(&mut status_event, context)?;
-                if session_outcome.forward {
-                    forwarded = Some(status_event);
-                }
-                retired = session_outcome.retired;
-                Ok(())
-            }
-        });
-
-    if let Err(e) = outcome {
-        problems.push(HealthProblem::new(HealthKind::Ingest, e.to_string()));
-    }
-    problems.extend(
-        retired
-            .problems
-            .into_iter()
-            .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
-    );
-    let mut swept = retired.events;
-    match store.sweep(ctx.liveness) {
-        Ok(outcome) => {
-            problems.extend(
-                outcome
-                    .problems
-                    .into_iter()
-                    .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
-            );
-            swept.extend(outcome.events);
-        }
-        Err(e) => {
-            problems.push(HealthProblem::new(
-                HealthKind::Sweep,
-                format!("sweep failed: {e}"),
-            ));
-        }
-    }
-
-    let mut messages: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
-    // A health write that fails is still reported to the caller, which is the only place
-    // left that can surface it.
-    messages.extend(
-        problems
-            .into_iter()
-            .filter_map(|problem| store.record_health(problem).err())
-            .map(|e| format!("failed to record health problem: {e}")),
-    );
-    let problem = (!messages.is_empty()).then(|| messages.join("; "));
-
-    fan_out_to_sinks(store, ctx, forwarded.as_ref(), swept);
-
-    IngestOutcome { problem }
-}
-
-fn fan_out_to_sinks(
-    store: &StatusStore,
-    ctx: &IngestContext,
-    forwarded: Option<&StatusEvent>,
-    swept: Vec<StatusEvent>,
-) {
-    if forwarded.is_none() && swept.is_empty() {
-        return;
-    }
-    let Some(consumers) = ctx.consumers else {
-        return;
-    };
-
-    let snapshot = match consumers.snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(e) => {
-            record(
-                store,
-                HealthKind::Other,
-                format!("sink consumer lookup failed: {e}"),
-            );
-            return;
-        }
-    };
-    for problem in snapshot.problems {
-        record(
-            store,
-            HealthKind::Other,
-            format!("sink consumer lookup failed: {problem}"),
-        );
-    }
-    let status_consumers = snapshot.consumers;
-    if status_consumers.is_empty() {
-        return;
-    }
-
-    let fanout = SinkFanout::new(ctx.http_client);
-    let record_problems = |problems: Vec<crate::sinks::SinkProblem>| {
-        for problem in problems {
-            // The message keeps its existing wording for consumers reading `problems[].message`;
-            // the kind is what doctor classifies on.
-            let message = format!("sink {} failed: {}", problem.consumer, problem.message);
-            record(
-                store,
-                HealthKind::Sink {
-                    consumer: problem.consumer,
-                },
-                message,
-            );
-        }
-    };
-
-    // The live event is one send and always goes out; only the sweep backlog is bounded.
-    if let Some(event) = forwarded {
-        record_problems(fanout.send(event, &status_consumers));
-    }
-    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
-    let mut undelivered = 0usize;
-    for swept_event in swept {
-        if Instant::now() >= deadline {
-            undelivered += 1;
-            continue;
-        }
-        record_problems(fanout.send(&synthetic_swept_event(swept_event), &status_consumers));
-    }
-    if undelivered > 0 {
-        record(
-            store,
-            HealthKind::Sweep,
-            format!(
-                "sink fan-out exceeded its {}ms budget; {undelivered} swept event(s) were not delivered",
-                SINK_FANOUT_BUDGET.as_millis()
-            ),
-        );
-    }
-}
-
-fn record(store: &StatusStore, kind: HealthKind, message: String) {
-    let _ = store.record_health(HealthProblem::new(kind, message));
-}
-
-fn synthetic_swept_event(mut swept: StatusEvent) -> StatusEvent {
-    // The `swept` event name is part of the protocol 1 consumer contract.
-    swept.event = "swept".to_string();
-    swept.running = false;
-    swept.observed_at = crate::processes::now_rfc3339();
-    swept
 }

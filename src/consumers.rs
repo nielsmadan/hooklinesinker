@@ -1,4 +1,4 @@
-use crate::state::{LockGuard, write_private_atomic};
+use crate::persistence::{LockGuard, write_private_atomic};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;

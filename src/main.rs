@@ -5,12 +5,13 @@ use cli::{Cli, Command, HooksCommand};
 use hooklinesinker::consumers::{Consumer, ConsumerStore};
 use hooklinesinker::environment::{self, SystemEnv};
 use hooklinesinker::hooks::{HookManager, HookRoots, HookState, HookStatus};
+use hooklinesinker::ingest::{self, IngestContext};
 use hooklinesinker::install::{InstalledVersion, Installer, UninstallOutcome};
 use hooklinesinker::paths;
 use hooklinesinker::processes::{SystemProcessLiveness, SystemProcessLookup};
 use hooklinesinker::protocol::{Agent, PROTOCOL_VERSION};
 use hooklinesinker::sinks::UreqHttpClient;
-use hooklinesinker::state::{self, HealthKind, HealthProblem, SessionsEnvelope, StatusStore};
+use hooklinesinker::state::{HealthKind, HealthProblem, SessionsEnvelope, StatusStore};
 use std::io;
 
 fn main() {
@@ -57,7 +58,7 @@ fn run_ingest(agent: Agent, event: &str) {
         std::process::exit(0);
     };
 
-    let input = match state::read_capped(&mut io::stdin(), 1_048_576) {
+    let input = match ingest::read_capped(&mut io::stdin(), 1_048_576) {
         Ok(input) => input,
         Err(e) => {
             let _ = store.record_health(HealthProblem::new(
@@ -87,13 +88,13 @@ fn run_ingest(agent: Agent, event: &str) {
     let liveness = SystemProcessLookup::new();
     let http_client = UreqHttpClient::new();
     let hook_pid = std::process::id();
-    let ctx = state::IngestContext {
+    let ctx = IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: consumers.as_ref(),
         http_client: &http_client,
     };
-    let outcome = state::handle_ingest(&ctx, agent, event, &input, &env, hook_pid);
+    let outcome = ingest::handle_ingest(&ctx, agent, event, &input, &env, hook_pid);
     // Agent hosts ignore hook stderr, so this surfaces the failure to a human running the
     // command by hand without touching ingest's exit-0 contract.
     if let Some(problem) = outcome.problem {
@@ -352,14 +353,15 @@ fn run_doctor(json: bool) {
         ),
     });
 
-    let status_store = StatusStore::open(paths::state_root());
-    let consumer_store = ConsumerStore::open(paths::state_root());
-
-    let permissions = permissions_check(&paths::state_root());
+    let state_root = paths::state_root();
+    let permissions = permissions_check(&state_root);
     if !permissions.ok {
         fatal = true;
     }
     checks.push(permissions);
+
+    let status_store = StatusStore::open(&state_root);
+    let consumer_store = ConsumerStore::open(&state_root);
 
     let active_version_check = doctor_active_version();
     if !active_version_check.ok {
@@ -414,7 +416,11 @@ fn run_doctor(json: bool) {
         }),
     }
 
-    checks.push(doctor_last_sink_error(&status_store));
+    let last_sink_error = doctor_last_sink_error(&status_store);
+    if !last_sink_error.ok {
+        fatal = true;
+    }
+    checks.push(last_sink_error);
 
     let exit_code = i32::from(fatal);
 
@@ -546,20 +552,27 @@ fn doctor_active_version() -> DoctorCheck {
 }
 
 fn doctor_last_sink_error(status_store: &io::Result<StatusStore>) -> DoctorCheck {
-    let detail = status_store.as_ref().map_or_else(
-        |_| "unavailable".to_string(),
-        |store| match store.health_problems() {
-            Ok(problems) => problems
-                .iter()
-                .rev()
-                .find(|p| p.is_sink_failure())
-                .map_or_else(|| "none".to_string(), |p| p.message.clone()),
-            Err(e) => format!("failed to read health problems: {e}"),
+    match status_store {
+        Ok(store) => match store.health_problems() {
+            Ok(problems) => DoctorCheck {
+                name: "last_sink_error",
+                ok: true,
+                detail: problems
+                    .iter()
+                    .rev()
+                    .find(|p| p.is_sink_failure())
+                    .map_or_else(|| "none".to_string(), |p| p.message.clone()),
+            },
+            Err(e) => DoctorCheck {
+                name: "last_sink_error",
+                ok: false,
+                detail: format!("failed to read health problems: {e}"),
+            },
         },
-    );
-    DoctorCheck {
-        name: "last_sink_error",
-        ok: true,
-        detail,
+        Err(e) => DoctorCheck {
+            name: "last_sink_error",
+            ok: false,
+            detail: format!("state store unavailable: {e}"),
+        },
     }
 }

@@ -95,8 +95,8 @@ envelope whose `protocol` is not one they speak, and skip individual records who
 
 Keys are camelCase. `agent` is kebab-case (`claude`, `codex`, `opencode`, `pi`, `droid`, `qwen`,
 `kimi`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`).
-Consumers should map unfamiliar phase values to `unknown` when the rest of the record can be
-decoded; the Rust enum itself does not provide that fallback.
+Rust deserialization maps unfamiliar phase values to `unknown` when the rest of the record can
+be decoded; consumers in other languages should provide the same fallback.
 
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which also separates two terminals driving the same native session.

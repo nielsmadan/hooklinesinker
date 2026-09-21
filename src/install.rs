@@ -1,7 +1,7 @@
 use crate::consumers::{Consumer, ConsumerStore};
 use crate::hooks::HookManager;
+use crate::persistence::{LockGuard, write_private_atomic};
 use crate::protocol::Agent;
-use crate::state::{LockGuard, write_private_atomic};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};

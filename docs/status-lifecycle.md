@@ -5,13 +5,15 @@ registered sinks. It has no daemon, event history, delivery queue, or retry work
 
 ## Ingest and identity
 
-The flow starts in [`run_ingest`](../src/main.rs), passes through
-[`normalize`](../src/normalize.rs), and updates [`StatusStore`](../src/state.rs):
+The flow starts in [`run_ingest`](../src/main.rs), which delegates to
+[`handle_ingest`](../src/ingest.rs). That application layer normalizes the event and updates
+[`StatusStore`](../src/state.rs):
 
 1. Read at most 1 MiB of native JSON; gather terminal, tmux, Git, and remote-host
    context; discover the owning agent by walking the hook process's ancestors.
-2. Map the native event to a phase update, removal, or ignored event. The mapping
-   in `normalize.rs` is canonical; unknown event names are ignored.
+2. Map command-hook events through `events.rs` and adapter-specific events through
+   `normalize.rs` to a phase update, removal, or ignored event. Event names outside an
+   agent's vocabulary become ingest diagnostics.
 3. Write or remove the binding, retire superseded foreground bindings, then
    sweep bindings whose processes have died.
 4. Send the normalized event and synthetic removals to registered status sinks.

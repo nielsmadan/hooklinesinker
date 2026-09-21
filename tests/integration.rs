@@ -1,6 +1,7 @@
 use hooklinesinker::consumers::{Consumer, ConsumerStore};
 use hooklinesinker::environment::{self, EnvSource};
 use hooklinesinker::hooks::{HookManager, HookRoots, HookState};
+use hooklinesinker::ingest;
 use hooklinesinker::install::{Candidate, Installer, SemVer};
 use hooklinesinker::normalize::{HookEnvironment, Normalized, normalize};
 use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
@@ -8,8 +9,10 @@ use hooklinesinker::protocol::{
     Agent, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity, StatusEvent,
 };
 use hooklinesinker::sinks::{HttpClient, SinkFanout};
-use hooklinesinker::state::{self, HealthKind, HealthProblem, StatusStore};
+use hooklinesinker::state::{HealthKind, HealthProblem, StatusStore};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -104,19 +107,19 @@ impl HttpClient for FailingHttpClient {
 }
 
 fn ingest(
-    ctx: &state::IngestContext,
+    ctx: &ingest::IngestContext,
     agent: Agent,
     event: &str,
     input: &str,
     hook_pid: u32,
-) -> state::IngestOutcome {
-    state::handle_ingest(ctx, agent, event, input, &test_environment(), hook_pid)
+) -> ingest::IngestOutcome {
+    ingest::handle_ingest(ctx, agent, event, input, &test_environment(), hook_pid)
 }
 
 fn status(session_id: &str, pid: u32, started_at: u64) -> StatusEvent {
     StatusEvent {
         protocol: PROTOCOL_VERSION,
-        binding_id: format!("{session_id}-{pid}-{started_at}"),
+        binding_id: test_binding_id(&format!("{session_id}-{pid}-{started_at}")),
         agent: Agent::Claude,
         event: "PreToolUse".into(),
         phase: Phase::Working,
@@ -137,6 +140,15 @@ fn status(session_id: &str, pid: u32, started_at: u64) -> StatusEvent {
         git: None,
         remote_host: None,
     }
+}
+
+fn test_binding_id(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut id = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(id, "{byte:02x}").unwrap();
+    }
+    id
 }
 
 struct AllAlive;
@@ -340,7 +352,7 @@ fn codex_interrupt_keeps_the_session_live_and_pushes_idle_to_consumers() {
     let liveness = FakeProcessLookup::with_owner(process.clone());
     liveness.set_alive(process.pid, &process.started_at);
     let client = RecordingHttpClient::default();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),
@@ -641,14 +653,14 @@ fn malformed_native_json_is_rejected() {
 #[test]
 fn oversized_stdin_is_rejected_before_processing() {
     let mut reader = std::io::Cursor::new(vec![b'a'; 2_000_000]);
-    let result = state::read_capped(&mut reader, 1_048_576);
+    let result = ingest::read_capped(&mut reader, 1_048_576);
     assert!(result.is_err());
 }
 
 #[test]
 fn stdin_at_or_under_the_cap_is_accepted() {
     let mut reader = std::io::Cursor::new(b"{}".to_vec());
-    let result = state::read_capped(&mut reader, 1_048_576).unwrap();
+    let result = ingest::read_capped(&mut reader, 1_048_576).unwrap();
     assert_eq!(result, "{}");
 }
 
@@ -657,7 +669,7 @@ fn stdin_at_or_under_the_cap_is_accepted() {
 fn stdin_of_exactly_the_cap_is_accepted() {
     const LIMIT: usize = 1_048_576;
     let mut reader = std::io::Cursor::new(vec![b'a'; LIMIT]);
-    let result = state::read_capped(&mut reader, LIMIT as u64).unwrap();
+    let result = ingest::read_capped(&mut reader, LIMIT as u64).unwrap();
     assert_eq!(result.len(), LIMIT);
 }
 
@@ -665,7 +677,7 @@ fn stdin_of_exactly_the_cap_is_accepted() {
 fn stdin_one_byte_over_the_cap_is_rejected() {
     const LIMIT: usize = 1_048_576;
     let mut reader = std::io::Cursor::new(vec![b'a'; LIMIT + 1]);
-    let result = state::read_capped(&mut reader, LIMIT as u64);
+    let result = ingest::read_capped(&mut reader, LIMIT as u64);
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
 }
 
@@ -696,7 +708,7 @@ fn concurrent_writes_to_the_same_binding_never_produce_a_torn_file() {
         handles.push(std::thread::spawn(move || {
             for _ in 0..25 {
                 let mut event = status(&format!("session-{i}"), 900, 90);
-                event.binding_id = "shared-binding".into();
+                event.binding_id = test_binding_id("shared-binding");
                 store.record(&event).unwrap();
             }
         }));
@@ -721,6 +733,26 @@ fn running_excludes_dead_bindings_without_deleting_them() {
         1,
         "a read must leave the dead binding on disk for ingest to sweep and fan out"
     );
+}
+
+#[test]
+fn binding_paths_reject_invalid_ids_before_accessing_the_filesystem() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let outside = root.join("outside.json");
+    std::fs::write(&outside, "keep").unwrap();
+
+    let mut event = status("invalid-binding", 301, 31);
+    event.binding_id = "../outside".into();
+    assert_eq!(
+        store.record(&event).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        store.end("../outside").unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "keep");
 }
 
 #[test]
@@ -838,7 +870,7 @@ fn unrelated_ingest_sweeps_a_dead_binding() {
     dying_liveness.set_alive(700, "70");
 
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &dying_liveness,
             consumers: None,
@@ -862,7 +894,7 @@ fn unrelated_ingest_sweeps_a_dead_binding() {
     // Omitting pid 700 simulates its exit before the unrelated ingest.
 
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &other_liveness,
             consumers: None,
@@ -885,7 +917,7 @@ fn ingest_records_a_health_problem_on_malformed_input_and_still_succeeds() {
     let store = store();
     let liveness = FakeProcessLookup::new();
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: None,
@@ -920,7 +952,7 @@ fn a_type_mismatched_scalar_in_native_json_never_reaches_the_health_record() {
     let store = store();
     let liveness = FakeProcessLookup::new();
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: None,
@@ -1196,7 +1228,7 @@ fn ingest_fans_out_the_recorded_event_to_registered_status_sinks() {
     liveness.set_alive(900, "90");
 
     ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: Some(&consumers),
@@ -1247,7 +1279,7 @@ fn claude_replacement_uses_tmux_pane_identity_when_session_names_change() {
             ))
             .unwrap();
         let client = RecordingHttpClient::default();
-        let ctx = state::IngestContext {
+        let ctx = ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: Some(&consumers),
@@ -1266,7 +1298,7 @@ fn claude_replacement_uses_tmux_pane_identity_when_session_names_change() {
             ),
         ] {
             let outcome =
-                state::handle_ingest(&ctx, Agent::Claude, event, input, &env, process.pid);
+                ingest::handle_ingest(&ctx, Agent::Claude, event, input, &env, process.pid);
             assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
         }
         let mut ids: Vec<_> = store
@@ -1282,7 +1314,7 @@ fn claude_replacement_uses_tmux_pane_identity_when_session_names_change() {
             assert_eq!(before.len(), 3);
             assert_eq!(before[2]["session"]["id"], "a");
             assert_eq!(before[2]["running"], false);
-            let outcome = state::handle_ingest(
+            let outcome = ingest::handle_ingest(
                 &ctx,
                 Agent::Claude,
                 "Stop",
@@ -1324,7 +1356,7 @@ fn claude_session_start_immediately_replaces_every_foreground_phase() {
             ))
             .unwrap();
         let client = RecordingHttpClient::default();
-        let ctx = state::IngestContext {
+        let ctx = ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: Some(&consumers),
@@ -1369,7 +1401,7 @@ fn claude_activity_retires_an_abandoned_startup_in_the_same_process() {
     let process = test_process();
     let liveness = FakeProcessLookup::with_owner(process.clone());
     liveness.set_alive(process.pid, &process.started_at);
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),
@@ -1440,7 +1472,7 @@ fn claude_parallel_conversations_preserve_foreground_startups() {
         let liveness = FakeProcessLookup::with_owner(process.clone());
         liveness.set_alive(process.pid, &process.started_at);
         let client = RecordingHttpClient::default();
-        let ctx = state::IngestContext {
+        let ctx = ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: None,
@@ -1455,7 +1487,7 @@ fn claude_parallel_conversations_preserve_foreground_startups() {
         }
 
         let reopened = StatusStore::open(&root).unwrap();
-        let ctx = state::IngestContext {
+        let ctx = ingest::IngestContext {
             store: &reopened,
             ..ctx
         };
@@ -1495,7 +1527,7 @@ fn claude_foreground_activity_preserves_fork_startups() {
     let liveness = FakeProcessLookup::with_owner(process.clone());
     liveness.set_alive(process.pid, &process.started_at);
     let client = RecordingHttpClient::default();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: None,
@@ -1545,7 +1577,7 @@ fn claude_replacement_preserves_other_bindings() {
         r#"{"session_id":"original"}"#,
     );
     let mut expected = Vec::new();
-    for case in [
+    for (index, case) in [
         "pid",
         "start",
         "host",
@@ -1554,9 +1586,12 @@ fn claude_replacement_preserves_other_bindings() {
         "tmux",
         "remote",
         "unverifiable",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut other = base.clone();
-        other.binding_id = case.into();
+        other.binding_id = format!("{index:064x}");
         other.session.id = case.into();
         match case {
             "pid" => other.process.as_mut().unwrap().pid += 1,
@@ -1587,7 +1622,7 @@ fn claude_replacement_preserves_other_bindings() {
     let liveness = OwnerAlive(process.clone());
     let client = RecordingHttpClient::default();
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: None,
@@ -1610,7 +1645,7 @@ fn claude_replacement_preserves_other_bindings() {
         .collect();
     actual.sort();
     assert_eq!(actual, expected);
-    assert!(root.join("status/unverifiable.json").is_file());
+    assert!(root.join(format!("status/{:064x}.json", 7)).is_file());
 }
 
 #[test]
@@ -1656,7 +1691,7 @@ fn claude_replacement_requires_identified_foreground_activity() {
         liveness.set_alive(process.pid, &process.started_at);
         let client = RecordingHttpClient::default();
         let outcome = ingest(
-            &state::IngestContext {
+            &ingest::IngestContext {
                 store: &store,
                 liveness: &liveness,
                 consumers: None,
@@ -1698,7 +1733,7 @@ fn retired_claude_hooks_neither_resurrect_the_session_nor_reach_sinks() {
         ))
         .unwrap();
     let client = RecordingHttpClient::default();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),
@@ -1716,7 +1751,7 @@ fn retired_claude_hooks_neither_resurrect_the_session_nor_reach_sinks() {
         );
     }
     let reopened = StatusStore::open(&root).unwrap();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &reopened,
         ..ctx
     };
@@ -1755,7 +1790,7 @@ fn claude_can_explicitly_resume_a_retired_or_forked_conversation() {
         let liveness = FakeProcessLookup::with_owner(process.clone());
         liveness.set_alive(process.pid, &process.started_at);
         let client = RecordingHttpClient::default();
-        let ctx = state::IngestContext {
+        let ctx = ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: None,
@@ -1798,7 +1833,7 @@ fn claude_end_retains_a_guard_until_process_exit_without_duplicate_removals() {
         ))
         .unwrap();
     let client = RecordingHttpClient::default();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),
@@ -1857,7 +1892,7 @@ fn claude_subagent_hooks_do_not_change_the_parent_binding_to_parallel() {
     let liveness = FakeProcessLookup::with_owner(process.clone());
     liveness.set_alive(process.pid, &process.started_at);
     let client = RecordingHttpClient::default();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: None,
@@ -1900,7 +1935,7 @@ fn failed_claude_status_write_preserves_the_startup() {
     liveness.set_alive(process.pid, &process.started_at);
     let client = RecordingHttpClient::default();
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &liveness,
             consumers: None,
@@ -1939,7 +1974,7 @@ fn a_dead_binding_swept_during_an_unrelated_ingest_produces_a_running_false_post
     let dying_liveness = FakeProcessLookup::with_owner(dying_process);
     dying_liveness.set_alive(710, "71");
     ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &dying_liveness,
             consumers: Some(&consumers),
@@ -1962,7 +1997,7 @@ fn a_dead_binding_swept_during_an_unrelated_ingest_produces_a_running_false_post
     // Omitting pid 710 makes the unrelated ingest sweep it as dead.
 
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &other_liveness,
             consumers: Some(&consumers),
@@ -2006,7 +2041,7 @@ fn a_read_between_the_kill_and_the_next_ingest_still_lets_the_sweep_fan_out() {
     let dying_liveness = FakeProcessLookup::with_owner(dying_process);
     dying_liveness.set_alive(730, "75");
     ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &dying_liveness,
             consumers: Some(&consumers),
@@ -2032,7 +2067,7 @@ fn a_read_between_the_kill_and_the_next_ingest_still_lets_the_sweep_fan_out() {
     assert_eq!(ledger_files(&root), 1);
 
     ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &other_liveness,
             consumers: Some(&consumers),
@@ -2071,7 +2106,7 @@ fn an_event_without_a_session_id_reaches_sinks_but_never_the_ledger() {
         host: "host-a".into(),
     });
     liveness.set_alive(740, "77");
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),
@@ -2124,7 +2159,7 @@ fn every_agent_drops_an_empty_session_id_from_the_ledger() {
         liveness.set_alive(750, "78");
 
         ingest(
-            &state::IngestContext {
+            &ingest::IngestContext {
                 store: &store,
                 liveness: &liveness,
                 consumers: None,
@@ -2160,7 +2195,7 @@ fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
     let dying_liveness = FakeProcessLookup::with_owner(dying_process);
     dying_liveness.set_alive(720, "73");
     ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &dying_liveness,
             consumers: Some(&consumers),
@@ -2181,7 +2216,7 @@ fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
     other_liveness.set_alive(721, "74");
 
     let outcome = ingest(
-        &state::IngestContext {
+        &ingest::IngestContext {
             store: &store,
             liveness: &other_liveness,
             consumers: Some(&consumers),
@@ -2432,7 +2467,7 @@ fn partial_sweep_failure_still_delivers_successful_removals() {
         ))
         .unwrap();
     let client = RecordingHttpClient::default();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),
@@ -2486,7 +2521,7 @@ fn damaged_consumer_record_reports_health_while_valid_sink_receives_event() {
     let store = store();
     let liveness = all_alive();
     let client = RecordingHttpClient::default();
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),
@@ -2623,7 +2658,7 @@ fn a_slow_sink_cannot_stretch_a_sweep_backlog_past_the_fanout_budget() {
     let client = SlowHttpClient {
         calls: Mutex::new(0),
     };
-    let ctx = state::IngestContext {
+    let ctx = ingest::IngestContext {
         store: &store,
         liveness: &liveness,
         consumers: Some(&consumers),

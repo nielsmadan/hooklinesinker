@@ -52,11 +52,12 @@ resolve failures. Each invocation schedules a kill after two seconds. The host
 timeouts and adapter timers bound waiting outside ingest; ingest's handled
 errors exit zero. See [status lifecycle](status-lifecycle.md) for sink deadlines.
 
-Registration and normalization must move together. For example, Codex
-`Interrupt` keeps the binding live and sets it idle; `request_user_input` also
-maps to idle. Claude's `SubagentStop` is ignored so a child finishing cannot
-mark its still-working parent idle. Qwen's `SessionDelete` is ignored because
-it names a different conversation. The full mapping stays in `normalize.rs`.
+Registration and normalization must move together. `events.rs` owns native command-hook
+registration and actions; `normalize.rs` adds Pi and OpenCode adapter mappings and
+metadata-dependent refinements. For example, Codex `Interrupt` keeps the binding live and sets
+it idle; `request_user_input` also maps to idle. Claude's `SubagentStop` is ignored so a child
+finishing cannot mark its still-working parent idle. Qwen's `SessionDelete` is ignored because
+it names a different conversation.
 
 ## Embedded TypeScript
 
