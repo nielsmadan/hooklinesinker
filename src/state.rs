@@ -11,12 +11,13 @@ const MAX_HEALTH_PROBLEMS: usize = 50;
 // Expired diagnostics must not replay as current faults on every read.
 const HEALTH_PROBLEM_TTL_SECS: u64 = 600;
 const UNVERIFIABLE_RECORD_TTL_SECS: u64 = 24 * 60 * 60;
+const SHARED_RECORD_TTL_SECS: u64 = 24 * 60 * 60;
 
 // Doctor recovers the last sink failure from the health log, so the failing subsystem is
 // part of the record rather than a prefix on its message.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum HealthKind {
+pub(crate) enum HealthKind {
     Sink {
         consumer: String,
     },
@@ -29,7 +30,7 @@ pub enum HealthKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HealthProblem {
+pub(crate) struct HealthProblem {
     pub observed_at: Timestamp,
     pub message: String,
     // Protocol 1 records predate the field and read back as `Other`.
@@ -38,7 +39,7 @@ pub struct HealthProblem {
 }
 
 impl HealthProblem {
-    pub fn new(kind: HealthKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: HealthKind, message: impl Into<String>) -> Self {
         Self {
             observed_at: Timestamp::now(),
             message: message.into(),
@@ -46,7 +47,7 @@ impl HealthProblem {
         }
     }
 
-    pub const fn is_sink_failure(&self) -> bool {
+    pub(crate) const fn is_sink_failure(&self) -> bool {
         matches!(self.kind, HealthKind::Sink { .. })
     }
 
@@ -77,6 +78,7 @@ struct StoredStatusWire {
 
 // `parallel` is resolved once, at the read boundary: a legacy record without the field
 // infers it from the agent there, so nothing downstream carries the tri-state.
+#[derive(Clone)]
 struct StoredStatus {
     status: StatusEvent,
     parallel: bool,
@@ -110,12 +112,12 @@ impl StoredStatus {
 }
 
 #[derive(Default)]
-pub struct SweepOutcome {
+pub(crate) struct SweepOutcome {
     pub events: Vec<StatusEvent>,
     pub problems: Vec<String>,
 }
 
-pub struct IngestSessionOutcome {
+pub(crate) struct IngestSessionOutcome {
     pub forward: bool,
     pub retired: SweepOutcome,
 }
@@ -146,14 +148,14 @@ impl StoreMode {
     }
 }
 
-pub struct StatusStore {
+pub(crate) struct StatusStore {
     bindings_dir: PathBuf,
     lock_path: PathBuf,
     health_path: PathBuf,
 }
 
 impl StatusStore {
-    pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+    pub(crate) fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref();
         let bindings_dir = root.join("status");
         crate::paths::ensure_private_dir(root)?;
@@ -184,7 +186,7 @@ impl StatusStore {
     }
 
     #[cfg(test)]
-    pub fn record(&self, event: &StatusEvent) -> io::Result<()> {
+    pub(crate) fn record(&self, event: &StatusEvent) -> io::Result<()> {
         let _guard = self.lock()?;
         let path = self.binding_path(&event.binding_id)?;
         let bytes = serde_json::to_vec_pretty(event)
@@ -192,10 +194,11 @@ impl StatusStore {
         write_private_atomic(&path, &bytes)
     }
 
-    pub fn ingest_session(
+    pub(crate) fn ingest_session(
         &self,
         event: &mut StatusEvent,
         context: SessionContext,
+        liveness: &(impl ProcessLiveness + ?Sized),
     ) -> io::Result<IngestSessionOutcome> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
@@ -220,14 +223,13 @@ impl StatusStore {
             event.phase = previous.status.phase;
         }
         self.persist_session(event, mode.is_parallel())?;
-        let retired = if mode.retires_superseded() {
-            Self::retire_superseded(event, snapshot.records, snapshot.problems)
-        } else {
-            SweepOutcome {
-                events: Vec::new(),
-                problems: snapshot.problems,
-            }
-        };
+        let retired = Self::reconcile_existing_records(
+            Some(event),
+            snapshot.records,
+            snapshot.problems,
+            mode.retires_superseded(),
+            liveness,
+        );
         Ok(IngestSessionOutcome {
             forward: true,
             retired,
@@ -247,32 +249,41 @@ impl StatusStore {
         }
     }
 
-    fn retire_superseded(
-        event: &StatusEvent,
+    fn reconcile_existing_records(
+        current: Option<&StatusEvent>,
         records: Vec<(PathBuf, StoredStatus)>,
         problems: Vec<String>,
+        retire_superseded: bool,
+        liveness: &(impl ProcessLiveness + ?Sized),
     ) -> SweepOutcome {
         let mut outcome = SweepOutcome {
             events: Vec::new(),
             problems,
         };
+        let now = Timestamp::now();
         for (path, mut stored) in records {
-            let previous = &stored.status;
-            if !stored.parallel
+            if current.is_some_and(|event| event.binding_id == stored.status.binding_id) {
+                continue;
+            }
+            if retire_superseded
+                && !stored.parallel
                 && !stored.retired
-                && previous.agent == event.agent
-                && previous.session.id != event.session.id
-                && previous.process == event.process
-                && previous.terminal == event.terminal
-                && previous.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
-                    == event.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
-                && previous.remote_host == event.remote_host
+                && current.is_some_and(|event| {
+                    let previous = &stored.status;
+                    previous.agent == event.agent
+                        && previous.session.id != event.session.id
+                        && previous.process == event.process
+                        && previous.terminal == event.terminal
+                        && previous.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
+                            == event.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
+                        && previous.remote_host == event.remote_host
+                })
             {
                 stored.status.running = false;
                 stored.retired = true;
                 match stored.write(&path) {
                     Ok(()) => {
-                        outcome.events.push(stored.status);
+                        outcome.events.push(stored.status.clone());
                     }
                     Err(e) => outcome.problems.push(format!(
                         "failed to retire superseded status record {}: {e}",
@@ -280,12 +291,29 @@ impl StatusStore {
                     )),
                 }
             }
+            if is_sweepable(&stored, liveness, now) {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        outcome.problems.push(format!(
+                            "failed to remove status record {}: {e}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                }
+                if stored.status.process.is_some() && !stored.retired {
+                    stored.status.running = false;
+                    outcome.events.push(stored.status);
+                }
+            }
         }
         outcome
     }
 
     #[cfg(test)]
-    pub fn end(&self, binding_id: &str) -> io::Result<()> {
+    pub(crate) fn end(&self, binding_id: &str) -> io::Result<()> {
         let _guard = self.lock()?;
         self.remove_binding(binding_id)
     }
@@ -342,8 +370,7 @@ impl StatusStore {
         Ok(snapshot)
     }
 
-    // Deliberately stricter than `sessions_envelope`: `running()` and `dead_records()` back
-    // doctor's counts, where a number computed from a partial read would read as healthy.
+    #[cfg(test)]
     fn read_complete(&self) -> io::Result<Vec<(PathBuf, StatusEvent)>> {
         let snapshot = self.read_all()?;
         if !snapshot.problems.is_empty() {
@@ -360,9 +387,8 @@ impl StatusStore {
             .collect())
     }
 
-    // Leave deletion to ingest so polling cannot swallow a sink's removal event.
     #[cfg(test)]
-    pub fn running<L: ProcessLiveness + ?Sized>(
+    pub(crate) fn running<L: ProcessLiveness + ?Sized>(
         &self,
         liveness: &L,
     ) -> io::Result<Vec<StatusEvent>> {
@@ -375,53 +401,55 @@ impl StatusStore {
             .collect())
     }
 
-    pub fn dead_records<L: ProcessLiveness + ?Sized>(&self, liveness: &L) -> io::Result<usize> {
+    pub(crate) fn dead_records<L: ProcessLiveness + ?Sized>(
+        &self,
+        liveness: &L,
+    ) -> io::Result<usize> {
         let _guard = self.lock()?;
+        let snapshot = self.read_all()?;
+        if !snapshot.problems.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                snapshot.problems.join("; "),
+            ));
+        }
         let now = Timestamp::now();
-        Ok(self
-            .read_complete()?
+        Ok(snapshot
+            .records
             .iter()
-            .filter(|(_, event)| is_sweepable(event, liveness, now))
+            .filter(|(_, stored)| !stored.retired && is_sweepable(stored, liveness, now))
             .count())
     }
 
-    pub fn sweep<L: ProcessLiveness + ?Sized>(&self, liveness: &L) -> io::Result<SweepOutcome> {
+    pub(crate) fn sweep<L: ProcessLiveness + ?Sized>(
+        &self,
+        liveness: &L,
+    ) -> io::Result<SweepOutcome> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
-        let mut outcome = SweepOutcome {
-            events: Vec::new(),
-            problems: snapshot.problems,
-        };
-        let now = Timestamp::now();
-        for (path, stored) in snapshot.records {
-            let mut event = stored.status;
-            if is_sweepable(&event, liveness, now) {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        outcome.problems.push(format!(
-                            "failed to remove status record {}: {e}",
-                            path.display()
-                        ));
-                        continue;
-                    }
-                }
-                if event.process.is_some() && !stored.retired {
-                    event.running = false;
-                    outcome.events.push(event);
-                }
-            }
-        }
-        Ok(outcome)
+        Ok(Self::reconcile_existing_records(
+            None,
+            snapshot.records,
+            snapshot.problems,
+            false,
+            liveness,
+        ))
     }
 
-    pub fn record_health(&self, problem: HealthProblem) -> io::Result<()> {
+    pub(crate) fn record_health(&self, problem: HealthProblem) -> io::Result<()> {
+        self.record_health_many([problem])
+    }
+
+    pub(crate) fn record_health_many(
+        &self,
+        new_problems: impl IntoIterator<Item = HealthProblem>,
+    ) -> io::Result<()> {
         let _guard = self.lock()?;
         let mut problems = self.read_health_locked()?;
-        // A repeating fault refreshes its entry instead of evicting every other diagnostic.
-        problems.retain(|p| p.kind != problem.kind || p.message != problem.message);
-        problems.push(problem);
+        for problem in new_problems {
+            problems.retain(|p| p.kind != problem.kind || p.message != problem.message);
+            problems.push(problem);
+        }
         if problems.len() > MAX_HEALTH_PROBLEMS {
             let excess = problems.len() - MAX_HEALTH_PROBLEMS;
             problems.drain(0..excess);
@@ -431,7 +459,7 @@ impl StatusStore {
         write_private_atomic(&self.health_path, &bytes)
     }
 
-    pub fn health_problems(&self) -> io::Result<Vec<HealthProblem>> {
+    pub(crate) fn health_problems(&self) -> io::Result<Vec<HealthProblem>> {
         let _guard = self.lock()?;
         self.read_health_locked()
     }
@@ -449,12 +477,15 @@ impl StatusStore {
         }
     }
 
-    pub fn parse_problems(&self) -> io::Result<Vec<String>> {
+    pub(crate) fn parse_problems(&self) -> io::Result<Vec<String>> {
         let _guard = self.lock()?;
         Ok(self.read_all()?.problems)
     }
 
-    pub fn sessions_envelope<L: ProcessLiveness + ?Sized>(&self, liveness: &L) -> SessionsEnvelope {
+    pub(crate) fn sessions_envelope<L: ProcessLiveness + ?Sized>(
+        &self,
+        liveness: &L,
+    ) -> SessionsEnvelope {
         match self.read_sessions_envelope(liveness) {
             Ok(envelope) => envelope,
             Err(e) => SessionsEnvelope {
@@ -467,6 +498,7 @@ impl StatusStore {
         }
     }
 
+    // Do not delete dead records here; ingest must emit their sink removal events.
     fn read_sessions_envelope<L: ProcessLiveness + ?Sized>(
         &self,
         liveness: &L,
@@ -529,7 +561,7 @@ fn session_disposition(
     })
 }
 
-pub struct SessionsEnvelope {
+pub(crate) struct SessionsEnvelope {
     pub sessions: Vec<StatusEvent>,
     pub problems: Vec<HealthProblem>,
 }
@@ -549,13 +581,21 @@ fn is_dead(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> b
 }
 
 fn is_sweepable(
-    event: &StatusEvent,
+    stored: &StoredStatus,
     liveness: &(impl ProcessLiveness + ?Sized),
     now: Timestamp,
 ) -> bool {
-    is_dead(event, liveness)
-        || event.process.is_none()
-            && Timestamp::parse(&event.observed_at).is_none_or(|observed| {
-                observed > now || now.seconds_since(observed) > UNVERIFIABLE_RECORD_TTL_SECS
-            })
+    let event = &stored.status;
+    if is_dead(event, liveness) {
+        return true;
+    }
+    let Some(observed) = Timestamp::parse(&event.observed_at) else {
+        return true;
+    };
+    if observed > now {
+        return true;
+    }
+    let age = now.seconds_since(observed);
+    event.process.is_none() && age > UNVERIFIABLE_RECORD_TTL_SECS
+        || stored.parallel && age > SHARED_RECORD_TTL_SECS
 }

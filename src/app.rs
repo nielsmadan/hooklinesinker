@@ -9,14 +9,20 @@ use crate::install::{InstalledVersion, Installer, UninstallOutcome};
 use crate::paths;
 use crate::processes::{SystemProcessLiveness, SystemProcessLookup};
 use crate::protocol::{
-    Agent, Capability, Consumer, ConsumersResponse, DoctorResponse, PROTOCOL_VERSION,
+    Agent, Capability, Consumer, ConsumersResponse, DoctorCheck, DoctorResponse, PROTOCOL_VERSION,
     ProtocolResponse, SessionsResponse, VersionResponse,
 };
 use crate::sinks::UreqHttpClient;
 use crate::state::{HealthKind, HealthProblem, SessionsEnvelope, StatusStore};
 use clap::Parser;
 use cli::{Cli, Command, HooksCommand};
-use std::io;
+use std::io::{self, Write};
+
+macro_rules! stdoutln {
+    ($($arg:tt)*) => {
+        write_stdout(format_args!($($arg)*))
+    };
+}
 
 pub fn run() {
     let cli = Cli::parse();
@@ -45,10 +51,10 @@ fn print_version(json: bool) {
     if json {
         print_json(&VersionResponse {
             protocol: PROTOCOL_VERSION,
-            version: env!("CARGO_PKG_VERSION"),
+            version: env!("CARGO_PKG_VERSION").to_string(),
         });
     } else {
-        println!(
+        stdoutln!(
             "hooklinesinker {} (protocol {})",
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION
@@ -123,16 +129,17 @@ fn run_sessions(json: bool) {
     if json {
         print_json(&SessionsResponse {
             protocol: PROTOCOL_VERSION,
-            sessions: &envelope.sessions,
-            problems: &envelope.problems,
+            sessions: envelope.sessions,
+            problems: envelope.problems,
         });
         return;
     }
-    if envelope.sessions.is_empty() {
-        println!("no running sessions");
+    let has_problems = !envelope.problems.is_empty();
+    if envelope.sessions.is_empty() && !has_problems {
+        stdoutln!("no running sessions");
     } else {
         for session in envelope.sessions {
-            println!(
+            stdoutln!(
                 "{}\t{}\t{}\t{}",
                 session.agent.as_str(),
                 session.session.id,
@@ -141,8 +148,11 @@ fn run_sessions(json: bool) {
             );
         }
     }
-    for problem in envelope.problems {
+    for problem in &envelope.problems {
         eprintln!("problem: {}", problem.message);
+    }
+    if has_problems {
+        std::process::exit(1);
     }
 }
 
@@ -160,17 +170,18 @@ fn run_consumers(json: bool) {
     if json {
         print_json(&ConsumersResponse {
             protocol: PROTOCOL_VERSION,
-            consumers: &consumers,
-            problems: &problems,
+            consumers,
+            problems,
         });
         return;
     }
-    if consumers.is_empty() {
-        println!("no registered consumers");
+    let has_problems = !problems.is_empty();
+    if consumers.is_empty() && !has_problems {
+        stdoutln!("no registered consumers");
     } else {
         for consumer in consumers {
             let sink = consumer.sink.as_deref().unwrap_or("poll");
-            println!(
+            stdoutln!(
                 "{}\tprotocol {}\t{}\t{sink}",
                 consumer.name,
                 consumer.protocol,
@@ -183,8 +194,11 @@ fn run_consumers(json: bool) {
             );
         }
     }
-    for problem in problems {
+    for problem in &problems {
         eprintln!("problem: {problem}");
+    }
+    if has_problems {
+        std::process::exit(1);
     }
 }
 
@@ -201,9 +215,10 @@ fn run_install(consumer_name: &str, sink: Option<&str>) {
     })();
     match result {
         Ok(installed) => {
-            println!(
+            stdoutln!(
                 "registered consumer {consumer_name} (active version {}, protocol {})",
-                installed.active_version, installed.protocol_major
+                installed.active_version,
+                installed.protocol_major
             );
         }
         Err(e) => {
@@ -222,12 +237,12 @@ fn run_uninstall(consumer_name: &str) {
     })();
     match result {
         Ok(outcome) if outcome.was_last_consumer => {
-            println!(
+            stdoutln!(
                 "removed consumer {consumer_name} (last consumer; hooks and active binary removed)"
             );
         }
         Ok(_) => {
-            println!("removed consumer {consumer_name}");
+            stdoutln!("removed consumer {consumer_name}");
         }
         Err(e) => {
             eprintln!("failed to remove consumer {consumer_name}: {e}");
@@ -245,8 +260,28 @@ fn run_hooks(command: HooksCommand) {
 }
 
 fn run_hooks_install(agent: Agent) {
-    match with_hook_manager(|hooks| hooks.install(agent)) {
-        Ok(status) => print_hook_status_human(&status),
+    let result = (|| -> io::Result<HookStatus> {
+        let installer = open_installer()?;
+        if installer.active_version_summary()?.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no active hooklinesinker installation; run install --consumer NAME first",
+            ));
+        }
+        let hooks = hook_manager(&installer)?;
+        hooks.install(agent)
+    })();
+    match result {
+        Ok(status) if status.state == HookState::Installed => print_hook_status_human(&status),
+        Ok(status) => {
+            eprintln!(
+                "failed to install {} hooks: resulting state is {} ({})",
+                agent.as_str(),
+                status.state.as_str(),
+                status.path.display()
+            );
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("failed to install {} hooks: {e}", agent.as_str());
             std::process::exit(1);
@@ -256,7 +291,16 @@ fn run_hooks_install(agent: Agent) {
 
 fn run_hooks_uninstall(agent: Agent) {
     match with_hook_manager(|hooks| hooks.uninstall(agent)) {
-        Ok(status) => print_hook_status_human(&status),
+        Ok(status) if status.state == HookState::Missing => print_hook_status_human(&status),
+        Ok(status) => {
+            eprintln!(
+                "failed to uninstall {} hooks: resulting state is {} ({})",
+                agent.as_str(),
+                status.state.as_str(),
+                status.path.display()
+            );
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("failed to uninstall {} hooks: {e}", agent.as_str());
             std::process::exit(1);
@@ -291,7 +335,7 @@ fn print_hook_status_json(status: &HookStatus) {
 }
 
 fn print_hook_status_human(status: &HookStatus) {
-    println!(
+    stdoutln!(
         "[{}] {}: {}",
         status.agent.as_str(),
         status.state.as_str(),
@@ -299,17 +343,10 @@ fn print_hook_status_human(status: &HookStatus) {
     );
 }
 
-#[derive(serde::Serialize)]
-struct DoctorCheck {
-    name: &'static str,
-    ok: bool,
-    detail: String,
-}
-
 fn push_parse_problems_check<T>(
     checks: &mut Vec<DoctorCheck>,
     fatal: &mut bool,
-    name: &'static str,
+    name: &str,
     store_label: &str,
     store: Result<&T, String>,
     parse_problems: impl FnOnce(&T) -> io::Result<Vec<String>>,
@@ -322,14 +359,14 @@ fn push_parse_problems_check<T>(
     };
     match problems {
         Ok(problems) if problems.is_empty() => checks.push(DoctorCheck {
-            name,
+            name: name.to_string(),
             ok: true,
             detail: "none".to_string(),
         }),
         Ok(problems) => {
             *fatal = true;
             checks.push(DoctorCheck {
-                name,
+                name: name.to_string(),
                 ok: false,
                 detail: problems.join("; "),
             });
@@ -337,7 +374,7 @@ fn push_parse_problems_check<T>(
         Err(detail) => {
             *fatal = true;
             checks.push(DoctorCheck {
-                name,
+                name: name.to_string(),
                 ok: false,
                 detail,
             });
@@ -350,7 +387,7 @@ fn run_doctor(json: bool) {
     let mut fatal = false;
 
     checks.push(DoctorCheck {
-        name: "version",
+        name: "version".to_string(),
         ok: true,
         detail: format!(
             "hooklinesinker {} (protocol {})",
@@ -398,21 +435,21 @@ fn run_doctor(json: bool) {
     match &status_store {
         Ok(store) => match store.dead_records(&SystemProcessLiveness) {
             Ok(count) => checks.push(DoctorCheck {
-                name: "dead_records",
+                name: "dead_records".to_string(),
                 ok: true,
                 detail: count.to_string(),
             }),
             Err(e) => {
                 fatal = true;
                 checks.push(DoctorCheck {
-                    name: "dead_records",
+                    name: "dead_records".to_string(),
                     ok: false,
                     detail: format!("failed to count dead records: {e}"),
                 });
             }
         },
         Err(_) => checks.push(DoctorCheck {
-            name: "dead_records",
+            name: "dead_records".to_string(),
             ok: true,
             detail: "unavailable".to_string(),
         }),
@@ -429,14 +466,14 @@ fn run_doctor(json: bool) {
     if json {
         print_json(&DoctorResponse {
             protocol: PROTOCOL_VERSION,
-            version: env!("CARGO_PKG_VERSION"),
-            checks: &checks,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            checks,
             exit_code,
         });
     } else {
         for check in &checks {
             let status = if check.ok { "ok" } else { "fail" };
-            println!("[{status}] {}: {}", check.name, check.detail);
+            stdoutln!("[{status}] {}: {}", check.name, check.detail);
         }
     }
 
@@ -444,10 +481,21 @@ fn run_doctor(json: bool) {
 }
 
 fn print_json(value: &impl serde::Serialize) {
-    println!(
+    stdoutln!(
         "{}",
         serde_json::to_string(value).expect("wire response always serializes")
     );
+}
+
+fn write_stdout(args: std::fmt::Arguments<'_>) {
+    let mut stdout = io::stdout().lock();
+    if let Err(e) = writeln!(stdout, "{args}") {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("failed to write stdout: {e}");
+        std::process::exit(1);
+    }
 }
 
 fn open_doctor_stores() -> (
@@ -465,7 +513,7 @@ fn open_doctor_stores() -> (
             let detail = format!("invalid state root: {e}");
             (
                 DoctorCheck {
-                    name: "permissions",
+                    name: "permissions".to_string(),
                     ok: false,
                     detail: detail.clone(),
                 },
@@ -481,12 +529,12 @@ fn permissions_check(root: &std::path::Path) -> DoctorCheck {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(root) {
         Ok(metadata) if metadata.permissions().mode() & 0o777 == 0o700 => DoctorCheck {
-            name: "permissions",
+            name: "permissions".to_string(),
             ok: true,
             detail: format!("{} is 0700", root.display()),
         },
         Ok(metadata) => DoctorCheck {
-            name: "permissions",
+            name: "permissions".to_string(),
             ok: false,
             detail: format!(
                 "{} is {:o}, expected 0700",
@@ -495,7 +543,7 @@ fn permissions_check(root: &std::path::Path) -> DoctorCheck {
             ),
         },
         Err(e) => DoctorCheck {
-            name: "permissions",
+            name: "permissions".to_string(),
             ok: true,
             detail: format!("{} does not exist yet: {e}", root.display()),
         },
@@ -505,7 +553,7 @@ fn permissions_check(root: &std::path::Path) -> DoctorCheck {
 #[cfg(not(unix))]
 fn permissions_check(_root: &std::path::Path) -> DoctorCheck {
     DoctorCheck {
-        name: "permissions",
+        name: "permissions".to_string(),
         ok: true,
         detail: "permission checks apply only on unix".to_string(),
     }
@@ -518,7 +566,7 @@ fn doctor_hook_status() -> DoctorCheck {
                 Ok(hooks) => hooks,
                 Err(e) => {
                     return DoctorCheck {
-                        name: "hook_status",
+                        name: "hook_status".to_string(),
                         ok: false,
                         detail: format!("failed to resolve hook roots: {e}"),
                     };
@@ -544,7 +592,7 @@ fn doctor_hook_status() -> DoctorCheck {
                 }
             }
             DoctorCheck {
-                name: "hook_status",
+                name: "hook_status".to_string(),
                 ok: problems.is_empty(),
                 detail: if problems.is_empty() {
                     summaries.join(", ")
@@ -554,7 +602,7 @@ fn doctor_hook_status() -> DoctorCheck {
             }
         }
         Err(e) => DoctorCheck {
-            name: "hook_status",
+            name: "hook_status".to_string(),
             ok: false,
             detail: format!("failed to prepare hook installer: {e}"),
         },
@@ -564,7 +612,7 @@ fn doctor_hook_status() -> DoctorCheck {
 fn doctor_active_version() -> DoctorCheck {
     match open_installer().and_then(|i| i.active_version_summary()) {
         Ok(Some(installed)) => DoctorCheck {
-            name: "active_version_target",
+            name: "active_version_target".to_string(),
             ok: true,
             detail: format!(
                 "v{} (protocol {})",
@@ -572,12 +620,12 @@ fn doctor_active_version() -> DoctorCheck {
             ),
         },
         Ok(None) => DoctorCheck {
-            name: "active_version_target",
+            name: "active_version_target".to_string(),
             ok: true,
             detail: "not installed".to_string(),
         },
         Err(e) => DoctorCheck {
-            name: "active_version_target",
+            name: "active_version_target".to_string(),
             ok: false,
             detail: format!("failed to read active version: {e}"),
         },
@@ -588,7 +636,7 @@ fn doctor_last_sink_error(status_store: &io::Result<StatusStore>) -> DoctorCheck
     match status_store {
         Ok(store) => match store.health_problems() {
             Ok(problems) => DoctorCheck {
-                name: "last_sink_error",
+                name: "last_sink_error".to_string(),
                 ok: true,
                 detail: problems
                     .iter()
@@ -597,13 +645,13 @@ fn doctor_last_sink_error(status_store: &io::Result<StatusStore>) -> DoctorCheck
                     .map_or_else(|| "none".to_string(), |p| p.message.clone()),
             },
             Err(e) => DoctorCheck {
-                name: "last_sink_error",
+                name: "last_sink_error".to_string(),
                 ok: false,
                 detail: format!("failed to read health problems: {e}"),
             },
         },
         Err(e) => DoctorCheck {
-            name: "last_sink_error",
+            name: "last_sink_error".to_string(),
             ok: false,
             detail: format!("state store unavailable: {e}"),
         },

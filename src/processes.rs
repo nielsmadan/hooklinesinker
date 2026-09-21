@@ -4,11 +4,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-pub trait ProcessLiveness {
+pub(crate) trait ProcessLiveness {
     fn process_is_alive(&self, identity: &ProcessIdentity) -> bool;
 }
 
-pub trait ProcessLookup: ProcessLiveness {
+pub(crate) trait ProcessLookup: ProcessLiveness {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
     fn has_exclusive_session(&self, _identity: &ProcessIdentity, _agent: Agent) -> bool {
         true
@@ -19,18 +19,18 @@ pub trait ProcessLookup: ProcessLiveness {
 // at deserialization, so comparisons are integer arithmetic and a malformed timestamp
 // fails its record instead of silently classifying itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Timestamp(u64);
+pub(crate) struct Timestamp(u64);
 
 impl Timestamp {
-    pub fn now() -> Self {
+    pub(crate) fn now() -> Self {
         Self(epoch_now())
     }
 
-    pub fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         parse_epoch_seconds(text).map(Self)
     }
 
-    pub const fn seconds_since(self, earlier: Self) -> u64 {
+    pub(crate) const fn seconds_since(self, earlier: Self) -> u64 {
         self.0.saturating_sub(earlier.0)
     }
 }
@@ -56,21 +56,21 @@ impl<'de> Deserialize<'de> for Timestamp {
     }
 }
 
-pub fn local_hostname() -> String {
+pub(crate) fn local_hostname() -> String {
     System::host_name().unwrap_or_else(|| "localhost".to_string())
 }
 
-pub fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     format_epoch_seconds(epoch_now())
 }
 
-pub fn epoch_now() -> u64 {
+pub(crate) fn epoch_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-pub fn parse_epoch_seconds(s: &str) -> Option<u64> {
+pub(crate) fn parse_epoch_seconds(s: &str) -> Option<u64> {
     let s = s.strip_suffix('Z')?;
     let (date, time) = s.split_once('T')?;
     let mut d = date.split('-');
@@ -105,7 +105,7 @@ pub fn parse_epoch_seconds(s: &str) -> Option<u64> {
     clippy::missing_panics_doc,
     reason = "every u64 second count fits in i64 days after division by 86400"
 )]
-pub fn format_epoch_seconds(seconds: u64) -> String {
+pub(crate) fn format_epoch_seconds(seconds: u64) -> String {
     let days =
         i64::try_from(seconds / 86_400).expect("u64 seconds divided by 86_400 fits i64 days");
     let secs_of_day = seconds % 86_400;
@@ -162,7 +162,7 @@ fn pid_is_alive(identity: &ProcessIdentity) -> bool {
 // Liveness costs one targeted refresh per query. The paths that only poll liveness
 // (`sessions`, `doctor`) use this instead of paying for the full process table.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct SystemProcessLiveness;
+pub(crate) struct SystemProcessLiveness;
 
 impl ProcessLiveness for SystemProcessLiveness {
     fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
@@ -172,12 +172,12 @@ impl ProcessLiveness for SystemProcessLiveness {
 
 // Ancestry walks and shared-host detection need every process at once, so ingest
 // pays for the full table that `SystemProcessLiveness` avoids.
-pub struct SystemProcessLookup {
+pub(crate) struct SystemProcessLookup {
     system: System,
 }
 
 impl SystemProcessLookup {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut system = System::new();
         // Ancestry matching reads name, parent, start time and argv. `refresh_processes`
         // leaves argv unset and would silently fall through to a same-named ancestor.
@@ -247,7 +247,11 @@ impl Default for SystemProcessLookup {
 
 impl ProcessLiveness for SystemProcessLookup {
     fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
-        pid_is_alive(identity)
+        self.system
+            .process(Pid::from_u32(identity.pid))
+            .is_some_and(|process| {
+                format_epoch_seconds(process.start_time()) == identity.started_at
+            })
     }
 }
 
@@ -458,12 +462,12 @@ mod tests {
                 started_at: format_epoch_seconds(process.start_time()),
                 host: local_hostname(),
             };
-            let alive = lookup.process_is_alive(&identity);
-            assert_eq!(
-                alive,
-                SystemProcessLiveness.process_is_alive(&identity),
-                "the table-free liveness path must agree with the full lookup"
+            assert!(
+                !lookup.process_is_alive(&identity),
+                "a process snapshot must not invent processes started after it"
             );
+            assert!(SystemProcessLookup::new().process_is_alive(&identity));
+            let alive = SystemProcessLiveness.process_is_alive(&identity);
             (identity, alive)
         });
         child.kill().unwrap();

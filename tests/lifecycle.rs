@@ -184,7 +184,7 @@ fn start(agent: Agent, id: &str, source: &str) -> Value {
 fn exclusive_agents_replace_foreground_sessions_and_can_resume_them() {
     for agent in Agent::ALL
         .into_iter()
-        .filter(|agent| *agent != Agent::Opencode)
+        .filter(|agent| !matches!(agent, Agent::Opencode | Agent::Droid))
     {
         let mut fixture = Fixture::new();
         let (begin, activity, end) = events(agent);
@@ -239,7 +239,7 @@ fn every_agent_ignores_activity_after_its_session_ends() {
 fn foreground_activity_replaces_legacy_records_when_start_was_missed() {
     for agent in Agent::ALL
         .into_iter()
-        .filter(|agent| *agent != Agent::Opencode)
+        .filter(|agent| !matches!(agent, Agent::Opencode | Agent::Droid))
     {
         let fixture = Fixture::new();
         fixture.seed(agent, "a", &json!({}));
@@ -260,7 +260,7 @@ fn agents_with_the_same_process_and_session_ids_stay_independent() {
     for agent in Agent::ALL {
         fixture.send(agent, events(agent).0, &start(agent, "b", "new"));
         let sessions = fixture.store.running(&fixture.owner).unwrap();
-        let expected = if agent == Agent::Opencode {
+        let expected = if matches!(agent, Agent::Opencode | Agent::Droid) {
             expected_count += 1;
             vec!["a", "b"]
         } else {

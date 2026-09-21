@@ -1,10 +1,17 @@
 use crate::persistence::{LockGuard, write_private_atomic};
-pub use crate::protocol::{Capability, Consumer};
+pub(crate) use crate::protocol::{Capability, Consumer};
 use std::fs;
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-pub const SUPPORTED_PROTOCOL_MAJOR: u16 = crate::protocol::PROTOCOL_VERSION;
+pub(crate) const SUPPORTED_PROTOCOL_MAJOR: u16 = crate::protocol::PROTOCOL_VERSION;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoveOutcome {
+    Removed,
+    Missing,
+}
 
 impl Consumer {
     pub fn new(
@@ -30,18 +37,18 @@ impl Consumer {
     }
 }
 
-pub struct ConsumerSnapshot {
+pub(crate) struct ConsumerSnapshot {
     pub consumers: Vec<Consumer>,
     pub problems: Vec<String>,
 }
 
-pub struct ConsumerStore {
+pub(crate) struct ConsumerStore {
     consumers_dir: PathBuf,
     lock_path: PathBuf,
 }
 
 impl ConsumerStore {
-    pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+    pub(crate) fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref();
         let consumers_dir = root.join("consumers");
         crate::paths::ensure_private_dir(root)?;
@@ -60,7 +67,7 @@ impl ConsumerStore {
         self.consumers_dir.join(format!("{name}.json"))
     }
 
-    pub fn register(&self, consumer: &Consumer) -> io::Result<()> {
+    pub(crate) fn register(&self, consumer: &Consumer) -> io::Result<()> {
         consumer.validate()?;
 
         let _guard = self.lock()?;
@@ -70,22 +77,22 @@ impl ConsumerStore {
         write_private_atomic(&path, &bytes)
     }
 
-    pub fn remove(&self, name: &str) -> io::Result<()> {
+    pub(crate) fn remove(&self, name: &str) -> io::Result<RemoveOutcome> {
         validate_name(name)?;
         let _guard = self.lock()?;
         match fs::remove_file(self.consumer_path(name)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(RemoveOutcome::Removed),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RemoveOutcome::Missing),
             Err(e) => Err(e),
         }
     }
 
-    pub fn snapshot(&self) -> io::Result<ConsumerSnapshot> {
+    pub(crate) fn snapshot(&self) -> io::Result<ConsumerSnapshot> {
         let _guard = self.lock()?;
         self.read_all_locked()
     }
 
-    pub fn list(&self) -> io::Result<Vec<Consumer>> {
+    pub(crate) fn list(&self) -> io::Result<Vec<Consumer>> {
         let snapshot = self.snapshot()?;
         if !snapshot.problems.is_empty() {
             return Err(io::Error::new(
@@ -97,7 +104,10 @@ impl ConsumerStore {
     }
 
     #[cfg(test)]
-    pub fn requested_capabilities(&self, capability: Capability) -> io::Result<Vec<Consumer>> {
+    pub(crate) fn requested_capabilities(
+        &self,
+        capability: Capability,
+    ) -> io::Result<Vec<Consumer>> {
         Ok(self
             .list()?
             .into_iter()
@@ -105,7 +115,7 @@ impl ConsumerStore {
             .collect())
     }
 
-    pub fn parse_problems(&self) -> io::Result<Vec<String>> {
+    pub(crate) fn parse_problems(&self) -> io::Result<Vec<String>> {
         Ok(self.snapshot()?.problems)
     }
 
@@ -212,17 +222,34 @@ fn validate_sink(sink: Option<&str>) -> io::Result<()> {
             format!("invalid sink URL {sink}: {e}"),
         )
     })?;
-    match (uri.scheme_str(), uri.authority()) {
-        (Some(scheme), Some(_))
-            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+    match (uri.scheme_str(), uri.authority(), uri.host()) {
+        (Some(scheme), Some(_), Some(_)) if scheme.eq_ignore_ascii_case("https") => Ok(()),
+        (Some(scheme), Some(_), Some(host))
+            if scheme.eq_ignore_ascii_case("http") && is_loopback_host(host) =>
         {
             Ok(())
+        }
+        (Some(scheme), Some(_), Some(_)) if scheme.eq_ignore_ascii_case("http") => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("remote sink must use HTTPS; HTTP is allowed only for loopback: {sink}"),
+            ))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("sink must be an absolute HTTP(S) URL: {sink}"),
         )),
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host)
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 #[cfg(test)]
@@ -283,13 +310,34 @@ mod tests {
     #[test]
     fn invalid_sink_scheme_is_rejected() {
         let store = store();
-        for sink in ["ftp://example.com", "http://", "https:///hook"] {
+        for sink in [
+            "ftp://example.com",
+            "http://",
+            "https:///hook",
+            "http://example.com/hook",
+            "http://192.0.2.1/hook",
+        ] {
             assert!(
                 store
                     .register(&consumer("juggler", &["status"], Some(sink)))
                     .is_err(),
                 "accepted {sink}"
             );
+        }
+    }
+
+    #[test]
+    fn loopback_http_and_remote_https_sinks_are_accepted() {
+        let store = store();
+        for (name, sink) in [
+            ("ipv4", "http://127.0.0.1:7483/hook"),
+            ("ipv6", "http://[::1]:7483/hook"),
+            ("localhost", "http://localhost:7483/hook"),
+            ("remote", "https://example.com/hook"),
+        ] {
+            store
+                .register(&consumer(name, &["status"], Some(sink)))
+                .unwrap();
         }
     }
 

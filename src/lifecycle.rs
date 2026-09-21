@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::io;
 
 #[derive(Clone, Copy)]
-pub enum SessionContext {
+pub(crate) enum SessionContext {
     Foreground,
     Background,
     Parallel,
@@ -26,14 +26,14 @@ struct PiContext {
 }
 
 impl SessionContext {
-    pub const fn in_shared_process(self) -> Self {
+    pub(crate) const fn in_shared_process(self) -> Self {
         match self {
             Self::Selected | Self::SelectedParallel => Self::SelectedParallel,
             _ => Self::Parallel,
         }
     }
 
-    pub fn parse(agent: Agent, event: &str, input: &str) -> io::Result<Self> {
+    pub(crate) fn parse(agent: Agent, event: &str, input: &str) -> io::Result<Self> {
         let invalid = |e: serde_json::Error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -78,6 +78,9 @@ impl SessionContext {
                 Ok(
                     if profile.attributed_sessions_share_process
                         && (context.source_type.is_some() || context.source_id.is_some())
+                        || profile.ambiguous_sessions_share_process
+                            && context.source_type.is_none()
+                            && context.source_id.is_none()
                     {
                         role.in_shared_process()
                     } else {

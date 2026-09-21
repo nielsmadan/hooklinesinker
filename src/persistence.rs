@@ -4,15 +4,18 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub struct LockGuard {
+pub(crate) struct LockGuard {
     file: File,
 }
 
 impl LockGuard {
-    pub fn acquire(path: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true);
         #[cfg(unix)]
@@ -21,11 +24,29 @@ impl LockGuard {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        file.lock_exclusive()?;
-        Ok(Self { file })
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {}ms waiting for {}",
+                            LOCK_TIMEOUT.as_millis(),
+                            path.display()
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
-    pub fn acquire_for(target: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire_for(target: &Path) -> io::Result<Self> {
         let parent = target.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
         Self::acquire(&sibling_path(target, ".hooklinesinker.lock"))
@@ -38,16 +59,39 @@ impl Drop for LockGuard {
     }
 }
 
-pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomic(path, bytes, true)
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic(path, bytes, true, ExpectedFile::Any)
 }
 
-pub fn write_preserving_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomic(path, bytes, false)
+#[cfg(test)]
+fn write_preserving_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic(path, bytes, false, ExpectedFile::Any)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
-    let (tmp_path, mut file) = create_unique_sibling(path, private)?;
+pub(crate) fn write_preserving_atomic_if_unchanged(
+    path: &Path,
+    expected: Option<&[u8]>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let expected = expected.map_or(ExpectedFile::Missing, ExpectedFile::Bytes);
+    write_atomic(path, bytes, false, expected)
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedFile<'a> {
+    Any,
+    Missing,
+    Bytes(&'a [u8]),
+}
+
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+    expected: ExpectedFile<'_>,
+) -> io::Result<()> {
+    let target_exists = fs::symlink_metadata(path).is_ok();
+    let (tmp_path, mut file) = create_unique_sibling(path, private || !target_exists)?;
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -58,6 +102,24 @@ fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
             }
         }
         drop(file);
+        if !matches!(expected, ExpectedFile::Any) {
+            let current = match fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            let matches_expected = match expected {
+                ExpectedFile::Any => true,
+                ExpectedFile::Missing => current.is_none(),
+                ExpectedFile::Bytes(bytes) => current.as_deref() == Some(bytes),
+            };
+            if !matches_expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("{} changed during reconciliation", path.display()),
+                ));
+            }
+        }
         fs::rename(&tmp_path, path)
     })();
     if result.is_err() {
@@ -167,6 +229,21 @@ mod tests {
         assert_eq!(final_bytes.len(), 128 * 1024);
         assert!(final_bytes.iter().all(|byte| *byte == final_bytes[0]));
         assert!((b'a'..=b'p').contains(&final_bytes[0]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conditional_atomic_write_rejects_a_changed_source() {
+        let root = temp_root("conditional-write");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("settings.json");
+        fs::write(&target, b"changed by another process").unwrap();
+
+        let error = write_preserving_atomic_if_unchanged(&target, Some(b"original"), b"our update")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&target).unwrap(), b"changed by another process");
         fs::remove_dir_all(root).unwrap();
     }
 }

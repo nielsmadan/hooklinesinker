@@ -476,7 +476,6 @@ fn every_normalized_phase_maps_correctly() {
         (Agent::Droid, "Stop", Phase::Idle),
         (Agent::Droid, "UserPromptSubmit", Phase::Working),
         (Agent::Droid, "PreToolUse", Phase::Working),
-        (Agent::Droid, "PostToolUse", Phase::Working),
         (Agent::Droid, "PreCompact", Phase::Compacting),
         (Agent::Qwen, "SessionStart", Phase::Idle),
         (Agent::Qwen, "Stop", Phase::Idle),
@@ -824,6 +823,32 @@ fn unverifiable_records_expire_without_emitting_removal_events() {
 
     assert_eq!(store.dead_records(&all_alive()).unwrap(), 1);
     assert!(store.sweep(&all_alive()).unwrap().events.is_empty());
+    assert_eq!(ledger_files(&root), 0);
+}
+
+#[test]
+fn stale_parallel_records_expire_even_while_the_shared_process_is_alive() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let event = status("stale-parallel", 502, 52);
+    store.record(&event).unwrap();
+    let path = std::fs::read_dir(root.join("status"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    wire["parallel"] = serde_json::json!(true);
+    wire["status"]["observedAt"] = serde_json::json!("2020-01-01T00:00:00Z");
+    std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+    let liveness = FakeProcessLookup::new();
+    liveness.set_alive(502, "52");
+
+    let events = store.sweep(&liveness).unwrap().events;
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].running);
     assert_eq!(ledger_files(&root), 0);
 }
 
@@ -2612,6 +2637,24 @@ fn the_same_message_under_a_different_kind_is_a_separate_problem() {
 }
 
 #[test]
+fn health_history_keeps_only_the_newest_fifty_problems() {
+    let store = store();
+    for index in 0..51 {
+        store
+            .record_health(HealthProblem::new(
+                HealthKind::Other,
+                format!("problem-{index:02}"),
+            ))
+            .unwrap();
+    }
+
+    let problems = store.health_problems().unwrap();
+    assert_eq!(problems.len(), 50);
+    assert_eq!(problems.first().unwrap().message, "problem-01");
+    assert_eq!(problems.last().unwrap().message, "problem-50");
+}
+
+#[test]
 fn a_sink_failure_is_classified_by_kind_not_by_its_message_wording() {
     let store = store();
     store
@@ -2638,7 +2681,6 @@ fn a_sink_failure_is_classified_by_kind_not_by_its_message_wording() {
     assert_eq!(sink, ["anything at all"]);
 }
 
-// Reject malformed timestamps so stale faults cannot replay as recent forever.
 #[test]
 fn a_malformed_health_timestamp_is_reported_instead_of_replaying_as_current() {
     let root = temp_home();
@@ -2662,7 +2704,6 @@ fn a_malformed_health_timestamp_is_reported_instead_of_replaying_as_current() {
     );
 }
 
-// Bound fan-out so an unbounded backlog cannot exhaust the editor's 3-second hook window.
 #[test]
 fn a_slow_sink_cannot_stretch_a_sweep_backlog_past_the_fanout_budget() {
     struct SlowHttpClient {

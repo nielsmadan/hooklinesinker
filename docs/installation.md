@@ -24,11 +24,11 @@ installation if promotion is needed, then writes the named consumer's registrati
 |---|---|
 | None | Activate the candidate. |
 | Same protocol, candidate is newer | Copy it and atomically switch the active symlink. |
-| Same protocol, candidate is equal or older | Reuse the active binary without copying. |
+| Same protocol, candidate is equal or older | Reuse the active binary if it still exists and is executable; otherwise repair from the candidate. |
 | Different protocol major | Refuse installation before registering the consumer. |
 
 The version comes from the candidate's compiled Cargo package version. Rebuilding an equal
-version does not replace the shared binary; see [local iteration](development-and-releases.md).
+version does not replace a usable shared binary; see [local iteration](development-and-releases.md).
 Old version directories survive promotion. Consumer names, protocols, capabilities and sink
 URLs are validated before activation, so a rejected registration leaves the active binary
 unchanged.
@@ -59,7 +59,7 @@ installer's refusal is the protection against running consumers against an incom
 [`ConsumerStore`](../src/consumers.rs) replaces only the registration for the same name;
 other names remain registered. Names start with a lowercase letter or digit and otherwise
 contain lowercase letters, digits, `_` or `-`. The CLI requests the `status` capability with
-its own protocol major. `--sink URL` requires an absolute HTTP(S) URL; omitting it on
+its own protocol major. `--sink URL` requires HTTPS unless the HTTP host is loopback; omitting it on
 re-registration clears that consumer's sink. Use `consumers --json` to inspect registrations;
 records that fail syntax or semantic validation are excluded and reported in `problems`.
 Removal validates the same name rules as registration before constructing any file path.
@@ -71,8 +71,8 @@ an explicit protocol and delivery review rather than accepting arbitrary strings
 `install --consumer` does not install or refresh hooks. Existing command hooks follow the
 shared symlink when it changes, but new events, changed timeouts and embedded OpenCode/Pi
 adapter source require a separate `hooks install --agent AGENT` using the updated helper.
-The hook command's templates come from the executable invoked, so use the shared binary
-when a bundled or Cargo-installed copy is older than the active installation.
+Hook installation requires a usable active shared binary. Run the active binary so its
+templates match the command path written into agent configuration.
 
 [`HookManager`](../src/hooks.rs) reconciles owned entries and preserves foreign entries;
 unsupported configuration shapes are reported and left alone. `hooks status --agent AGENT
@@ -85,11 +85,13 @@ See the [README path reference](../README.md#paths) for agent configuration loca
 
 ## Remove a consumer
 
-`uninstall --consumer me` removes that registration. While another consumer remains, hooks
+`uninstall --consumer me` removes that registration; an unknown name fails without changing
+the shared installation. While another consumer remains, hooks
 and the active binary stay. If any remaining registration cannot be read or parsed, cleanup
 stops with an error and preserves the shared hooks and binary. After a complete registry
 read confirms the last consumer has left, removal attempts hook cleanup for every supported
-agent, then removes the active symlink. An I/O failure stops cleanup at that point;
+agent, then removes the registration and active symlink. An I/O failure before completion
+keeps the last registration so a retry can finish cleanup;
 unsupported configurations remain untouched. Version directories, ledger/health files and
 installation directories remain. [`Installer::uninstall_consumer`](../src/install.rs) owns
 this sequence; [CLI tests](../tests/cli.rs) cover retention of version directories.

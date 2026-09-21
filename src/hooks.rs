@@ -2,7 +2,7 @@ use crate::agents::{HookTarget, profile};
 #[cfg(test)]
 use crate::events::native_event_specs;
 use crate::events::{EventSpec, subscribed_event_specs};
-use crate::persistence::{LockGuard, write_preserving_atomic};
+use crate::persistence::{LockGuard, write_preserving_atomic_if_unchanged, write_private_atomic};
 use crate::protocol::{Agent, Capability};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -20,7 +20,7 @@ const PI_TEMPLATE: &str = include_str!("../adapters/pi-hooklinesinker.ts");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HookState {
+pub(crate) enum HookState {
     Missing,
     Installed,
     Drifted,
@@ -28,7 +28,7 @@ pub enum HookState {
 }
 
 impl HookState {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Missing => "missing",
             Self::Installed => "installed",
@@ -40,7 +40,7 @@ impl HookState {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HookEntry {
+pub(crate) struct HookEntry {
     pub event: String,
     pub group_index: usize,
     pub command: String,
@@ -48,7 +48,7 @@ pub struct HookEntry {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HookStatus {
+pub(crate) struct HookStatus {
     pub agent: Agent,
     pub state: HookState,
     pub path: PathBuf,
@@ -56,7 +56,7 @@ pub struct HookStatus {
 }
 
 #[derive(Clone, Debug)]
-pub struct HookRoots {
+pub(crate) struct HookRoots {
     pub claude_dir: PathBuf,
     pub codex_dir: PathBuf,
     pub opencode_config_dir: PathBuf,
@@ -68,7 +68,7 @@ pub struct HookRoots {
 }
 
 impl HookRoots {
-    pub fn from_env(binary_path: PathBuf) -> io::Result<Self> {
+    pub(crate) fn from_env(binary_path: PathBuf) -> io::Result<Self> {
         let home = crate::paths::home_dir()?;
         let claude_dir = home.join(".claude");
         let codex_dir = home.join(".codex");
@@ -82,7 +82,6 @@ impl HookRoots {
             };
         let pi_agent_dir = crate::paths::absolute_env_path("PI_CODING_AGENT_DIR")?
             .unwrap_or_else(|| home.join(".pi/agent"));
-        // Droid has no documented home-relocation env var.
         let factory_dir = home.join(".factory");
         let qwen_config_dir =
             crate::paths::absolute_env_path("QWEN_HOME")?.unwrap_or_else(|| home.join(".qwen"));
@@ -101,7 +100,7 @@ impl HookRoots {
     }
 }
 
-pub struct HookManager {
+pub(crate) struct HookManager {
     roots: HookRoots,
 }
 
@@ -121,11 +120,11 @@ enum HookBackend {
 }
 
 impl HookManager {
-    pub const fn new(roots: HookRoots) -> Self {
+    pub(crate) const fn new(roots: HookRoots) -> Self {
         Self { roots }
     }
 
-    pub fn install(&self, agent: Agent) -> io::Result<HookStatus> {
+    pub(crate) fn install(&self, agent: Agent) -> io::Result<HookStatus> {
         let backend = self.backend(agent);
         let _guard = LockGuard::acquire_for(backend.path())?;
         let events = subscribed_event_specs(agent, &Capability::ALL);
@@ -148,7 +147,7 @@ impl HookManager {
         }
     }
 
-    pub fn status(&self, agent: Agent) -> io::Result<HookStatus> {
+    pub(crate) fn status(&self, agent: Agent) -> io::Result<HookStatus> {
         let events = subscribed_event_specs(agent, &Capability::ALL);
         match self.backend(agent) {
             HookBackend::Json { path, location } => {
@@ -161,7 +160,7 @@ impl HookManager {
         }
     }
 
-    pub fn uninstall(&self, agent: Agent) -> io::Result<HookStatus> {
+    pub(crate) fn uninstall(&self, agent: Agent) -> io::Result<HookStatus> {
         let backend = self.backend(agent);
         let _guard = LockGuard::acquire_for(backend.path())?;
         let events = subscribed_event_specs(agent, &Capability::ALL);
@@ -309,8 +308,8 @@ impl JsonHooks<'_> {
         mode: ReconcileMode,
         location: HooksLocation,
     ) -> io::Result<HookStatus> {
-        let root = read_json_root(path)?;
-        if root.is_none() && matches!(mode, ReconcileMode::Uninstall) {
+        let original_bytes = read_optional_bytes(path)?;
+        if original_bytes.is_none() && matches!(mode, ReconcileMode::Uninstall) {
             return Ok(HookStatus {
                 agent,
                 state: HookState::Missing,
@@ -318,7 +317,12 @@ impl JsonHooks<'_> {
                 entries: Vec::new(),
             });
         }
-        let root = root.unwrap_or_default();
+        let root = original_bytes
+            .as_deref()
+            .map(|bytes| parse_json_root(path, bytes))
+            .transpose()?
+            .unwrap_or_default();
+        let original_root = root.clone();
 
         let Ok((root, mut hooks)) = take_hook_map(root, location) else {
             return Ok(HookStatus {
@@ -342,10 +346,13 @@ impl JsonHooks<'_> {
         reconcile_managed_events(&mut hooks, events, mode, self.binary_path, agent);
         hooks.retain(|_, value| !matches!(value, Value::Array(items) if items.is_empty()));
         let final_root = place_hook_map(root, hooks, location);
+        if final_root == original_root {
+            return self.status(agent, path, events, location);
+        }
         let mut bytes = serde_json::to_vec_pretty(&Value::Object(final_root))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         bytes.push(b'\n');
-        write_agent_config(path, &bytes)?;
+        write_agent_config(path, original_bytes.as_deref(), &bytes)?;
 
         self.status(agent, path, events, location)
     }
@@ -404,14 +411,18 @@ impl JsonHooks<'_> {
 
         for spec in events {
             let canonical = canonical_command(self.binary_path, agent, spec.name);
+            let expected = build_group(spec, &canonical, agent);
+            let mut owned_count = 0;
+            let mut exact_count = 0;
             if let Some(Value::Array(arr)) = hooks.get(spec.name) {
                 for (index, group) in arr.iter().enumerate() {
                     if let GroupOwnership::Ours { exact } =
                         classify_group(group, &canonical, agent, spec.name)
                     {
                         any_found = true;
-                        if exact {
-                            installed_events.insert(spec.name);
+                        owned_count += 1;
+                        if exact && group == &expected {
+                            exact_count += 1;
                         }
                         let command = group_handler_commands(group)
                             .into_iter()
@@ -424,6 +435,9 @@ impl JsonHooks<'_> {
                         });
                     }
                 }
+            }
+            if owned_count == 1 && exact_count == 1 {
+                installed_events.insert(spec.name);
             }
         }
 
@@ -449,8 +463,7 @@ struct TomlHooks<'a> {
 }
 
 impl TomlHooks<'_> {
-    // Kimi rejects its entire config if any hook is malformed, so reconcile only removes exact
-    // matches, writes strict entries, and verifies the rendered TOML before replacing the file.
+    // Kimi rejects the entire config if any hook entry is malformed.
     fn reconcile(
         &self,
         agent: Agent,
@@ -527,7 +540,11 @@ impl TomlHooks<'_> {
         if should_write {
             let rendered = doc.to_string();
             parse_toml_document(path, &rendered)?;
-            write_agent_config(path, rendered.as_bytes())?;
+            write_agent_config(
+                path,
+                existing.as_deref().map(str::as_bytes),
+                rendered.as_bytes(),
+            )?;
             let on_disk = fs::read_to_string(path)?;
             parse_toml_document(path, &on_disk)?;
         }
@@ -574,22 +591,27 @@ impl TomlHooks<'_> {
 
         let mut entries = Vec::new();
         let mut installed_events: HashSet<&str> = HashSet::new();
-        for (index, table) in array.iter().enumerate() {
-            let command = table.get("command").and_then(Item::as_str);
-            let Some((spec, command)) = command.and_then(|command| {
-                events
-                    .iter()
-                    .find(|spec| canonical_command(self.binary_path, agent, spec.name) == command)
-                    .map(|spec| (spec, command))
-            }) else {
-                continue;
-            };
-            installed_events.insert(spec.name);
-            entries.push(HookEntry {
-                event: spec.name.to_string(),
-                group_index: index,
-                command: command.to_string(),
-            });
+        for spec in events {
+            let canonical = canonical_command(self.binary_path, agent, spec.name);
+            let mut owned_count = 0;
+            let mut exact_count = 0;
+            for (index, table) in array.iter().enumerate() {
+                if table.get("command").and_then(Item::as_str) != Some(canonical.as_str()) {
+                    continue;
+                }
+                owned_count += 1;
+                if kimi_table_is_exact(table, spec, &canonical) {
+                    exact_count += 1;
+                }
+                entries.push(HookEntry {
+                    event: spec.name.to_string(),
+                    group_index: index,
+                    command: canonical.clone(),
+                });
+            }
+            if owned_count == 1 && exact_count == 1 {
+                installed_events.insert(spec.name);
+            }
         }
 
         let state = if !events.is_empty() && installed_events.len() == events.len() {
@@ -665,7 +687,7 @@ impl TypeScriptHooks<'_> {
         template: &str,
         legacy_path: &Path,
     ) -> io::Result<HookStatus> {
-        remove_if_exists(legacy_path)?;
+        remove_legacy_generated_file(legacy_path)?;
         let current = self.status(agent, path, template)?;
         if current.state == HookState::Unsupported {
             return Ok(current);
@@ -682,7 +704,7 @@ impl TypeScriptHooks<'_> {
         template: &str,
         legacy_path: &Path,
     ) -> io::Result<HookStatus> {
-        remove_if_exists(legacy_path)?;
+        remove_legacy_generated_file(legacy_path)?;
         let current = self.status(agent, path, template)?;
         match current.state {
             HookState::Missing | HookState::Unsupported => Ok(current),
@@ -887,12 +909,7 @@ fn build_group(spec: &EventSpec, canonical: &str, agent: Agent) -> Value {
     let mut handler = Map::new();
     handler.insert("type".to_string(), Value::String("command".to_string()));
     handler.insert("command".to_string(), Value::String(canonical.to_string()));
-    // Qwen's settings.json timeout is milliseconds, unlike Claude/Codex's seconds.
-    let timeout = if profile(agent).timeout_is_milliseconds {
-        u64::try_from(spec.timeout.as_millis()).expect("hook timeout fits u64 milliseconds")
-    } else {
-        spec.timeout.as_secs()
-    };
+    let timeout = profile(agent).hook_target.timeout_value(spec.timeout);
     handler.insert("timeout".to_string(), Value::from(timeout));
     let mut group = Map::new();
     if let Some(matcher) = spec.matcher {
@@ -919,6 +936,14 @@ fn kimi_hook_table(binary_path: &Path, agent: Agent, spec: &EventSpec) -> Table 
     table
 }
 
+fn kimi_table_is_exact(table: &Table, spec: &EventSpec, canonical: &str) -> bool {
+    table.len() == 3
+        && table.get("event").and_then(Item::as_str) == Some(spec.name)
+        && table.get("command").and_then(Item::as_str) == Some(canonical)
+        && table.get("timeout").and_then(Item::as_integer)
+            == i64::try_from(spec.timeout.as_secs()).ok()
+}
+
 fn parse_toml_document(path: &Path, text: &str) -> io::Result<DocumentMut> {
     if text.is_empty() {
         return Ok(DocumentMut::new());
@@ -932,47 +957,85 @@ fn parse_toml_document(path: &Path, text: &str) -> io::Result<DocumentMut> {
 }
 
 fn read_json_root(path: &Path) -> io::Result<Option<Map<String, Value>>> {
+    read_optional_bytes(path)?
+        .as_deref()
+        .map(|bytes| parse_json_root(path, bytes))
+        .transpose()
+}
+
+fn read_optional_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match fs::read(path) {
-        Ok(bytes) => {
-            let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {e}", path.display()),
-                )
-            })?;
-            match value {
-                Value::Object(map) => Ok(Some(map)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} must contain a JSON object", path.display()),
-                )),
-            }
-        }
+        Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-fn write_agent_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn parse_json_root(path: &Path, bytes: &[u8]) -> io::Result<Map<String, Value>> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid JSON: {e}", path.display()),
+        )
+    })?;
+    match value {
+        Value::Object(map) => Ok(map),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} must contain a JSON object", path.display()),
+        )),
     }
-    write_preserving_atomic(path, bytes)
+}
+
+fn write_agent_config(path: &Path, expected: Option<&[u8]>, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_safe_config_dir(parent)?;
+    }
+    write_preserving_atomic_if_unchanged(path, expected, bytes)
 }
 
 fn write_generated_file(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_safe_config_dir(parent)?;
     }
-    write_preserving_atomic(path, contents.as_bytes())
+    write_private_atomic(path, contents.as_bytes())
 }
 
-fn remove_if_exists(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+fn ensure_safe_config_dir(path: &Path) -> io::Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path)?;
+    if !existed {
+        crate::paths::ensure_private_dir(path)?;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to write hooks in writable directory {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_legacy_generated_file(path: &Path) -> io::Result<()> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let recognized = text.starts_with("// Juggler plugin for OpenCode\n")
+        || text.starts_with("// Juggler extension for Pi ");
+    if recognized {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn file_protocol(text: &str) -> Option<u16> {
@@ -1154,6 +1217,28 @@ mod tests {
             manager.status(Agent::Claude).unwrap().state,
             HookState::Drifted
         );
+    }
+
+    #[test]
+    fn claude_status_rejects_duplicate_and_noncanonical_owned_groups() {
+        for mutation in ["duplicate", "extra-field"] {
+            let (manager, base) = manager();
+            manager.install(Agent::Claude).unwrap();
+            let path = base.join("claude").join("settings.json");
+            let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let groups = value["hooks"]["SessionStart"].as_array_mut().unwrap();
+            if mutation == "duplicate" {
+                groups.push(groups[0].clone());
+            } else {
+                groups[0]["hooks"][0]["extra"] = Value::Bool(true);
+            }
+            fs::write(&path, value.to_string()).unwrap();
+            assert_eq!(
+                manager.status(Agent::Claude).unwrap().state,
+                HookState::Drifted,
+                "accepted {mutation} ownership"
+            );
+        }
     }
 
     #[test]
@@ -1712,6 +1797,32 @@ mod tests {
     }
 
     #[test]
+    fn kimi_status_rejects_duplicate_owned_entries() {
+        let (manager, base) = manager();
+        manager.install(Agent::Kimi).unwrap();
+        let path = base.join("kimi-code").join("config.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        let mut doc: DocumentMut = text.parse().unwrap();
+        let duplicate = doc["hooks"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        doc["hooks"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .push(duplicate);
+        fs::write(&path, doc.to_string()).unwrap();
+
+        assert_eq!(
+            manager.status(Agent::Kimi).unwrap().state,
+            HookState::Drifted
+        );
+    }
+
+    #[test]
     fn kimi_status_reports_unsupported_when_hooks_is_not_an_array_of_tables() {
         let (manager, base) = manager();
         let path = base.join("kimi-code").join("config.toml");
@@ -1792,10 +1903,24 @@ mod tests {
             .join("plugins")
             .join("juggler-opencode.ts");
         fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        fs::write(&legacy_path, "// legacy juggler plugin\n").unwrap();
+        fs::write(&legacy_path, "// Juggler plugin for OpenCode\n").unwrap();
 
         manager.install(Agent::Opencode).unwrap();
         assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn opencode_install_preserves_a_foreign_legacy_filename() {
+        let (manager, base) = manager();
+        let legacy_path = base
+            .join("opencode")
+            .join("plugins")
+            .join("juggler-opencode.ts");
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, "// user plugin\n").unwrap();
+
+        manager.install(Agent::Opencode).unwrap();
+        assert_eq!(fs::read_to_string(legacy_path).unwrap(), "// user plugin\n");
     }
 
     #[test]

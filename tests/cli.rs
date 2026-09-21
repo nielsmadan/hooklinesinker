@@ -32,6 +32,14 @@ fn hooklinesinker_isolated(temp: &std::path::Path) -> Command {
     cmd
 }
 
+fn install_isolated(temp: &std::path::Path) {
+    let output = hooklinesinker_isolated(temp)
+        .args(["install", "--consumer", "test"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
 #[test]
 fn version_reports_protocol_one() {
     let output = Command::cargo_bin("hooklinesinker")
@@ -43,6 +51,39 @@ fn version_reports_protocol_one() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["protocol"], 1);
     assert!(value["version"].as_str().is_some());
+}
+
+#[test]
+fn standard_version_flag_reports_the_package_version() {
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("hooklinesinker {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn command_help_describes_the_primary_actions() {
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for text in [
+        "Own agent status hooks and serve normalized session state",
+        "List currently running sessions",
+        "Register a consumer and activate this binary",
+        "Install, inspect, or remove agent hooks",
+    ] {
+        assert!(stdout.contains(text), "help omitted {text:?}");
+    }
 }
 
 #[test]
@@ -114,6 +155,7 @@ fn hooks_status_reports_missing_before_install() {
 #[test]
 fn hooks_install_writes_claude_settings_with_the_stable_binary_path() {
     let temp = unique_temp_dir("hooks-install-claude");
+    install_isolated(&temp);
     let output = hooklinesinker_isolated(&temp)
         .args(["hooks", "install", "--agent", "claude"])
         .output()
@@ -142,6 +184,7 @@ fn hooks_install_writes_claude_settings_with_the_stable_binary_path() {
 #[test]
 fn hooks_install_writes_droid_hooks_json_with_no_hooks_wrapper() {
     let temp = unique_temp_dir("hooks-install-droid");
+    install_isolated(&temp);
     let output = hooklinesinker_isolated(&temp)
         .args(["hooks", "install", "--agent", "droid"])
         .output()
@@ -161,6 +204,7 @@ fn hooks_install_writes_droid_hooks_json_with_no_hooks_wrapper() {
 #[test]
 fn hooks_install_honors_qwen_home_override() {
     let temp = unique_temp_dir("hooks-install-qwen-home");
+    install_isolated(&temp);
     let qwen_home = temp.join("custom-qwen-home");
     let output = hooklinesinker_isolated(&temp)
         .env("QWEN_HOME", &qwen_home)
@@ -181,6 +225,7 @@ fn hooks_install_honors_qwen_home_override() {
 #[test]
 fn hooks_install_honors_kimi_code_home_override() {
     let temp = unique_temp_dir("hooks-install-kimi-home");
+    install_isolated(&temp);
     let kimi_home = temp.join("custom-kimi-home");
     let output = hooklinesinker_isolated(&temp)
         .env("KIMI_CODE_HOME", &kimi_home)
@@ -202,7 +247,7 @@ fn relative_configuration_roots_are_rejected() {
         .args(["sessions"])
         .output()
         .unwrap();
-    assert!(sessions.status.success());
+    assert!(!sessions.status.success());
     assert!(
         String::from_utf8(sessions.stderr)
             .unwrap()
@@ -225,6 +270,7 @@ fn relative_configuration_roots_are_rejected() {
 #[test]
 fn hooks_uninstall_removes_what_hooks_install_wrote() {
     let temp = unique_temp_dir("hooks-uninstall");
+    install_isolated(&temp);
     hooklinesinker_isolated(&temp)
         .args(["hooks", "install", "--agent", "codex"])
         .output()
@@ -394,13 +440,18 @@ fn uninstalling_the_last_consumer_removes_the_active_symlink_but_keeps_the_versi
 }
 
 #[test]
-fn uninstall_of_a_never_registered_consumer_still_succeeds() {
+fn uninstall_of_a_never_registered_consumer_fails_without_teardown() {
     let temp = unique_temp_dir("uninstall-missing");
     let output = hooklinesinker_isolated(&temp)
         .args(["uninstall", "--consumer", "never-registered"])
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("is not registered")
+    );
 }
 
 #[test]

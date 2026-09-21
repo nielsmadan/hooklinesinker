@@ -1,4 +1,4 @@
-use crate::consumers::ConsumerStore;
+use crate::consumers::{ConsumerStore, RemoveOutcome};
 use crate::hooks::HookManager;
 use crate::persistence::{LockGuard, write_private_atomic};
 #[cfg(test)]
@@ -9,14 +9,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SemVer {
+pub(crate) struct SemVer {
     major: u64,
     minor: u64,
     patch: u64,
 }
 
 impl SemVer {
-    pub fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         let mut parts = value.split('.');
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;
@@ -38,14 +38,14 @@ impl std::fmt::Display for SemVer {
     }
 }
 
-pub struct Candidate {
+pub(crate) struct Candidate {
     pub version: SemVer,
     pub protocol_major: u16,
     pub binary_path: PathBuf,
 }
 
 impl Candidate {
-    pub fn current(binary_path: PathBuf) -> io::Result<Self> {
+    pub(crate) fn current(binary_path: PathBuf) -> io::Result<Self> {
         let version = SemVer::parse(env!("CARGO_PKG_VERSION")).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -61,7 +61,7 @@ impl Candidate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InstalledVersion {
+pub(crate) struct InstalledVersion {
     pub active_version: String,
     pub protocol_major: u16,
 }
@@ -73,17 +73,17 @@ struct ActiveVersion {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UninstallOutcome {
+pub(crate) struct UninstallOutcome {
     pub was_last_consumer: bool,
     pub active_version: Option<String>,
 }
 
-pub struct Installer {
+pub(crate) struct Installer {
     data_root: PathBuf,
 }
 
 impl Installer {
-    pub fn open(data_root: PathBuf) -> io::Result<Self> {
+    pub(crate) fn open(data_root: PathBuf) -> io::Result<Self> {
         crate::paths::ensure_private_dir(&data_root)?;
         Ok(Self { data_root })
     }
@@ -96,7 +96,7 @@ impl Installer {
         self.data_root.join("bin")
     }
 
-    pub fn binary_path(&self) -> PathBuf {
+    pub(crate) fn binary_path(&self) -> PathBuf {
         self.bin_dir().join("hooklinesinker")
     }
 
@@ -131,6 +131,27 @@ impl Installer {
         }))
     }
 
+    fn active_binary_is_usable(&self, active: &ActiveVersion) -> bool {
+        let binary = self
+            .versions_dir()
+            .join(&active.version_str)
+            .join("hooklinesinker");
+        let Ok(metadata) = fs::metadata(binary) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
     fn read_protocol(&self, version_str: &str) -> io::Result<u16> {
         let path = self.versions_dir().join(version_str).join("protocol");
         let text = fs::read_to_string(path)?;
@@ -142,11 +163,23 @@ impl Installer {
         })
     }
 
-    pub fn active_version_summary(&self) -> io::Result<Option<InstalledVersion>> {
+    pub(crate) fn active_version_summary(&self) -> io::Result<Option<InstalledVersion>> {
         let _guard = self.lock()?;
-        Ok(self.active_version()?.map(|a| InstalledVersion {
-            active_version: a.version_str,
-            protocol_major: a.protocol_major,
+        let Some(active) = self.active_version()? else {
+            return Ok(None);
+        };
+        if !self.active_binary_is_usable(&active) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "active hooklinesinker {} is missing or not executable",
+                    active.version_str
+                ),
+            ));
+        }
+        Ok(Some(InstalledVersion {
+            active_version: active.version_str,
+            protocol_major: active.protocol_major,
         }))
     }
 
@@ -155,7 +188,7 @@ impl Installer {
     }
 
     #[cfg(test)]
-    pub fn install_candidate(&self, candidate: &Candidate) -> io::Result<InstalledVersion> {
+    pub(crate) fn install_candidate(&self, candidate: &Candidate) -> io::Result<InstalledVersion> {
         let _guard = self.lock()?;
         self.install_candidate_locked(candidate)
     }
@@ -164,6 +197,9 @@ impl Installer {
         match self.active_version()? {
             None => self.activate(candidate),
             Some(active) => {
+                if !self.active_binary_is_usable(&active) {
+                    return self.activate(candidate);
+                }
                 if candidate.protocol_major != active.protocol_major {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -222,7 +258,7 @@ impl Installer {
         Ok(())
     }
 
-    pub fn install_current(
+    pub(crate) fn install_current(
         &self,
         consumers: &ConsumerStore,
         consumer: &Consumer,
@@ -236,16 +272,23 @@ impl Installer {
         Ok(installed)
     }
 
-    pub fn uninstall_consumer(
+    pub(crate) fn uninstall_consumer(
         &self,
         consumers: &ConsumerStore,
         hooks: &HookManager,
         name: &str,
     ) -> io::Result<UninstallOutcome> {
         let _guard = self.lock()?;
-        consumers.remove(name)?;
-        let remaining = consumers.list()?;
-        if !remaining.is_empty() {
+        let registered = consumers.list()?;
+        if !registered.iter().any(|consumer| consumer.name == name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("consumer {name} is not registered"),
+            ));
+        }
+        if registered.len() > 1 {
+            let removed = consumers.remove(name)?;
+            debug_assert_eq!(removed, RemoveOutcome::Removed);
             let active_version = self.active_version()?.map(|a| a.version_str);
             return Ok(UninstallOutcome {
                 was_last_consumer: false,
@@ -254,7 +297,17 @@ impl Installer {
         }
 
         for agent in Agent::ALL {
-            hooks.uninstall(agent)?;
+            let status = hooks.uninstall(agent)?;
+            if status.state != crate::hooks::HookState::Missing {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} hooks remain {} after uninstall",
+                        agent.as_str(),
+                        status.state.as_str()
+                    ),
+                ));
+            }
         }
 
         match fs::remove_file(self.binary_path()) {
@@ -262,6 +315,8 @@ impl Installer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        let removed = consumers.remove(name)?;
+        debug_assert_eq!(removed, RemoveOutcome::Removed);
 
         Ok(UninstallOutcome {
             was_last_consumer: true,
@@ -298,7 +353,7 @@ fn copy_executable_and_fsync(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::{HookManager, HookRoots};
+    use crate::hooks::{HookManager, HookRoots, HookState};
 
     static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -376,6 +431,21 @@ mod tests {
         let install = installation_with_active("0.2.0", 1);
         let result = install.install_candidate(&candidate("0.1.0", 1)).unwrap();
         assert_eq!(result.active_version, "0.2.0");
+    }
+
+    #[test]
+    fn a_damaged_active_binary_is_repaired_from_the_candidate() {
+        let install = installation_with_active("0.2.0", 1);
+        let candidate = candidate("0.1.0", 1);
+        let active_target = install.versions_dir().join("0.2.0").join("hooklinesinker");
+        fs::remove_file(&active_target).unwrap();
+
+        let result = install.install_candidate(&candidate).unwrap();
+        assert_eq!(result.active_version, "0.1.0");
+        assert_eq!(
+            fs::read(install.binary_path()).unwrap(),
+            fs::read(candidate.binary_path).unwrap()
+        );
     }
 
     #[test]
@@ -546,6 +616,43 @@ mod tests {
         let status = hooks.status(Agent::Claude).unwrap();
         assert_eq!(status.state, crate::hooks::HookState::Missing);
     }
+
+    #[test]
+    fn last_consumer_uninstall_removes_hooks_for_every_agent() {
+        let install = installation_with_active("0.7.0", 1);
+        let consumers = ConsumerStore::open(temp_root("consumers-all-hooks")).unwrap();
+        consumers
+            .register(&Consumer {
+                name: "juggler".to_string(),
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                capabilities: vec![Capability::Status],
+                sink: None,
+            })
+            .unwrap();
+        let hooks = hook_manager_for(&install);
+        let agents = [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Opencode,
+            Agent::Pi,
+            Agent::Droid,
+            Agent::Qwen,
+            Agent::Kimi,
+        ];
+        for agent in agents {
+            hooks.install(agent).unwrap();
+        }
+
+        install
+            .uninstall_consumer(&consumers, &hooks, "juggler")
+            .unwrap();
+
+        for agent in agents {
+            assert_eq!(hooks.status(agent).unwrap().state, HookState::Missing);
+        }
+        assert!(!install.binary_path().exists());
+    }
+
     #[test]
     fn damaged_remaining_registration_preserves_shared_installation() {
         for unreadable in [false, true] {

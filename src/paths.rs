@@ -1,7 +1,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn state_root_with(xdg_state_home: Option<&str>, home: Option<&str>) -> io::Result<PathBuf> {
+pub(crate) fn state_root_with(
+    xdg_state_home: Option<&str>,
+    home: Option<&str>,
+) -> io::Result<PathBuf> {
     if let Some(xdg) = xdg_state_home
         && !xdg.is_empty()
     {
@@ -10,14 +13,17 @@ pub fn state_root_with(xdg_state_home: Option<&str>, home: Option<&str>) -> io::
     home_root(home).map(|path| path.join(".local/state/hooklinesinker"))
 }
 
-pub fn state_root() -> io::Result<PathBuf> {
+pub(crate) fn state_root() -> io::Result<PathBuf> {
     state_root_with(
         std::env::var("XDG_STATE_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     )
 }
 
-pub fn data_root_with(xdg_data_home: Option<&str>, home: Option<&str>) -> io::Result<PathBuf> {
+pub(crate) fn data_root_with(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+) -> io::Result<PathBuf> {
     if let Some(xdg) = xdg_data_home
         && !xdg.is_empty()
     {
@@ -26,18 +32,18 @@ pub fn data_root_with(xdg_data_home: Option<&str>, home: Option<&str>) -> io::Re
     home_root(home).map(|path| path.join(".local/share/hooklinesinker"))
 }
 
-pub fn data_root() -> io::Result<PathBuf> {
+pub(crate) fn data_root() -> io::Result<PathBuf> {
     data_root_with(
         std::env::var("XDG_DATA_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     )
 }
 
-pub fn home_dir() -> io::Result<PathBuf> {
+pub(crate) fn home_dir() -> io::Result<PathBuf> {
     home_root(std::env::var("HOME").ok().as_deref())
 }
 
-pub fn absolute_env_path(name: &str) -> io::Result<Option<PathBuf>> {
+pub(crate) fn absolute_env_path(name: &str) -> io::Result<Option<PathBuf>> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.is_empty())
@@ -67,7 +73,7 @@ fn absolute_root(name: &str, value: &str) -> io::Result<PathBuf> {
     }
 }
 
-pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     set_private_dir_mode(path)
 }

@@ -49,6 +49,7 @@ See [installation](docs/installation.md) for the three installation lifecycles.
 
 ```sh
 hooklinesinker version [--json]                  # version + protocol major
+hooklinesinker --version                         # standard CLI version string
 hooklinesinker sessions [--json]                 # every live session (the point of all this)
 hooklinesinker consumers [--json]                # who is registered
 hooklinesinker doctor [--json]                   # every self-check; nonzero on a real fault
@@ -119,8 +120,9 @@ sessions remain independent when another conversation is selected. The
 report an empty, healthy-looking result.
 
 **Sinks.** A consumer that registers with `--sink URL` gets each event POSTed as JSON to that URL
-as it happens, instead of polling. Sink failures are recorded as problems and are not retried.
-Network timeouts bound each delivery phase; handled delivery failures do not fail the agent hook.
+as it happens, instead of polling. Plain HTTP is accepted only for loopback hosts; remote sinks
+must use HTTPS. Sink failures are recorded as problems and are not retried. Network timeouts
+bound each delivery phase; handled delivery failures do not fail the agent hook.
 
 ## Integrating
 
@@ -147,7 +149,7 @@ This is ringleader's model (`ringleader/presence.py`).
 
 Register a sink and receive every event as it happens.
 
-1. Start a localhost HTTP server. Each event arrives as one `POST` with a `StatusEvent` JSON
+1. Start a loopback-only HTTP server. Each event arrives as one `POST` with a `StatusEvent` JSON
    body. Answer 2xx fast: the sender has separate 200 ms connection, response and body timeouts
    and never retries. Do your real work after responding.
 2. Register: `hooklinesinker install --consumer yourname --sink http://127.0.0.1:PORT/hook`.
@@ -221,8 +223,8 @@ additive and removal is scoped:
 
 - `install --consumer X` adds X and activates a compatible binary. Running it again from a second
   tool adds only that tool's registration.
-- `uninstall --consumer X` removes X. Hooks and the active binary stay as long as **any** other
-  consumer is registered.
+- `uninstall --consumer X` removes X. An unknown name is an error. Hooks and the active binary
+  stay as long as **any** other consumer is registered.
 - Removing the last consumer uninstalls the hooks for every agent and drops the active
   binary symlink.
 

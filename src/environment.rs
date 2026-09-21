@@ -2,15 +2,19 @@ use crate::normalize::HookEnvironment;
 use crate::processes::local_hostname;
 use crate::protocol::{GitIdentity, TerminalIdentity, TmuxIdentity};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-pub trait EnvSource {
+const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
+
+pub(crate) trait EnvSource {
     fn var(&self, name: &str) -> Option<String>;
     fn command_output(&self, program: &str, args: &[&str]) -> Option<String>;
     fn local_hostname(&self) -> String;
 }
 
-pub struct SystemEnv;
+pub(crate) struct SystemEnv;
 
 impl EnvSource for SystemEnv {
     fn var(&self, name: &str) -> Option<String> {
@@ -18,12 +22,33 @@ impl EnvSource for SystemEnv {
     }
 
     fn command_output(&self, program: &str, args: &[&str]) -> Option<String> {
-        Command::new(program)
+        let mut child = Command::new(program)
             .args(args)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        };
+        if !status.success() {
+            return None;
+        }
+        child
+            .wait_with_output()
             .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -37,7 +62,7 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
 
-pub fn gather_environment(env: &dyn EnvSource, cwd: String) -> HookEnvironment {
+pub(crate) fn gather_environment(env: &dyn EnvSource, cwd: String) -> HookEnvironment {
     HookEnvironment {
         terminal: detect_terminal(env),
         tmux: detect_tmux(env),

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 // Codex caps a hook at 3s. Deliver what fits and record the rest as a health problem.
 const SINK_FANOUT_BUDGET: Duration = Duration::from_millis(1_000);
 
-pub fn read_capped(reader: &mut impl Read, limit: u64) -> io::Result<String> {
+pub(crate) fn read_capped(reader: &mut impl Read, limit: u64) -> io::Result<String> {
     let mut buf = Vec::new();
     reader.take(limit + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > limit {
@@ -24,18 +24,18 @@ pub fn read_capped(reader: &mut impl Read, limit: u64) -> io::Result<String> {
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-pub struct IngestOutcome {
+pub(crate) struct IngestOutcome {
     pub problem: Option<String>,
 }
 
-pub struct IngestContext<'a> {
+pub(crate) struct IngestContext<'a> {
     pub store: &'a StatusStore,
     pub liveness: &'a dyn ProcessLookup,
     pub consumers: Option<&'a ConsumerStore>,
     pub http_client: &'a dyn HttpClient,
 }
 
-pub fn handle_ingest(
+pub(crate) fn handle_ingest(
     ctx: &IngestContext,
     agent: Agent,
     event: &str,
@@ -48,6 +48,7 @@ pub fn handle_ingest(
     let mut forwarded: Option<StatusEvent> = None;
     let mut problems: Vec<HealthProblem> = Vec::new();
     let mut retired = SweepOutcome::default();
+    let mut swept_with_ingest = false;
 
     let outcome =
         normalize(agent, event, input, env, process).and_then(|normalized| match normalized {
@@ -75,11 +76,13 @@ pub fn handle_ingest(
                 {
                     context = context.in_shared_process();
                 }
-                let session_outcome = store.ingest_session(&mut status_event, context)?;
+                let session_outcome =
+                    store.ingest_session(&mut status_event, context, ctx.liveness)?;
                 if session_outcome.forward {
                     forwarded = Some(status_event);
                 }
                 retired = session_outcome.retired;
+                swept_with_ingest = true;
                 Ok(())
             }
         });
@@ -94,89 +97,88 @@ pub fn handle_ingest(
             .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
     );
     let mut swept = retired.events;
-    match store.sweep(ctx.liveness) {
-        Ok(outcome) => {
-            problems.extend(
-                outcome
-                    .problems
-                    .into_iter()
-                    .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
-            );
-            swept.extend(outcome.events);
-        }
-        Err(e) => {
-            problems.push(HealthProblem::new(
-                HealthKind::Sweep,
-                format!("sweep failed: {e}"),
-            ));
+    if !swept_with_ingest {
+        match store.sweep(ctx.liveness) {
+            Ok(outcome) => {
+                problems.extend(
+                    outcome
+                        .problems
+                        .into_iter()
+                        .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
+                );
+                swept.extend(outcome.events);
+            }
+            Err(e) => {
+                problems.push(HealthProblem::new(
+                    HealthKind::Sweep,
+                    format!("sweep failed: {e}"),
+                ));
+            }
         }
     }
 
-    let mut messages: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
-    // A health write that fails is still reported to the caller, which is the only place
-    // left that can surface it.
-    messages.extend(
-        problems
-            .into_iter()
-            .filter_map(|problem| store.record_health(problem).err())
-            .map(|e| format!("failed to record health problem: {e}")),
-    );
-    let problem = (!messages.is_empty()).then(|| messages.join("; "));
-
-    fan_out_to_sinks(store, ctx, forwarded.as_ref(), swept);
+    let messages: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
+    let mut problem = (!messages.is_empty()).then(|| messages.join("; "));
+    problems.extend(fan_out_to_sinks(ctx, forwarded.as_ref(), swept));
+    if !problems.is_empty()
+        && let Err(e) = store.record_health_many(problems)
+    {
+        let health_error = format!("failed to record health problems: {e}");
+        problem = Some(match problem {
+            Some(existing) => format!("{existing}; {health_error}"),
+            None => health_error,
+        });
+    }
 
     IngestOutcome { problem }
 }
 
 fn fan_out_to_sinks(
-    store: &StatusStore,
     ctx: &IngestContext,
     forwarded: Option<&StatusEvent>,
     swept: Vec<StatusEvent>,
-) {
+) -> Vec<HealthProblem> {
+    let mut problems = Vec::new();
     if forwarded.is_none() && swept.is_empty() {
-        return;
+        return problems;
     }
     let Some(consumers) = ctx.consumers else {
-        return;
+        return problems;
     };
 
     let snapshot = match consumers.snapshot() {
         Ok(snapshot) => snapshot,
         Err(e) => {
-            record(
-                store,
+            problems.push(HealthProblem::new(
                 HealthKind::Other,
                 format!("sink consumer lookup failed: {e}"),
-            );
-            return;
+            ));
+            return problems;
         }
     };
     for problem in snapshot.problems {
-        record(
-            store,
+        problems.push(HealthProblem::new(
             HealthKind::Other,
             format!("sink consumer lookup failed: {problem}"),
-        );
+        ));
     }
     let status_consumers = snapshot.consumers;
     if status_consumers.is_empty() {
-        return;
+        return problems;
     }
 
     let fanout = SinkFanout::new(ctx.http_client);
-    let record_problems = |problems: Vec<crate::sinks::SinkProblem>| {
-        for problem in problems {
+    let mut collect_problems = |sink_problems: Vec<crate::sinks::SinkProblem>| {
+        for problem in sink_problems {
             // The message keeps its existing wording for consumers reading `problems[].message`;
             // the kind is what doctor classifies on.
             let message = format!("sink {} failed: {}", problem.consumer, problem.message);
-            record(
-                store,
+            problems.push(HealthProblem::new(
                 HealthKind::Sink {
                     consumer: problem.consumer,
                 },
                 message,
-            );
+            ));
         }
     };
 
@@ -185,7 +187,7 @@ fn fan_out_to_sinks(
     if let Some(event) = forwarded {
         let outcome = fanout.send_until(event, &status_consumers, Some(deadline));
         undelivered += outcome.undelivered;
-        record_problems(outcome.problems);
+        collect_problems(outcome.problems);
     }
     for swept_event in swept {
         let outcome = fanout.send_until(
@@ -194,22 +196,18 @@ fn fan_out_to_sinks(
             Some(deadline),
         );
         undelivered += outcome.undelivered;
-        record_problems(outcome.problems);
+        collect_problems(outcome.problems);
     }
     if undelivered > 0 {
-        record(
-            store,
+        problems.push(HealthProblem::new(
             HealthKind::Sweep,
             format!(
                 "sink fan-out exceeded its {}ms budget; {undelivered} sink delivery attempt(s) were skipped",
                 SINK_FANOUT_BUDGET.as_millis()
             ),
-        );
+        ));
     }
-}
-
-fn record(store: &StatusStore, kind: HealthKind, message: String) {
-    let _ = store.record_health(HealthProblem::new(kind, message));
+    problems
 }
 
 fn synthetic_swept_event(mut swept: StatusEvent) -> StatusEvent {

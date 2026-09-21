@@ -19,7 +19,7 @@ impl Capability {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Consumer {
     pub name: String,
@@ -28,39 +28,53 @@ pub struct Consumer {
     pub sink: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VersionResponse {
     pub protocol: u16,
-    pub version: &'static str,
+    pub version: String,
 }
 
-#[derive(Serialize)]
-pub struct SessionsResponse<'a, Problem> {
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionsResponse<Problem> {
     pub protocol: u16,
-    pub sessions: &'a [StatusEvent],
-    pub problems: &'a [Problem],
+    pub sessions: Vec<StatusEvent>,
+    pub problems: Vec<Problem>,
 }
 
-#[derive(Serialize)]
-pub struct ConsumersResponse<'a> {
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConsumersResponse {
     pub protocol: u16,
-    pub consumers: &'a [Consumer],
-    pub problems: &'a [String],
+    pub consumers: Vec<Consumer>,
+    pub problems: Vec<String>,
 }
 
-#[derive(Serialize)]
-pub struct ProtocolResponse<'a, Payload> {
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProtocolResponse<Payload> {
     pub protocol: u16,
     #[serde(flatten)]
-    pub payload: &'a Payload,
+    pub payload: Payload,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct DoctorResponse<'a, Check> {
+#[non_exhaustive]
+pub struct DoctorCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DoctorResponse {
     pub protocol: u16,
-    pub version: &'static str,
-    pub checks: &'a [Check],
+    pub version: String,
+    pub checks: Vec<DoctorCheck>,
     pub exit_code: i32,
 }
 
@@ -103,6 +117,7 @@ impl Agent {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Phase {
     Idle,
     Working,
@@ -127,6 +142,7 @@ impl Phase {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct StatusEvent {
     pub protocol: u16,
     pub binding_id: String,
@@ -145,6 +161,7 @@ pub struct StatusEvent {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SessionIdentity {
     pub id: String,
     pub cwd: String,
@@ -153,6 +170,7 @@ pub struct SessionIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub started_at: String,
@@ -161,6 +179,7 @@ pub struct ProcessIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TerminalIdentity {
     pub session_id: Option<String>,
     pub terminal_type: Option<String>,
@@ -170,6 +189,7 @@ pub struct TerminalIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TmuxIdentity {
     pub pane: Option<String>,
     pub session_name: Option<String>,
@@ -177,6 +197,7 @@ pub struct TmuxIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct GitIdentity {
     pub branch: Option<String>,
     pub repo: Option<String>,
@@ -279,6 +300,38 @@ mod tests {
         let round_tripped: StatusEvent = serde_json::from_value(value).unwrap();
 
         assert_eq!(round_tripped, event);
+    }
+
+    #[test]
+    fn response_envelopes_are_deserializable() {
+        let version: VersionResponse =
+            serde_json::from_value(serde_json::json!({"protocol": 1, "version": "1.2.3"})).unwrap();
+        assert_eq!(version.version, "1.2.3");
+
+        let sessions: SessionsResponse<String> = serde_json::from_value(serde_json::json!({
+            "protocol": 1,
+            "sessions": [],
+            "problems": ["damaged record"]
+        }))
+        .unwrap();
+        assert_eq!(sessions.problems, ["damaged record"]);
+
+        let consumers: ConsumersResponse = serde_json::from_value(serde_json::json!({
+            "protocol": 1,
+            "consumers": [],
+            "problems": []
+        }))
+        .unwrap();
+        assert!(consumers.consumers.is_empty());
+
+        let doctor: DoctorResponse = serde_json::from_value(serde_json::json!({
+            "protocol": 1,
+            "version": "1.2.3",
+            "checks": [{"name": "state", "ok": true, "detail": "healthy"}],
+            "exitCode": 0
+        }))
+        .unwrap();
+        assert_eq!(doctor.checks[0].name, "state");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::protocol::{Capability, Consumer, StatusEvent};
 use std::time::{Duration, Instant};
 
-pub trait HttpClient {
+pub(crate) trait HttpClient {
     fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String>;
 }
 
@@ -12,31 +12,31 @@ impl<T: HttpClient + ?Sized> HttpClient for &T {
 }
 
 #[derive(Clone, Debug)]
-pub struct SinkProblem {
+pub(crate) struct SinkProblem {
     pub consumer: String,
     pub message: String,
 }
 
-pub struct FanoutOutcome {
+pub(crate) struct FanoutOutcome {
     pub problems: Vec<SinkProblem>,
     pub undelivered: usize,
 }
 
-pub struct SinkFanout<C: HttpClient> {
+pub(crate) struct SinkFanout<C: HttpClient> {
     client: C,
 }
 
 impl<C: HttpClient> SinkFanout<C> {
-    pub const fn new(client: C) -> Self {
+    pub(crate) const fn new(client: C) -> Self {
         Self { client }
     }
 
     #[cfg(test)]
-    pub fn send(&self, event: &StatusEvent, consumers: &[Consumer]) -> Vec<SinkProblem> {
+    pub(crate) fn send(&self, event: &StatusEvent, consumers: &[Consumer]) -> Vec<SinkProblem> {
         self.send_until(event, consumers, None).problems
     }
 
-    pub fn send_until(
+    pub(crate) fn send_until(
         &self,
         event: &StatusEvent,
         consumers: &[Consumer],
@@ -88,12 +88,12 @@ fn status_sink(consumer: &Consumer) -> Option<&str> {
         .flatten()
 }
 
-pub struct UreqHttpClient {
+pub(crate) struct UreqHttpClient {
     agent: ureq::Agent,
 }
 
 impl UreqHttpClient {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_millis(200)))
             .timeout_recv_response(Some(Duration::from_millis(200)))

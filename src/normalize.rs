@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::io;
 
 #[derive(Clone, Debug, Default)]
-pub struct HookEnvironment {
+pub(crate) struct HookEnvironment {
     pub cwd: String,
     pub host: String,
     pub terminal: Option<TerminalIdentity>,
@@ -39,7 +39,7 @@ enum MappedAction {
 // Sessionless events may reach terminal-keyed sinks but cannot enter the ledger; the variant
 // enforces this across ingestion paths.
 #[derive(Debug)]
-pub enum Normalized {
+pub(crate) enum Normalized {
     Recordable(StatusEvent),
     ForwardOnly(StatusEvent),
     Ignored,
@@ -48,7 +48,7 @@ pub enum Normalized {
 
 impl Normalized {
     #[cfg(test)]
-    pub fn into_event(self) -> Option<StatusEvent> {
+    pub(crate) fn into_event(self) -> Option<StatusEvent> {
         match self {
             Self::Recordable(event) | Self::ForwardOnly(event) => Some(event),
             Self::Ignored | Self::Unrecognized => None,
@@ -97,7 +97,7 @@ fn map_event(
     }
 }
 
-pub fn normalize(
+pub(crate) fn normalize(
     agent: Agent,
     event: &str,
     input: &str,

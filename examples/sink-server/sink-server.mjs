@@ -11,6 +11,11 @@ const BIN = process.env.HOOKLINESINKER_BIN || "hooklinesinker";
 const CONSUMER = process.env.HOOKLINESINKER_CONSUMER || "sink-server-example";
 const HOST = process.env.HOOKLINESINKER_HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4870);
+const MAX_BODY_BYTES = 1024 * 1024;
+
+if (!["127.0.0.1", "::1", "localhost"].includes(HOST)) {
+  throw new Error("HOOKLINESINKER_HOST must be a loopback host");
+}
 
 const sessions = new Map();
 
@@ -80,8 +85,20 @@ const server = createServer((req, res) => {
     return;
   }
   const chunks = [];
-  req.on("data", (chunk) => chunks.push(chunk));
+  let received = 0;
+  let rejected = false;
+  req.on("data", (chunk) => {
+    received += chunk.length;
+    if (received > MAX_BODY_BYTES) {
+      rejected = true;
+      res.writeHead(413).end();
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
   req.on("end", () => {
+    if (rejected) return;
     res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
     const body = Buffer.concat(chunks).toString("utf8");
     // Real work happens after the response is already on the wire: the sender's

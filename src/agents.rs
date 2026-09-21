@@ -1,15 +1,16 @@
 use crate::events::{CLAUDE, CODEX, DROID, EventSpec, KIMI, QWEN};
 use crate::protocol::Agent;
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum EventSource {
+pub(crate) enum EventSource {
     Native,
     OpenCode,
     Pi,
 }
 
 #[derive(Clone, Copy)]
-pub enum HookTarget {
+pub(crate) enum HookTarget {
     ClaudeJson,
     CodexJson,
     OpenCodeTypeScript,
@@ -19,7 +20,18 @@ pub enum HookTarget {
     KimiToml,
 }
 
-pub struct AgentProfile {
+impl HookTarget {
+    pub(crate) fn timeout_value(self, timeout: Duration) -> u64 {
+        match self {
+            Self::QwenJson => {
+                u64::try_from(timeout.as_millis()).expect("hook timeout fits u64 milliseconds")
+            }
+            _ => timeout.as_secs(),
+        }
+    }
+}
+
+pub(crate) struct AgentProfile {
     pub agent: Agent,
     pub event_source: EventSource,
     pub hook_target: HookTarget,
@@ -28,10 +40,10 @@ pub struct AgentProfile {
     pub shared_host_markers: &'static [&'static str],
     pub fork_starts_parallel: bool,
     pub attributed_sessions_share_process: bool,
-    pub timeout_is_milliseconds: bool,
+    pub ambiguous_sessions_share_process: bool,
 }
 
-pub const PROFILES: [AgentProfile; 7] = [
+pub(crate) const PROFILES: [AgentProfile; 7] = [
     AgentProfile {
         agent: Agent::Claude,
         event_source: EventSource::Native,
@@ -41,7 +53,7 @@ pub const PROFILES: [AgentProfile; 7] = [
         shared_host_markers: &[],
         fork_starts_parallel: true,
         attributed_sessions_share_process: false,
-        timeout_is_milliseconds: false,
+        ambiguous_sessions_share_process: false,
     },
     AgentProfile {
         agent: Agent::Codex,
@@ -52,7 +64,7 @@ pub const PROFILES: [AgentProfile; 7] = [
         shared_host_markers: &["app-server", "mcp-server"],
         fork_starts_parallel: false,
         attributed_sessions_share_process: false,
-        timeout_is_milliseconds: false,
+        ambiguous_sessions_share_process: false,
     },
     AgentProfile {
         agent: Agent::Opencode,
@@ -63,7 +75,7 @@ pub const PROFILES: [AgentProfile; 7] = [
         shared_host_markers: &[],
         fork_starts_parallel: false,
         attributed_sessions_share_process: false,
-        timeout_is_milliseconds: false,
+        ambiguous_sessions_share_process: false,
     },
     AgentProfile {
         agent: Agent::Pi,
@@ -74,7 +86,7 @@ pub const PROFILES: [AgentProfile; 7] = [
         shared_host_markers: &[],
         fork_starts_parallel: false,
         attributed_sessions_share_process: false,
-        timeout_is_milliseconds: false,
+        ambiguous_sessions_share_process: false,
     },
     AgentProfile {
         agent: Agent::Droid,
@@ -85,7 +97,7 @@ pub const PROFILES: [AgentProfile; 7] = [
         shared_host_markers: &[],
         fork_starts_parallel: false,
         attributed_sessions_share_process: false,
-        timeout_is_milliseconds: false,
+        ambiguous_sessions_share_process: true,
     },
     AgentProfile {
         agent: Agent::Qwen,
@@ -96,7 +108,7 @@ pub const PROFILES: [AgentProfile; 7] = [
         shared_host_markers: &["--acp", "--experimental-acp", "serve"],
         fork_starts_parallel: false,
         attributed_sessions_share_process: true,
-        timeout_is_milliseconds: true,
+        ambiguous_sessions_share_process: false,
     },
     AgentProfile {
         agent: Agent::Kimi,
@@ -107,11 +119,11 @@ pub const PROFILES: [AgentProfile; 7] = [
         shared_host_markers: &["acp", "--acp", "web", "--wire"],
         fork_starts_parallel: false,
         attributed_sessions_share_process: false,
-        timeout_is_milliseconds: false,
+        ambiguous_sessions_share_process: false,
     },
 ];
 
-pub fn profile(agent: Agent) -> &'static AgentProfile {
+pub(crate) fn profile(agent: Agent) -> &'static AgentProfile {
     PROFILES
         .iter()
         .find(|profile| profile.agent == agent)
