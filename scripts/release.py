@@ -22,9 +22,15 @@ def run(root, *args, capture=True):
     return result.stdout.strip() if capture else ""
 
 
+def version_pattern(components, tag_prefix=False):
+    part = r"(?:0|[1-9][0-9]*)"
+    prefix = "v" if tag_prefix else ""
+    return prefix + part + r"(?:\." + part + r"){" + str(components - 1) + "}"
+
+
 def version_tuple(value, components):
     value = value.removeprefix("v")
-    if not re.fullmatch(r"(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){" + str(components - 1) + "}", value):
+    if not re.fullmatch(version_pattern(components), value):
         raise ReleaseError(f"Expected a {components}-part version, got {value!r}.")
     return tuple(int(part) for part in value.split("."))
 
@@ -102,7 +108,7 @@ def inspect(root, config):
             f"Update this checkout to include origin/{branch} before releasing."
         ) from error
     components = config["components"]
-    pattern = r"v(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){" + str(components - 1) + "}"
+    pattern = version_pattern(components, tag_prefix=True)
     tags = [
         tag
         for tag in run(root, "git", "tag", "--list", "v*").splitlines()

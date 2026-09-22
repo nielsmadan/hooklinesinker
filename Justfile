@@ -39,8 +39,9 @@ check:
     @cargo test
 
 # Release artifacts + SHA256SUMS in dist/. Pass targets to build a subset.
+[positional-arguments]
 build-release *TARGETS:
-    @bash scripts/build-release.sh {{TARGETS}}
+    @bash scripts/build-release.sh "$@"
 
 [positional-arguments]
 release *args:

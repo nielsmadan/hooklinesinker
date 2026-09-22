@@ -99,6 +99,11 @@ Keys are camelCase. `agent` is kebab-case (`claude`, `codex`, `opencode`, `pi`, 
 Rust deserialization maps unfamiliar phase values to `unknown` when the rest of the record can
 be decoded; consumers in other languages should provide the same fallback.
 
+`event` carries each agent's own spelling and has no single casing: PascalCase for the native
+agents (`SessionStart`), snake_case for Pi (`session_start`), dot-case for OpenCode
+(`session.created`), plus the synthetic `swept`. Branch on `phase` and `running`, which are
+normalized; treat `event` as a diagnostic label rather than a dispatch key.
+
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which also separates two terminals driving the same native session.
 
@@ -173,8 +178,9 @@ This is Juggler's model (`juggler/Services/HooklinesinkerClient.swift`, `HookSer
 - **Native macOS (Swift)**: bundle as an auxiliary executable under `Contents/MacOS`, spawn via
   `Process` with argument arrays, and mind code signing/notarization if you distribute: the
   nested binary is signed as part of your app. Juggler is the worked example.
-- **Everywhere**: talk to it only through its CLI JSON (never read the state files directly),
-  and verify a downloaded release artifact against `SHA256SUMS` before executing it.
+- **Everywhere**: talk to it only through its CLI JSON (never read the state files directly).
+  `SHA256SUMS` only proves transit integrity, so also verify authenticity with
+  `gh attestation verify hooklinesinker-<artifact> --repo nielsmadan/hooklinesinker` before executing it.
 
 ## Paths
 
