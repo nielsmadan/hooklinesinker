@@ -1,6 +1,9 @@
 use crate::protocol::{Capability, Consumer, StatusEvent};
 use std::time::{Duration, Instant};
 
+// Phase timeouts leave DNS resolution unbounded, which no fan-out deadline can contain.
+const SINK_REQUEST_BUDGET: Duration = Duration::from_millis(600);
+
 pub(crate) trait HttpClient {
     fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String>;
 }
@@ -94,7 +97,12 @@ pub(crate) struct UreqHttpClient {
 
 impl UreqHttpClient {
     pub(crate) fn new() -> Self {
+        // ureq defaults read HTTP(S)_PROXY/ALL_PROXY from the hook's inherited environment and
+        // follow redirects; both would send events somewhere no consumer registered.
         let config = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .timeout_global(Some(SINK_REQUEST_BUDGET))
             .timeout_connect(Some(Duration::from_millis(200)))
             .timeout_recv_response(Some(Duration::from_millis(200)))
             .timeout_recv_body(Some(Duration::from_millis(200)))
