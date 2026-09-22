@@ -44,7 +44,7 @@ function stage(assetPath, scenario) {
   // HOOK_TIMEOUT_MS. `stdin` is already JSON, so it is embedded as a nested value.
   const recorder = `#!/bin/bash
 printf '%s\\n' "$$" >> ${JSON.stringify(pidLog)}
-stdin=$(cat)
+IFS= read -r stdin || true
 args=""
 for arg in "$@"; do args="$args\${args:+,}\\"$arg\\""; done
 printf '{"args":[%s],"stdin":%s}\\n' "$args" "\${stdin:-null}" >> ${JSON.stringify(recordLog)}
