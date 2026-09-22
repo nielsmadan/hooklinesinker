@@ -30,6 +30,14 @@ setTimeout(() => {
 const PI_ADAPTER = join(repoRoot, "adapters/pi-hooklinesinker.ts");
 const OPENCODE_ADAPTER = join(repoRoot, "adapters/opencode-hooklinesinker.ts");
 
+// The shipped budget stays pinned by a Rust test; scenarios that are not timing the budget
+// only need it to be far larger than any spawn.
+const RELAXED_HOOK_TIMEOUT_MS = 60000;
+
+function timesOutOnPurpose(scenario) {
+  return scenario.endsWith(":hang") || scenario.endsWith(":slow");
+}
+
 /// Stages a scenario: a fake binary that records its argv and stdin, and a copy of the adapter
 /// pointed at it. A scenario suffixed with ":hang" gets a binary that records and then blocks,
 /// so the adapter's own timeout and kill are what have to end the call.
@@ -59,8 +67,24 @@ ${scenario.endsWith(":hang") ? "sleep 3600" : scenario.endsWith(":slow") ? "slee
   if (!source.includes("__HOOKLINESINKER_BIN__")) {
     throw new Error(`${assetPath} has no __HOOKLINESINKER_BIN__ placeholder`);
   }
+  let staged = source.replaceAll("__HOOKLINESINKER_BIN__", binPath);
+
+  // Only the :hang and :slow scenarios are about the hook budget. Everywhere else a loaded
+  // machine could let the real 2s deadline kill a spawn mid-handshake and silently drop the
+  // invocation the assertion is waiting for, so give those runs room they will never use.
+  if (!timesOutOnPurpose(scenario)) {
+    const relaxed = staged.replace(
+      /^const HOOK_TIMEOUT_MS = \d+;$/m,
+      `const HOOK_TIMEOUT_MS = ${RELAXED_HOOK_TIMEOUT_MS};`,
+    );
+    if (relaxed === staged) {
+      throw new Error(`${assetPath} has no HOOK_TIMEOUT_MS declaration to relax`);
+    }
+    staged = relaxed;
+  }
+
   const adapterPath = join(dir, "adapter.ts");
-  writeFileSync(adapterPath, source.replaceAll("__HOOKLINESINKER_BIN__", binPath));
+  writeFileSync(adapterPath, staged);
 
   const invocations = () => {
     if (!existsSync(recordLog)) return [];
