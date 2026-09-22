@@ -229,6 +229,7 @@ async function runPi(scenario, adapterPath, invocations) {
       break;
 
     case "pi:queue_bound:slow":
+    case "pi:queue_bound":
       await start();
       for (let index = 0; index < 100; index += 1) {
         prompt(`prompt-${index}`);
@@ -283,6 +284,7 @@ async function runOpenCode(scenario, adapterPath) {
       break;
 
     case "opencode:queue_bound:slow":
+    case "opencode:queue_bound":
       await Promise.all(
         Array.from({ length: 100 }, (_, index) =>
           plugin.event({
@@ -364,6 +366,7 @@ const SCENARIOS = [
   [PI_ADAPTER, "pi:shutdown_fork"],
   [PI_ADAPTER, "pi:hanging_binary:hang"],
   [PI_ADAPTER, "pi:queue_bound:slow"],
+  [PI_ADAPTER, "pi:queue_bound"],
   [OPENCODE_ADAPTER, "opencode:load_posts_created"],
   [OPENCODE_ADAPTER, "opencode:selection_and_status_are_serialized"],
   [OPENCODE_ADAPTER, "opencode:instance_disposal_removes_known_sessions"],
@@ -374,6 +377,7 @@ const SCENARIOS = [
   [OPENCODE_ADAPTER, "opencode:session_id_fallbacks"],
   [OPENCODE_ADAPTER, "opencode:hanging_binary:hang"],
   [OPENCODE_ADAPTER, "opencode:queue_bound:slow"],
+  [OPENCODE_ADAPTER, "opencode:queue_bound"],
 ];
 
 const report = {};

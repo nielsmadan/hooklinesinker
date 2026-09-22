@@ -87,6 +87,7 @@ pub(crate) fn handle_ingest(
             }
         });
 
+    let ingest_failed = outcome.is_err();
     if let Err(e) = outcome {
         problems.push(HealthProblem::new(HealthKind::Ingest, e.to_string()));
     }
@@ -97,7 +98,9 @@ pub(crate) fn handle_ingest(
             .map(|message| HealthProblem::new(HealthKind::Sweep, message)),
     );
     let mut swept = retired.events;
-    if !swept_with_ingest {
+    // A failed ingest has usually just timed out on the store lock; retrying the sweep would
+    // wait on the same lock a second time and blow the host's hook budget.
+    if !swept_with_ingest && !ingest_failed {
         match store.sweep(ctx.liveness) {
             Ok(outcome) => {
                 problems.extend(
@@ -117,9 +120,9 @@ pub(crate) fn handle_ingest(
         }
     }
 
+    problems.extend(fan_out_to_sinks(ctx, forwarded.as_ref(), swept));
     let messages: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
     let mut problem = (!messages.is_empty()).then(|| messages.join("; "));
-    problems.extend(fan_out_to_sinks(ctx, forwarded.as_ref(), swept));
     if !problems.is_empty()
         && let Err(e) = store.record_health_many(problems)
     {

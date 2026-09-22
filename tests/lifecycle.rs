@@ -453,7 +453,7 @@ fn legacy_claude_lifecycle_markers_survive_the_upgrade() {
 }
 
 #[test]
-fn invalid_lifecycle_metadata_preserves_the_current_session() {
+fn a_wrongly_typed_lifecycle_hint_still_records_the_session() {
     for (agent, field) in [(Agent::Codex, "source"), (Agent::Pi, "reason")] {
         let fixture = Fixture::new();
         fixture.send(agent, events(agent).0, &start(agent, "a", "startup"));
@@ -473,16 +473,23 @@ fn invalid_lifecycle_metadata_preserves_the_current_session() {
             &HookEnvironment::default(),
             100,
         );
-        let problem = outcome.problem.unwrap();
-        assert!(
-            problem.starts_with("invalid lifecycle metadata at line "),
-            "{problem}"
-        );
-        // The offending value never reaches the diagnostic.
-        assert!(!problem.contains("private"), "{problem}");
-        assert!(!problem.contains("payload"), "{problem}");
-        assert_eq!(fixture.ids(), ["a"]);
-        assert_eq!(fixture.bodies(), before);
+        // The hint only classifies the session's role, so a wrong type must not discard a
+        // status event normalize already accepted.
+        assert_eq!(outcome.problem, None, "{agent:?}");
+        assert_eq!(fixture.ids(), ["b"], "{agent:?}");
+        let delivered = fixture.bodies();
+        assert!(delivered.len() > before.len(), "{agent:?}");
+        for body in &delivered {
+            let text = body.to_string();
+            assert!(
+                !text.contains("private"),
+                "{agent:?} leaked a hint value: {text}"
+            );
+            assert!(
+                !text.contains("payload"),
+                "{agent:?} leaked a hint value: {text}"
+            );
+        }
     }
 }
 

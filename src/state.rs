@@ -1,5 +1,5 @@
 use crate::lifecycle::SessionContext;
-use crate::persistence::{LockGuard, write_private_atomic};
+use crate::persistence::{LockGuard, read_json_records, write_private_atomic};
 use crate::processes::{ProcessLiveness, Timestamp};
 use crate::protocol::{Agent, StatusEvent};
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,14 @@ impl HealthProblem {
 
     pub(crate) const fn is_sink_failure(&self) -> bool {
         matches!(self.kind, HealthKind::Sink { .. })
+    }
+
+    pub(crate) const fn is_ingest_failure(&self) -> bool {
+        matches!(self.kind, HealthKind::Ingest)
+    }
+
+    pub(crate) const fn is_recent_problem(&self, now: Timestamp) -> bool {
+        self.is_recent(now)
     }
 
     const fn is_recent(&self, now: Timestamp) -> bool {
@@ -206,18 +214,23 @@ impl StatusStore {
             (stored.status.binding_id == event.binding_id).then_some(stored)
         });
         let SessionDisposition::Store(mode) = session_disposition(event, previous, context) else {
+            // Ingest is the only sweeper, so a hook for a retired binding still owes the
+            // ledger its pass or dead bindings for other agents go unannounced.
             return Ok(IngestSessionOutcome {
                 forward: false,
-                retired: SweepOutcome {
-                    events: Vec::new(),
-                    problems: snapshot.problems,
-                },
+                retired: Self::reconcile_existing_records(
+                    None,
+                    snapshot.records,
+                    snapshot.problems,
+                    false,
+                    liveness,
+                ),
             });
         };
         if matches!(
             context,
             SessionContext::Selected | SessionContext::SelectedParallel
-        ) && event.agent == Agent::Opencode
+        ) && crate::agents::profile(event.agent).retains_phase_on_selection
             && let Some(previous) = previous
         {
             event.phase = previous.status.phase;
@@ -327,47 +340,15 @@ impl StatusStore {
     }
 
     fn read_all(&self) -> io::Result<StatusSnapshot> {
-        let mut snapshot = StatusSnapshot {
-            records: Vec::new(),
-            problems: Vec::new(),
-        };
-        let entries = match fs::read_dir(&self.bindings_dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(snapshot),
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let path = match entry {
-                Ok(entry) => entry.path(),
-                Err(e) => {
-                    snapshot
-                        .problems
-                        .push(format!("failed to read status directory entry: {e}"));
-                    continue;
-                }
-            };
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    snapshot.problems.push(format!(
-                        "failed to read status record {}: {e}",
-                        path.display()
-                    ));
-                    continue;
-                }
-            };
-            match serde_json::from_slice::<StoredStatusWire>(&bytes) {
-                Ok(wire) => snapshot.records.push((path, wire.into())),
-                Err(e) => snapshot.problems.push(format!(
-                    "failed to parse status record {}: {e}",
-                    path.display()
-                )),
-            }
-        }
-        Ok(snapshot)
+        let scanned = read_json_records(&self.bindings_dir, "status", |path, bytes| {
+            serde_json::from_slice::<StoredStatusWire>(bytes)
+                .map(StoredStatus::from)
+                .map_err(|e| format!("failed to parse status record {}: {e}", path.display()))
+        })?;
+        Ok(StatusSnapshot {
+            records: scanned.records,
+            problems: scanned.problems,
+        })
     }
 
     #[cfg(test)]

@@ -1,4 +1,4 @@
-use crate::persistence::{LockGuard, write_private_atomic};
+use crate::persistence::{LockGuard, read_json_records, write_private_atomic};
 pub(crate) use crate::protocol::{Capability, Consumer};
 use std::fs;
 use std::io;
@@ -77,6 +77,16 @@ impl ConsumerStore {
         write_private_atomic(&path, &bytes)
     }
 
+    pub(crate) fn get(&self, name: &str) -> io::Result<Option<Consumer>> {
+        validate_name(name)?;
+        let _guard = self.lock()?;
+        match fs::read(self.consumer_path(name)) {
+            Ok(bytes) => Ok(serde_json::from_slice::<Consumer>(&bytes).ok()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub(crate) fn remove(&self, name: &str) -> io::Result<RemoveOutcome> {
         validate_name(name)?;
         let _guard = self.lock()?;
@@ -120,57 +130,17 @@ impl ConsumerStore {
     }
 
     fn read_all_locked(&self) -> io::Result<ConsumerSnapshot> {
-        let mut out = Vec::new();
-        let mut problems = Vec::new();
-        let entries = match fs::read_dir(&self.consumers_dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(ConsumerSnapshot {
-                    consumers: out,
-                    problems,
-                });
-            }
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let path = match entry {
-                Ok(entry) => entry.path(),
-                Err(e) => {
-                    problems.push(format!("failed to read consumer directory entry: {e}"));
-                    continue;
-                }
-            };
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    problems.push(format!(
-                        "failed to read consumer record {}: {e}",
-                        path.display()
-                    ));
-                    continue;
-                }
-            };
-            match serde_json::from_slice::<Consumer>(&bytes) {
-                Ok(consumer) => match consumer.validate() {
-                    Ok(()) => out.push(consumer),
-                    Err(e) => {
-                        problems.push(format!("invalid consumer record {}: {e}", path.display()));
-                    }
-                },
-                Err(e) => {
-                    problems.push(format!(
-                        "failed to parse consumer record {}: {e}",
-                        path.display()
-                    ));
-                }
-            }
-        }
+        let scanned = read_json_records(&self.consumers_dir, "consumer", |path, bytes| {
+            let consumer = serde_json::from_slice::<Consumer>(bytes)
+                .map_err(|e| format!("failed to parse consumer record {}: {e}", path.display()))?;
+            consumer
+                .validate()
+                .map_err(|e| format!("invalid consumer record {}: {e}", path.display()))?;
+            Ok(consumer)
+        })?;
         Ok(ConsumerSnapshot {
-            consumers: out,
-            problems,
+            consumers: scanned.records.into_iter().map(|(_, c)| c).collect(),
+            problems: scanned.problems,
         })
     }
 }

@@ -1,9 +1,24 @@
 import { spawn } from "node:child_process";
 
-const HOOKLINESINKER_BIN = "__HOOKLINESINKER_BIN__";
+const HOOKLINESINKER_BIN: string = "__HOOKLINESINKER_BIN__";
 
 const HOOK_TIMEOUT_MS = 2000;
 const MAX_PENDING_HOOKS = 32;
+
+interface NativeEvent {
+  session_id?: string;
+  reason?: string;
+}
+
+interface HookRequest {
+  event: string;
+  sessionId?: string;
+  reason?: string;
+}
+
+interface HookOptions extends HookRequest {
+  timeoutMs?: number;
+}
 
 interface PiContext {
   hasUI?: boolean;
@@ -29,6 +44,8 @@ interface PiHost {
   };
 }
 
+type Session = { ui: false } | { ui: true; id: string | undefined };
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -41,17 +58,21 @@ function sessionIdFromContext(ctx: PiContext): string | undefined {
   }
 }
 
-function runHook(
-  event: string,
-  sessionId?: string,
-  reason?: string,
+function runHook({
+  event,
+  sessionId,
+  reason,
   timeoutMs = HOOK_TIMEOUT_MS,
-): Promise<void> {
+}: HookOptions): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    let forceTimer: NodeJS.Timeout | undefined;
     const finish = () => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
       resolve();
     };
 
@@ -69,13 +90,14 @@ function runHook(
           child.kill(signal);
         }
       };
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         try {
           kill("SIGTERM");
         } catch {
           finish();
+          return;
         }
-        const forceTimer = setTimeout(() => {
+        forceTimer = setTimeout(() => {
           try {
             kill("SIGKILL");
           } catch {}
@@ -86,13 +108,10 @@ function runHook(
       timer.unref?.();
 
       child.on("error", finish);
-      child.on("close", () => {
-        clearTimeout(timer);
-        finish();
-      });
+      child.on("close", finish);
       child.stdin.on("error", () => {});
 
-      const native: Record<string, string> = {};
+      const native: NativeEvent = {};
       if (sessionId) native.session_id = sessionId;
       if (reason) native.reason = reason;
       child.stdin.end(JSON.stringify(native));
@@ -103,40 +122,45 @@ function runHook(
 }
 
 export default function (pi: PiHost) {
-  let currentSessionId: string | undefined;
-  let isUISession = false;
+  let session: Session = { ui: false };
   const pendingPermissionRequestIds = new Set<string>();
   let hookQueue: Promise<void> = Promise.resolve();
   let pendingHooks = 0;
 
-  function queueHook(event: string, sessionId?: string, reason?: string): Promise<void> {
+  function queueHook(request: HookRequest): Promise<void> {
     if (pendingHooks >= MAX_PENDING_HOOKS) return Promise.resolve();
     const queuedAt = Date.now();
     pendingHooks += 1;
     const queued = hookQueue.then(() => {
       const remaining = HOOK_TIMEOUT_MS - (Date.now() - queuedAt);
       return remaining > 0
-        ? runHook(event, sessionId, reason, remaining)
+        ? runHook({ ...request, timeoutMs: remaining })
         : Promise.resolve();
     });
-    hookQueue = queued.finally(() => {
+    const settledQueue = queued.then(
+      () => {},
+      () => {},
+    ).finally(() => {
       pendingHooks -= 1;
     });
-    return queued;
+    hookQueue = settledQueue;
+    return settledQueue;
   }
 
   function rememberSessionId(ctx: PiContext): string | undefined {
-    currentSessionId = sessionIdFromContext(ctx) ?? currentSessionId;
-    return currentSessionId;
+    if (!session.ui) return undefined;
+    const id = sessionIdFromContext(ctx) ?? session.id;
+    session = { ui: true, id };
+    return id;
   }
 
   function permissionRequestId(event: unknown): string | undefined {
     return isRecord(event) && typeof event.requestId === "string" ? event.requestId : undefined;
   }
 
-  function queuePermissionResolvedIfNonePending() {
+  function queuePermissionResolvedIfNonePending(sessionId: string | undefined) {
     if (pendingPermissionRequestIds.size === 0) {
-      void queueHook("permission_resolved", currentSessionId);
+      void queueHook({ event: "permission_resolved", sessionId });
     }
   }
 
@@ -151,62 +175,64 @@ export default function (pi: PiHost) {
   }
 
   pi.events.on("permissions:ui_prompt", (event) => {
-    if (!isUISession) return;
+    if (!session.ui) return;
     const requestId = permissionRequestId(event);
     if (!requestId) return;
     pendingPermissionRequestIds.add(requestId);
-    void queueHook("permission_prompt", currentSessionId);
+    void queueHook({ event: "permission_prompt", sessionId: session.id });
   });
   pi.events.on("permissions:decision", (event) => {
-    if (!isUISession || !isPromptDecision(event)) return;
+    if (!session.ui || !isPromptDecision(event)) return;
     const requestId = permissionRequestId(event);
     if (!requestId || !pendingPermissionRequestIds.has(requestId)) return;
     pendingPermissionRequestIds.delete(requestId);
-    queuePermissionResolvedIfNonePending();
+    queuePermissionResolvedIfNonePending(session.id);
   });
 
   pi.on("session_start", async (event, ctx) => {
     pendingPermissionRequestIds.clear();
-    isUISession = ctx?.hasUI !== false;
-    currentSessionId = isUISession ? sessionIdFromContext(ctx) : undefined;
-    if (isUISession) {
-      const reason = typeof event?.reason === "string" ? event.reason : undefined;
-      await queueHook("session_start", currentSessionId, reason);
+    if (ctx?.hasUI === false) {
+      session = { ui: false };
+      return;
     }
+    const id = sessionIdFromContext(ctx);
+    session = { ui: true, id };
+    const reason = typeof event?.reason === "string" ? event.reason : undefined;
+    await queueHook({ event: "session_start", sessionId: id, reason });
   });
 
   pi.on("agent_start", async (_event, ctx) => {
-    if (!isUISession) return;
-    await queueHook("agent_start", rememberSessionId(ctx));
+    if (!session.ui) return;
+    await queueHook({ event: "agent_start", sessionId: rememberSessionId(ctx) });
   });
   // agent_settled fires after automatic retries and compaction complete.
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!isUISession) return;
+    if (!session.ui) return;
     pendingPermissionRequestIds.clear();
-    await queueHook("agent_settled", rememberSessionId(ctx));
+    await queueHook({ event: "agent_settled", sessionId: rememberSessionId(ctx) });
   });
 
   // Automatic compaction resumes the current turn; manual compaction leaves it idle.
   pi.on("session_before_compact", async (_event, ctx) => {
-    if (!isUISession) return;
-    await queueHook("session_before_compact", rememberSessionId(ctx));
+    if (!session.ui) return;
+    await queueHook({ event: "session_before_compact", sessionId: rememberSessionId(ctx) });
   });
   pi.on("session_compact", async (event, ctx) => {
-    if (!isUISession) return;
+    if (!session.ui) return;
     const done = event?.reason === "manual" ? "session_compact_idle" : "session_compact_working";
-    await queueHook(done, rememberSessionId(ctx));
+    await queueHook({ event: done, sessionId: rememberSessionId(ctx) });
   });
 
   // Session switches are reconciled by the next session_start.
   pi.on("session_shutdown", async (event, ctx) => {
-    const id = isUISession ? rememberSessionId(ctx) : undefined;
+    const wasUI = session.ui;
+    const id = rememberSessionId(ctx);
     pendingPermissionRequestIds.clear();
-    currentSessionId = undefined;
-    if (isUISession && event?.reason === "quit") {
-      await queueHook("session_shutdown", id);
+    session = { ui: false };
+    if (wasUI && event?.reason === "quit") {
+      await queueHook({ event: "session_shutdown", sessionId: id });
     } else {
       await hookQueue;
     }
-    isUISession = false;
   });
 }

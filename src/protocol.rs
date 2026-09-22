@@ -1,20 +1,27 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
+// A newer binary may register a capability this one predates; refusing the whole record
+// would drop that consumer from sink fan-out entirely.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Capability {
     Status,
+    #[serde(other)]
+    Unknown,
 }
 
 impl Capability {
-    pub const ALL: [Self; 1] = [Self::Status];
+    pub const ALL: &'static [Self] = &[Self::Status];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Status => "status",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -49,6 +56,47 @@ pub struct ConsumersResponse {
     pub protocol: u16,
     pub consumers: Vec<Consumer>,
     pub problems: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookState {
+    Missing,
+    Installed,
+    Drifted,
+    Unsupported,
+}
+
+impl HookState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Installed => "installed",
+            Self::Drifted => "drifted",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookEntry {
+    pub event: String,
+    pub group_index: usize,
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookStatus {
+    pub agent: Agent,
+    pub state: HookState,
+    pub path: PathBuf,
+    pub entries: Vec<HookEntry>,
+    // Unsupported is the tool declining to touch a config, so the shape it refused is the
+    // whole message; an additive optional field keeps protocol 1 readers working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

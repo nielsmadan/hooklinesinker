@@ -131,6 +131,7 @@ pub(crate) fn subscribed_event_specs(agent: Agent, capabilities: &[Capability]) 
     for capability in capabilities {
         match capability {
             Capability::Status => events.extend_from_slice(native_event_specs(agent)),
+            Capability::Unknown => {}
         }
     }
     events

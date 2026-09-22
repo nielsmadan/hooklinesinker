@@ -1,6 +1,5 @@
 use crate::agents::{EventSource, profile};
 use crate::protocol::Agent;
-use serde::Deserialize;
 use std::io;
 
 #[derive(Clone, Copy)]
@@ -12,17 +11,22 @@ pub(crate) enum SessionContext {
     SelectedParallel,
 }
 
-#[derive(Deserialize)]
-struct NativeContext {
-    source: Option<String>,
-    agent_id: Option<String>,
-    source_type: Option<String>,
-    source_id: Option<String>,
-}
+// These fields only hint at a session's role. Reading them leniently keeps a wrongly typed
+// hint from discarding a status event that normalize already accepted.
+struct Hints(serde_json::Value);
 
-#[derive(Deserialize)]
-struct PiContext {
-    reason: Option<String>,
+impl Hints {
+    fn parse(input: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(input).map(Self)
+    }
+
+    fn present(&self, name: &str) -> bool {
+        self.0.get(name).is_some_and(|value| !value.is_null())
+    }
+
+    fn text(&self, name: &str) -> Option<&str> {
+        self.0.get(name).and_then(serde_json::Value::as_str)
+    }
 }
 
 impl SessionContext {
@@ -47,9 +51,9 @@ impl SessionContext {
         let profile = profile(agent);
         match profile.event_source {
             EventSource::Pi => {
-                let context: PiContext = serde_json::from_str(input).map_err(invalid)?;
+                let hints = Hints::parse(input).map_err(invalid)?;
                 Ok(
-                    if event == "session_start" && context.reason.as_deref() == Some("resume") {
+                    if event == "session_start" && hints.text("reason") == Some("resume") {
                         Self::Selected
                     } else {
                         Self::Foreground
@@ -62,25 +66,23 @@ impl SessionContext {
                 Self::Background
             }),
             EventSource::Native => {
-                let context: NativeContext = serde_json::from_str(input).map_err(invalid)?;
-                let role = if context.agent_id.is_some() {
+                let hints = Hints::parse(input).map_err(invalid)?;
+                let role = if hints.present("agent_id") {
                     Self::Background
-                } else if event == "SessionStart" && context.source.as_deref() == Some("resume") {
+                } else if event == "SessionStart" && hints.text("source") == Some("resume") {
                     Self::Selected
                 } else if profile.fork_starts_parallel
                     && event == "SessionStart"
-                    && context.source.as_deref() == Some("fork")
+                    && hints.text("source") == Some("fork")
                 {
                     Self::Parallel
                 } else {
                     Self::Foreground
                 };
+                let attributed = hints.present("source_type") || hints.present("source_id");
                 Ok(
-                    if profile.attributed_sessions_share_process
-                        && (context.source_type.is_some() || context.source_id.is_some())
-                        || profile.ambiguous_sessions_share_process
-                            && context.source_type.is_none()
-                            && context.source_id.is_none()
+                    if profile.attributed_sessions_share_process && attributed
+                        || profile.ambiguous_sessions_share_process && !attributed
                     {
                         role.in_shared_process()
                     } else {

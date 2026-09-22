@@ -223,6 +223,92 @@ fn hooks_install_honors_qwen_home_override() {
 }
 
 #[test]
+fn hooks_install_writes_the_opencode_plugin_and_reports_it() {
+    let temp = unique_temp_dir("hooks-install-opencode");
+    install_isolated(&temp);
+    let config_dir = temp.join("custom-opencode");
+    let output = hooklinesinker_isolated(&temp)
+        .env("OPENCODE_CONFIG_DIR", &config_dir)
+        .args(["hooks", "install", "--agent", "opencode"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let plugin = config_dir.join("plugins/hooklinesinker-opencode.ts");
+    let text = std::fs::read_to_string(&plugin).unwrap();
+    assert!(text.contains("--agent"), "{text}");
+    assert!(
+        !text.contains("__HOOKLINESINKER_BIN__"),
+        "placeholder survived"
+    );
+
+    let status = hooklinesinker_isolated(&temp)
+        .env("OPENCODE_CONFIG_DIR", &config_dir)
+        .args(["hooks", "status", "--agent", "opencode", "--json"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "installed");
+    assert_eq!(value["path"], plugin.to_str().unwrap());
+}
+
+#[test]
+fn opencode_config_dir_falls_back_to_xdg_config_home() {
+    let temp = unique_temp_dir("hooks-install-opencode-xdg");
+    install_isolated(&temp);
+    let xdg_config = temp.join("xdg-config");
+    let output = hooklinesinker_isolated(&temp)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .args(["hooks", "install", "--agent", "opencode"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        xdg_config
+            .join("opencode/plugins/hooklinesinker-opencode.ts")
+            .exists(),
+        "OPENCODE_CONFIG_DIR must fall back to XDG_CONFIG_HOME/opencode"
+    );
+}
+
+#[test]
+fn hooks_install_writes_the_pi_extension_and_reports_it() {
+    let temp = unique_temp_dir("hooks-install-pi");
+    install_isolated(&temp);
+    let agent_dir = temp.join("custom-pi");
+    let output = hooklinesinker_isolated(&temp)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .args(["hooks", "install", "--agent", "pi"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let extension = agent_dir.join("extensions/hooklinesinker-pi.ts");
+    let text = std::fs::read_to_string(&extension).unwrap();
+    assert!(text.contains("--agent"), "{text}");
+    assert!(
+        !text.contains("__HOOKLINESINKER_BIN__"),
+        "placeholder survived"
+    );
+
+    let status = hooklinesinker_isolated(&temp)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .args(["hooks", "status", "--agent", "pi", "--json"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "installed");
+
+    let uninstall = hooklinesinker_isolated(&temp)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .args(["hooks", "uninstall", "--agent", "pi"])
+        .output()
+        .unwrap();
+    assert!(uninstall.status.success());
+    assert!(!extension.exists(), "uninstall left the extension behind");
+}
+
+#[test]
 fn hooks_install_honors_kimi_code_home_override() {
     let temp = unique_temp_dir("hooks-install-kimi-home");
     install_isolated(&temp);
@@ -381,8 +467,8 @@ fn install_rejects_an_invalid_consumer_name() {
         .args(["install", "--consumer", "Not Valid"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert_ne!(output.status.code(), Some(2));
+    // Exit 1 is the application rejecting the name; clap's own usage errors are exit 2.
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         std::fs::read_dir(temp.join("hooklinesinker/consumers"))
             .map_or(0, std::iter::Iterator::count),
@@ -519,6 +605,7 @@ fn doctor_json_reports_ok_for_a_fresh_state_dir() {
             "status_parse_problems",
             "dead_records",
             "last_sink_error",
+            "ingest_problems",
         ]
     );
     assert!(checks.iter().all(|c| c["ok"] == true));
@@ -546,7 +633,7 @@ fn doctor_human_output_has_one_line_per_check() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<_> = stdout.lines().collect();
-    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.len(), 9);
     assert!(lines.iter().all(|line| line.starts_with('[')));
 }
 
@@ -909,7 +996,9 @@ fn sessions_json_reports_a_problem_when_the_state_store_cannot_be_opened() {
     assert_eq!(value["protocol"], 1);
     assert_eq!(value["sessions"], serde_json::json!([]));
     let problems = value["problems"].as_array().unwrap();
-    assert!(!problems.is_empty());
+    assert_eq!(problems.len(), 1);
+    let message = problems[0]["message"].as_str().unwrap();
+    assert!(message.contains("failed to open state store"), "{message}");
 }
 
 #[test]
@@ -919,11 +1008,10 @@ fn missing_required_flag_is_a_clap_usage_error_not_unimplemented() {
         .args(["ingest", "--agent", "claude"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert_ne!(
-        String::from_utf8(output.stderr).unwrap(),
-        "not implemented yet\n"
-    );
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--event"), "{stderr}");
+    assert!(stderr.contains("Usage:"), "{stderr}");
 }
 
 #[test]

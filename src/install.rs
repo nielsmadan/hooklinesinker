@@ -76,6 +76,7 @@ struct ActiveVersion {
 pub(crate) struct UninstallOutcome {
     pub was_last_consumer: bool,
     pub active_version: Option<String>,
+    pub leftover_hooks: Vec<String>,
 }
 
 pub(crate) struct Installer {
@@ -293,20 +294,28 @@ impl Installer {
             return Ok(UninstallOutcome {
                 was_last_consumer: false,
                 active_version,
+                leftover_hooks: Vec::new(),
             });
         }
 
+        // Aborting mid-loop would leave earlier agents torn down, the consumer registered,
+        // and every retry failing at the same agent, so collect refusals and finish.
+        let mut leftover_hooks = Vec::new();
         for agent in Agent::ALL {
-            let status = hooks.uninstall(agent)?;
-            if status.state != crate::hooks::HookState::Missing {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{} hooks remain {} after uninstall",
-                        agent.as_str(),
-                        status.state.as_str()
-                    ),
-                ));
+            match hooks.uninstall(agent) {
+                Ok(status) if status.state == crate::hooks::HookState::Missing => {}
+                Ok(status) => leftover_hooks.push(format!(
+                    "{} hooks remain {} at {}",
+                    agent.as_str(),
+                    status.state.as_str(),
+                    status.path.display()
+                )),
+                Err(e) => {
+                    leftover_hooks.push(format!(
+                        "{} hooks could not be removed: {e}",
+                        agent.as_str()
+                    ));
+                }
             }
         }
 
@@ -321,6 +330,7 @@ impl Installer {
         Ok(UninstallOutcome {
             was_last_consumer: true,
             active_version: None,
+            leftover_hooks,
         })
     }
 }

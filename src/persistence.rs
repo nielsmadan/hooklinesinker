@@ -10,6 +10,57 @@ use std::time::{Duration, Instant};
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
+pub(crate) struct JsonRecords<T> {
+    pub records: Vec<(std::path::PathBuf, T)>,
+    pub problems: Vec<String>,
+}
+
+// Both stores keep one JSON file per record and must report a bad file as a problem rather
+// than failing the whole read.
+pub(crate) fn read_json_records<T>(
+    dir: &Path,
+    label: &str,
+    parse: impl Fn(&Path, &[u8]) -> Result<T, String>,
+) -> io::Result<JsonRecords<T>> {
+    let mut out = JsonRecords {
+        records: Vec::new(),
+        problems: Vec::new(),
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                out.problems
+                    .push(format!("failed to read {label} directory entry: {e}"));
+                continue;
+            }
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                out.problems.push(format!(
+                    "failed to read {label} record {}: {e}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        match parse(&path, &bytes) {
+            Ok(record) => out.records.push((path, record)),
+            Err(problem) => out.problems.push(problem),
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) struct LockGuard {
     file: File,
 }

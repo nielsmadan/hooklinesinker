@@ -33,7 +33,11 @@ pub fn run() {
         Command::Sessions { json } => run_sessions(json),
         Command::Consumers { json } => run_consumers(json),
         Command::Doctor { json } => run_doctor(json),
-        Command::Install { consumer, sink } => run_install(&consumer, sink.as_deref()),
+        Command::Install {
+            consumer,
+            sink,
+            no_sink,
+        } => run_install(&consumer, sink.as_deref(), no_sink),
         Command::Uninstall { consumer } => run_uninstall(&consumer),
         Command::Hooks { command } => run_hooks(command),
     }
@@ -116,15 +120,21 @@ fn run_ingest(agent: Agent, event: &str) {
 }
 
 fn run_sessions(json: bool) {
+    // A read that answered exits 0 even when the health log carries problems; only an
+    // unreadable store means the query itself failed.
+    let mut answered = true;
     let envelope = match paths::state_root().and_then(StatusStore::open) {
         Ok(store) => store.sessions_envelope(&SystemProcessLiveness),
-        Err(e) => SessionsEnvelope {
-            sessions: Vec::new(),
-            problems: vec![HealthProblem::new(
-                HealthKind::Other,
-                format!("failed to open state store: {e}"),
-            )],
-        },
+        Err(e) => {
+            answered = false;
+            SessionsEnvelope {
+                sessions: Vec::new(),
+                problems: vec![HealthProblem::new(
+                    HealthKind::Other,
+                    format!("failed to open state store: {e}"),
+                )],
+            }
+        }
     };
     if json {
         print_json(&SessionsResponse {
@@ -134,8 +144,7 @@ fn run_sessions(json: bool) {
         });
         return;
     }
-    let has_problems = !envelope.problems.is_empty();
-    if envelope.sessions.is_empty() && !has_problems {
+    if envelope.sessions.is_empty() {
         stdoutln!("no running sessions");
     } else {
         for session in envelope.sessions {
@@ -151,21 +160,28 @@ fn run_sessions(json: bool) {
     for problem in &envelope.problems {
         eprintln!("problem: {}", problem.message);
     }
-    if has_problems {
+    if !answered {
         std::process::exit(1);
     }
 }
 
 fn run_consumers(json: bool) {
+    let mut answered = true;
     let (consumers, problems) = match paths::state_root().and_then(ConsumerStore::open) {
         Ok(store) => match store.snapshot() {
             Ok(snapshot) => (snapshot.consumers, snapshot.problems),
-            Err(e) => (Vec::new(), vec![format!("failed to list consumers: {e}")]),
+            Err(e) => {
+                answered = false;
+                (Vec::new(), vec![format!("failed to list consumers: {e}")])
+            }
         },
-        Err(e) => (
-            Vec::new(),
-            vec![format!("failed to open consumer store: {e}")],
-        ),
+        Err(e) => {
+            answered = false;
+            (
+                Vec::new(),
+                vec![format!("failed to open consumer store: {e}")],
+            )
+        }
     };
     if json {
         print_json(&ConsumersResponse {
@@ -175,8 +191,7 @@ fn run_consumers(json: bool) {
         });
         return;
     }
-    let has_problems = !problems.is_empty();
-    if consumers.is_empty() && !has_problems {
+    if consumers.is_empty() {
         stdoutln!("no registered consumers");
     } else {
         for consumer in consumers {
@@ -197,26 +212,32 @@ fn run_consumers(json: bool) {
     for problem in &problems {
         eprintln!("problem: {problem}");
     }
-    if has_problems {
+    if !answered {
         std::process::exit(1);
     }
 }
 
-fn run_install(consumer_name: &str, sink: Option<&str>) {
+fn run_install(consumer_name: &str, sink: Option<&str>, no_sink: bool) {
+    let mut registered_sink = None;
     let result = (|| -> io::Result<InstalledVersion> {
-        let consumer = Consumer::new(
-            consumer_name,
-            vec![Capability::Status],
-            sink.map(str::to_string),
-        )?;
         let installer = open_installer()?;
         let consumers = ConsumerStore::open(paths::state_root()?)?;
+        // Consumers re-run install on every startup, so an omitted --sink keeps the
+        // registered one rather than silently downgrading a push consumer to polling.
+        let resolved = match (sink, no_sink) {
+            (Some(sink), _) => Some(sink.to_string()),
+            (None, true) => None,
+            (None, false) => consumers.get(consumer_name)?.and_then(|c| c.sink),
+        };
+        registered_sink.clone_from(&resolved);
+        let consumer = Consumer::new(consumer_name, vec![Capability::Status], resolved)?;
         installer.install_current(&consumers, &consumer)
     })();
     match result {
         Ok(installed) => {
+            let sink = registered_sink.as_deref().unwrap_or("poll");
             stdoutln!(
-                "registered consumer {consumer_name} (active version {}, protocol {})",
+                "registered consumer {consumer_name} (active version {}, protocol {}, sink {sink})",
                 installed.active_version,
                 installed.protocol_major
             );
@@ -240,6 +261,9 @@ fn run_uninstall(consumer_name: &str) {
             stdoutln!(
                 "removed consumer {consumer_name} (last consumer; hooks and active binary removed)"
             );
+            for leftover in &outcome.leftover_hooks {
+                eprintln!("problem: {leftover}");
+            }
         }
         Ok(_) => {
             stdoutln!("removed consumer {consumer_name}");
@@ -335,22 +359,24 @@ fn print_hook_status_json(status: &HookStatus) {
 }
 
 fn print_hook_status_human(status: &HookStatus) {
+    let reason = status
+        .reason
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
     stdoutln!(
-        "[{}] {}: {}",
+        "[{}] {}{reason}: {}",
         status.agent.as_str(),
         status.state.as_str(),
         status.path.display()
     );
 }
 
-fn push_parse_problems_check<T>(
-    checks: &mut Vec<DoctorCheck>,
-    fatal: &mut bool,
+fn parse_problems_check<T>(
     name: &str,
     store_label: &str,
     store: Result<&T, String>,
     parse_problems: impl FnOnce(&T) -> io::Result<Vec<String>>,
-) {
+) -> DoctorCheck {
     let problems = match store {
         Ok(store) => {
             parse_problems(store).map_err(|e| format!("failed to read {store_label}: {e}"))
@@ -358,27 +384,21 @@ fn push_parse_problems_check<T>(
         Err(e) => Err(format!("failed to open {store_label}: {e}")),
     };
     match problems {
-        Ok(problems) if problems.is_empty() => checks.push(DoctorCheck {
+        Ok(problems) if problems.is_empty() => DoctorCheck {
             name: name.to_string(),
             ok: true,
             detail: "none".to_string(),
-        }),
-        Ok(problems) => {
-            *fatal = true;
-            checks.push(DoctorCheck {
-                name: name.to_string(),
-                ok: false,
-                detail: problems.join("; "),
-            });
-        }
-        Err(detail) => {
-            *fatal = true;
-            checks.push(DoctorCheck {
-                name: name.to_string(),
-                ok: false,
-                detail,
-            });
-        }
+        },
+        Ok(problems) => DoctorCheck {
+            name: name.to_string(),
+            ok: false,
+            detail: problems.join("; "),
+        },
+        Err(detail) => DoctorCheck {
+            name: name.to_string(),
+            ok: false,
+            detail,
+        },
     }
 }
 
@@ -408,14 +428,16 @@ fn run_doctor(json: bool) {
     }
     checks.push(active_version_check);
 
-    push_parse_problems_check(
-        &mut checks,
-        &mut fatal,
+    let consumer_parse_check = parse_problems_check(
         "consumer_parse_problems",
         "consumer store",
         consumer_store.as_ref().map_err(ToString::to_string),
         ConsumerStore::parse_problems,
     );
+    if !consumer_parse_check.ok {
+        fatal = true;
+    }
+    checks.push(consumer_parse_check);
 
     let hook_status_check = doctor_hook_status();
     if !hook_status_check.ok {
@@ -423,14 +445,16 @@ fn run_doctor(json: bool) {
     }
     checks.push(hook_status_check);
 
-    push_parse_problems_check(
-        &mut checks,
-        &mut fatal,
+    let status_parse_check = parse_problems_check(
         "status_parse_problems",
         "status store",
         status_store.as_ref().map_err(ToString::to_string),
         StatusStore::parse_problems,
     );
+    if !status_parse_check.ok {
+        fatal = true;
+    }
+    checks.push(status_parse_check);
 
     match &status_store {
         Ok(store) => match store.dead_records(&SystemProcessLiveness) {
@@ -460,6 +484,12 @@ fn run_doctor(json: bool) {
         fatal = true;
     }
     checks.push(last_sink_error);
+
+    let ingest_problems = doctor_recent_ingest_problems(&status_store);
+    if !ingest_problems.ok {
+        fatal = true;
+    }
+    checks.push(ingest_problems);
 
     let exit_code = i32::from(fatal);
 
@@ -542,10 +572,15 @@ fn permissions_check(root: &std::path::Path) -> DoctorCheck {
                 metadata.permissions().mode() & 0o777
             ),
         },
-        Err(e) => DoctorCheck {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DoctorCheck {
             name: "permissions".to_string(),
             ok: true,
-            detail: format!("{} does not exist yet: {e}", root.display()),
+            detail: format!("{} does not exist yet", root.display()),
+        },
+        Err(e) => DoctorCheck {
+            name: "permissions".to_string(),
+            ok: false,
+            detail: format!("failed to inspect {}: {e}", root.display()),
         },
     }
 }
@@ -579,10 +614,15 @@ fn doctor_hook_status() -> DoctorCheck {
                     Ok(status) => {
                         summaries.push(format!("{}={}", agent.as_str(), status.state.as_str()));
                         if matches!(status.state, HookState::Drifted | HookState::Unsupported) {
+                            let reason = status
+                                .reason
+                                .map(|reason| format!(" ({reason})"))
+                                .unwrap_or_default();
                             problems.push(format!(
-                                "{} hooks are {}",
+                                "{} hooks are {}{reason} at {}",
                                 agent.as_str(),
-                                status.state.as_str()
+                                status.state.as_str(),
+                                status.path.display()
                             ));
                         }
                     }
@@ -628,6 +668,47 @@ fn doctor_active_version() -> DoctorCheck {
             name: "active_version_target".to_string(),
             ok: false,
             detail: format!("failed to read active version: {e}"),
+        },
+    }
+}
+
+// Dropped hook events are only visible in the health log, so doctor has to read it or a
+// push consumer never learns its status stopped updating.
+fn doctor_recent_ingest_problems(status_store: &io::Result<StatusStore>) -> DoctorCheck {
+    let name = "ingest_problems".to_string();
+    match status_store {
+        Ok(store) => match store.health_problems() {
+            Ok(problems) => {
+                let now = crate::processes::Timestamp::now();
+                let recent: Vec<&str> = problems
+                    .iter()
+                    .filter(|p| p.is_ingest_failure() && p.is_recent_problem(now))
+                    .map(|p| p.message.as_str())
+                    .collect();
+                if recent.is_empty() {
+                    DoctorCheck {
+                        name,
+                        ok: true,
+                        detail: "none".to_string(),
+                    }
+                } else {
+                    DoctorCheck {
+                        name,
+                        ok: false,
+                        detail: format!("{} recent: {}", recent.len(), recent.join("; ")),
+                    }
+                }
+            }
+            Err(e) => DoctorCheck {
+                name,
+                ok: false,
+                detail: format!("failed to read health problems: {e}"),
+            },
+        },
+        Err(e) => DoctorCheck {
+            name,
+            ok: false,
+            detail: format!("state store unavailable: {e}"),
         },
     }
 }

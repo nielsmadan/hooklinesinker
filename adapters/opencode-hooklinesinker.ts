@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-const HOOKLINESINKER_BIN = "__HOOKLINESINKER_BIN__";
+const HOOKLINESINKER_BIN: string = "__HOOKLINESINKER_BIN__";
 
 const TRACKED_EVENTS = new Set([
   "session.created",
@@ -14,24 +14,49 @@ const TRACKED_EVENTS = new Set([
   "tui.session.select",
 ]);
 
+const OPENCODE_STATUSES = ["idle", "busy", "retry"] as const;
+
 const HOOK_TIMEOUT_MS = 2000;
 const MAX_PENDING_HOOKS = 32;
+
+interface NativeEvent {
+  session_id?: string;
+  cwd?: string;
+}
+
+interface HookRequest {
+  event: string;
+  sessionId?: string;
+}
+
+interface HookOptions extends HookRequest {
+  cwd?: string;
+  timeoutMs?: number;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function runHook(
-  event: string,
-  sessionId?: string,
-  cwd?: string,
+function isOpenCodeStatus(value: unknown): value is (typeof OPENCODE_STATUSES)[number] {
+  return typeof value === "string" && OPENCODE_STATUSES.some((known) => known === value);
+}
+
+function runHook({
+  event,
+  sessionId,
+  cwd,
   timeoutMs = HOOK_TIMEOUT_MS,
-): Promise<void> {
+}: HookOptions): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    let forceTimer: NodeJS.Timeout | undefined;
     const finish = () => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
       resolve();
     };
 
@@ -49,13 +74,14 @@ function runHook(
           child.kill(signal);
         }
       };
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         try {
           kill("SIGTERM");
         } catch {
           finish();
+          return;
         }
-        const forceTimer = setTimeout(() => {
+        forceTimer = setTimeout(() => {
           try {
             kill("SIGKILL");
           } catch {}
@@ -66,13 +92,10 @@ function runHook(
       timer.unref?.();
 
       child.on("error", finish);
-      child.on("close", () => {
-        clearTimeout(timer);
-        finish();
-      });
+      child.on("close", finish);
       child.stdin.on("error", () => {});
 
-      const native: Record<string, string> = {};
+      const native: NativeEvent = {};
       if (sessionId) native.session_id = sessionId;
       if (cwd) native.cwd = cwd;
       child.stdin.end(JSON.stringify(native));
@@ -90,24 +113,28 @@ export const HooklinesinkerPlugin = async ({
   const knownSessionIds = new Set<string>();
   let hookQueue: Promise<void> = Promise.resolve();
   let pendingHooks = 0;
-  function queueHook(event: string, sessionId?: string): Promise<void> {
+  function queueHook(request: HookRequest): Promise<void> {
     if (pendingHooks >= MAX_PENDING_HOOKS) return Promise.resolve();
     const queuedAt = Date.now();
     pendingHooks += 1;
     const queued = hookQueue.then(() => {
       const remaining = HOOK_TIMEOUT_MS - (Date.now() - queuedAt);
       return remaining > 0
-        ? runHook(event, sessionId, directory, remaining)
+        ? runHook({ ...request, cwd: directory, timeoutMs: remaining })
         : Promise.resolve();
     });
-    hookQueue = queued.finally(() => {
+    const settledQueue = queued.then(
+      () => {},
+      () => {},
+    ).finally(() => {
       pendingHooks -= 1;
     });
-    return queued;
+    hookQueue = settledQueue;
+    return settledQueue;
   }
 
   // Resuming a session can skip the native session.created event.
-  await queueHook("session.created");
+  await queueHook({ event: "session.created" });
 
   return {
     event: async ({
@@ -124,7 +151,9 @@ export const HooklinesinkerPlugin = async ({
         .find((id): id is string => typeof id === "string" && id.length > 0);
 
       if (event.type === "server.instance.disposed") {
-        const removals = [...knownSessionIds].map((id) => queueHook("session.deleted", id));
+        const removals = [...knownSessionIds].map((id) =>
+          queueHook({ event: "session.deleted", sessionId: id }),
+        );
         knownSessionIds.clear();
         await Promise.all(removals);
         return;
@@ -138,11 +167,11 @@ export const HooklinesinkerPlugin = async ({
       let eventName = event.type;
       if (event.type === "session.status") {
         const status = isRecord(properties?.status) ? properties.status.type : undefined;
-        if (typeof status !== "string" || !status) return;
+        if (!isOpenCodeStatus(status)) return;
         eventName = `session.status.${status}`;
       }
 
-      await queueHook(eventName, sessionId);
+      await queueHook({ event: eventName, sessionId });
     },
   };
 };

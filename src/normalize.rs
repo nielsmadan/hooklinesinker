@@ -127,8 +127,8 @@ pub(crate) fn normalize(
         MappedAction::Remove => (Phase::Idle, false),
     };
 
-    let session_id = native.session_id.unwrap_or_default();
-    let cwd = native.cwd.unwrap_or_else(|| env.cwd.clone());
+    let session_id = capped(native.session_id.unwrap_or_default());
+    let cwd = capped(native.cwd.unwrap_or_else(|| env.cwd.clone()));
     let host = process
         .as_ref()
         .map_or_else(|| env.host.clone(), |p| p.host.clone());
@@ -146,7 +146,7 @@ pub(crate) fn normalize(
         session: SessionIdentity {
             id: session_id,
             cwd,
-            transcript_path: native.transcript_path,
+            transcript_path: native.transcript_path.map(capped),
         },
         process,
         terminal: env.terminal.clone(),
@@ -159,6 +159,21 @@ pub(crate) fn normalize(
     } else {
         Normalized::ForwardOnly(status)
     })
+}
+
+// Every distinct session id becomes its own ledger file, and each record is re-parsed under
+// the store lock on every ingest, so an agent must not be able to grow either without bound.
+const MAX_FIELD_BYTES: usize = 4096;
+
+fn capped(mut value: String) -> String {
+    if value.len() > MAX_FIELD_BYTES {
+        let mut end = MAX_FIELD_BYTES;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
 }
 
 fn binding_id(

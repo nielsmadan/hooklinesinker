@@ -4,7 +4,7 @@ use crate::events::native_event_specs;
 use crate::events::{EventSpec, subscribed_event_specs};
 use crate::persistence::{LockGuard, write_preserving_atomic_if_unchanged, write_private_atomic};
 use crate::protocol::{Agent, Capability};
-use serde::Serialize;
+pub(crate) use crate::protocol::{HookEntry, HookState, HookStatus};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fs;
@@ -18,41 +18,19 @@ const BIN_PLACEHOLDER: &str = "__HOOKLINESINKER_BIN__";
 const OPENCODE_TEMPLATE: &str = include_str!("../adapters/opencode-hooklinesinker.ts");
 const PI_TEMPLATE: &str = include_str!("../adapters/pi-hooklinesinker.ts");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum HookState {
-    Missing,
-    Installed,
-    Drifted,
-    Unsupported,
-}
-
-impl HookState {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::Installed => "installed",
-            Self::Drifted => "drifted",
-            Self::Unsupported => "unsupported",
-        }
+fn empty_status(
+    agent: Agent,
+    state: HookState,
+    path: &Path,
+    reason: Option<&'static str>,
+) -> HookStatus {
+    HookStatus {
+        agent,
+        state,
+        path: path.to_path_buf(),
+        entries: Vec::new(),
+        reason,
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct HookEntry {
-    pub event: String,
-    pub group_index: usize,
-    pub command: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct HookStatus {
-    pub agent: Agent,
-    pub state: HookState,
-    pub path: PathBuf,
-    pub entries: Vec<HookEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,7 +105,7 @@ impl HookManager {
     pub(crate) fn install(&self, agent: Agent) -> io::Result<HookStatus> {
         let backend = self.backend(agent);
         let _guard = LockGuard::acquire_for(backend.path())?;
-        let events = subscribed_event_specs(agent, &Capability::ALL);
+        let events = subscribed_event_specs(agent, Capability::ALL);
         match backend {
             HookBackend::Json { path, location } => {
                 self.json_hooks()
@@ -148,7 +126,7 @@ impl HookManager {
     }
 
     pub(crate) fn status(&self, agent: Agent) -> io::Result<HookStatus> {
-        let events = subscribed_event_specs(agent, &Capability::ALL);
+        let events = subscribed_event_specs(agent, Capability::ALL);
         match self.backend(agent) {
             HookBackend::Json { path, location } => {
                 self.json_hooks().status(agent, &path, &events, location)
@@ -163,7 +141,7 @@ impl HookManager {
     pub(crate) fn uninstall(&self, agent: Agent) -> io::Result<HookStatus> {
         let backend = self.backend(agent);
         let _guard = LockGuard::acquire_for(backend.path())?;
-        let events = subscribed_event_specs(agent, &Capability::ALL);
+        let events = subscribed_event_specs(agent, Capability::ALL);
         match backend {
             HookBackend::Json { path, location } => self.json_hooks().reconcile(
                 agent,
@@ -310,12 +288,7 @@ impl JsonHooks<'_> {
     ) -> io::Result<HookStatus> {
         let original_bytes = read_optional_bytes(path)?;
         if original_bytes.is_none() && matches!(mode, ReconcileMode::Uninstall) {
-            return Ok(HookStatus {
-                agent,
-                state: HookState::Missing,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+            return Ok(empty_status(agent, HookState::Missing, path, None));
         }
         let root = original_bytes
             .as_deref()
@@ -325,26 +298,30 @@ impl JsonHooks<'_> {
         let original_root = root.clone();
 
         let Ok((root, mut hooks)) = take_hook_map(root, location) else {
-            return Ok(HookStatus {
+            return Ok(empty_status(
                 agent,
-                state: HookState::Unsupported,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+                HookState::Unsupported,
+                path,
+                Some("the hooks key is not an object"),
+            ));
         };
 
         if managed_event_shape_is_unsupported(&hooks, events) {
-            return Ok(HookStatus {
+            return Ok(empty_status(
                 agent,
-                state: HookState::Unsupported,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+                HookState::Unsupported,
+                path,
+                Some("a managed event's value is not an array"),
+            ));
         }
 
         remove_legacy_handlers(&mut hooks);
         reconcile_managed_events(&mut hooks, events, mode, self.binary_path, agent);
-        hooks.retain(|_, value| !matches!(value, Value::Array(items) if items.is_empty()));
+        // Reconciliation may empty a group it owns, but a foreign empty array is the user's.
+        hooks.retain(|event, value| {
+            !matches!(value, Value::Array(items) if items.is_empty())
+                || !events.iter().any(|spec| spec.name == event)
+        });
         let final_root = place_hook_map(root, hooks, location);
         if final_root == original_root {
             return self.status(agent, path, events, location);
@@ -365,44 +342,34 @@ impl JsonHooks<'_> {
         location: HooksLocation,
     ) -> io::Result<HookStatus> {
         let Some(root) = read_json_root(path)? else {
-            return Ok(HookStatus {
-                agent,
-                state: HookState::Missing,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+            return Ok(empty_status(agent, HookState::Missing, path, None));
         };
 
         let hooks = match location {
             HooksLocation::Nested(key) => match root.get(key) {
                 None => {
-                    return Ok(HookStatus {
-                        agent,
-                        state: HookState::Missing,
-                        path: path.to_path_buf(),
-                        entries: Vec::new(),
-                    });
+                    return Ok(empty_status(agent, HookState::Missing, path, None));
                 }
                 Some(Value::Object(map)) => map,
                 Some(_) => {
-                    return Ok(HookStatus {
+                    return Ok(empty_status(
                         agent,
-                        state: HookState::Unsupported,
-                        path: path.to_path_buf(),
-                        entries: Vec::new(),
-                    });
+                        HookState::Unsupported,
+                        path,
+                        Some("the hooks key is not an object"),
+                    ));
                 }
             },
             HooksLocation::TopLevel => &root,
         };
 
         if managed_event_shape_is_unsupported(hooks, events) {
-            return Ok(HookStatus {
+            return Ok(empty_status(
                 agent,
-                state: HookState::Unsupported,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+                HookState::Unsupported,
+                path,
+                Some("a managed event's value is not an array"),
+            ));
         }
 
         let mut entries = Vec::new();
@@ -454,6 +421,7 @@ impl JsonHooks<'_> {
             state,
             path: path.to_path_buf(),
             entries,
+            reason: None,
         })
     }
 }
@@ -477,12 +445,7 @@ impl TomlHooks<'_> {
             Err(e) => return Err(e),
         };
         if existing.is_none() && matches!(mode, ReconcileMode::Uninstall) {
-            return Ok(HookStatus {
-                agent,
-                state: HookState::Missing,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+            return Ok(empty_status(agent, HookState::Missing, path, None));
         }
 
         let mut doc = parse_toml_document(path, existing.as_deref().unwrap_or(""))?;
@@ -490,12 +453,12 @@ impl TomlHooks<'_> {
         if let Some(item) = doc.get("hooks")
             && !item.is_array_of_tables()
         {
-            return Ok(HookStatus {
+            return Ok(empty_status(
                 agent,
-                state: HookState::Unsupported,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+                HookState::Unsupported,
+                path,
+                Some("the hooks key is not an array of tables"),
+            ));
         }
 
         let mut kept = ArrayOfTables::new();
@@ -556,12 +519,7 @@ impl TomlHooks<'_> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(HookStatus {
-                    agent,
-                    state: HookState::Missing,
-                    path: path.to_path_buf(),
-                    entries: Vec::new(),
-                });
+                return Ok(empty_status(agent, HookState::Missing, path, None));
             }
             Err(e) => return Err(e),
         };
@@ -569,22 +527,17 @@ impl TomlHooks<'_> {
 
         let array = match doc.get("hooks") {
             None => {
-                return Ok(HookStatus {
-                    agent,
-                    state: HookState::Missing,
-                    path: path.to_path_buf(),
-                    entries: Vec::new(),
-                });
+                return Ok(empty_status(agent, HookState::Missing, path, None));
             }
             Some(item) => match item.as_array_of_tables() {
                 Some(array) => array,
                 None => {
-                    return Ok(HookStatus {
+                    return Ok(empty_status(
                         agent,
-                        state: HookState::Unsupported,
-                        path: path.to_path_buf(),
-                        entries: Vec::new(),
-                    });
+                        HookState::Unsupported,
+                        path,
+                        Some("the hooks key is not an array of tables"),
+                    ));
                 }
             },
         };
@@ -627,6 +580,7 @@ impl TomlHooks<'_> {
             state,
             path: path.to_path_buf(),
             entries,
+            reason: None,
         })
     }
 }
@@ -648,23 +602,18 @@ impl TypeScriptHooks<'_> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(HookStatus {
-                    agent,
-                    state: HookState::Missing,
-                    path: path.to_path_buf(),
-                    entries: Vec::new(),
-                });
+                return Ok(empty_status(agent, HookState::Missing, path, None));
             }
             Err(e) => return Err(e),
         };
         let text = String::from_utf8_lossy(&bytes).into_owned();
         if !text.starts_with(MARKER_PREFIX) {
-            return Ok(HookStatus {
+            return Ok(empty_status(
                 agent,
-                state: HookState::Unsupported,
-                path: path.to_path_buf(),
-                entries: Vec::new(),
-            });
+                HookState::Unsupported,
+                path,
+                Some("the file is not one this tool generated"),
+            ));
         }
         let expected = self.generated_content(template);
         let state = if text == expected {
@@ -677,6 +626,7 @@ impl TypeScriptHooks<'_> {
             state,
             path: path.to_path_buf(),
             entries: Vec::new(),
+            reason: None,
         })
     }
 
@@ -1867,6 +1817,31 @@ mod tests {
     }
 
     #[test]
+    fn adapter_templates_keep_the_binary_placeholder_double_quoted() {
+        // generated_content replaces the placeholder including its quotes, and String::replace
+        // no-ops silently, so a requoted template would ship an adapter spawning the literal.
+        let quoted = format!("\"{BIN_PLACEHOLDER}\"");
+        for (agent, template) in [("opencode", OPENCODE_TEMPLATE), ("pi", PI_TEMPLATE)] {
+            assert!(
+                template.contains(&quoted),
+                "{agent} adapter must keep {quoted} as a double-quoted literal"
+            );
+            let generated = TypeScriptHooks {
+                binary_path: Path::new("/tmp/hooklinesinker"),
+            }
+            .generated_content(template);
+            assert!(
+                !generated.contains(BIN_PLACEHOLDER),
+                "{agent} adapter still carries the placeholder after substitution"
+            );
+            assert!(
+                generated.contains("\"/tmp/hooklinesinker\""),
+                "{agent} adapter is missing the substituted binary path"
+            );
+        }
+    }
+
+    #[test]
     fn opencode_install_writes_a_marked_file_and_is_idempotent() {
         let (manager, base) = manager();
         let status = manager.install(Agent::Opencode).unwrap();
@@ -2131,6 +2106,46 @@ mod tests {
                     canonical_command(&manager.roots.binary_path, Agent::Claude, "Stop")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn droid_reconciliation_preserves_foreign_handlers_in_its_top_level_shape() {
+        // Droid stores the same array-of-groups under a top-level event key instead of a
+        // "hooks" wrapper, so the preservation logic meets a different root here.
+        for install in [true, false] {
+            let (manager, base) = manager();
+            let canonical = canonical_command(&manager.roots.binary_path, Agent::Droid, "Stop");
+            let foreign = serde_json::json!([
+                {"type": "prompt", "prompt": "Keep this prompt"},
+                {"future": "handler", "command": canonical}
+            ]);
+            let mut handlers = foreign.as_array().unwrap().clone();
+            handlers.push(serde_json::json!({"type": "command", "command": canonical}));
+            let original =
+                serde_json::json!({"Stop": [{"hooks": handlers, "custom": "keep group metadata"}]});
+            let path = base.join("factory").join("hooks.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, original.to_string()).unwrap();
+
+            let status = if install {
+                manager.install(Agent::Droid)
+            } else {
+                manager.uninstall(Agent::Droid)
+            }
+            .unwrap();
+            assert_eq!(
+                status.state,
+                if install {
+                    HookState::Installed
+                } else {
+                    HookState::Missing
+                }
+            );
+            let result: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(result["Stop"][0]["hooks"], foreign);
+            assert_eq!(result["Stop"][0]["custom"], "keep group metadata");
+            assert!(result.get("hooks").is_none(), "droid has no hooks wrapper");
         }
     }
 

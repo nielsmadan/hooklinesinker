@@ -45,8 +45,14 @@ pub(super) enum Command {
     Install {
         #[arg(long, help = "Consumer name")]
         consumer: String,
-        #[arg(long, help = "Optional HTTP(S) event sink")]
+        #[arg(
+            long,
+            conflicts_with = "no_sink",
+            help = "HTTP(S) event sink; omit to keep the registered one"
+        )]
         sink: Option<String>,
+        #[arg(long, help = "Clear the registered event sink")]
+        no_sink: bool,
     },
     #[command(about = "Remove a registered consumer")]
     Uninstall {

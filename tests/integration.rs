@@ -536,7 +536,8 @@ fn codex_stop_remains_idle_and_running_rather_than_ending() {
 
 #[test]
 fn claude_subagent_stop_is_outside_the_installed_vocabulary() {
-    // A hand-wired SubagentStop must remain unrecognized so it cannot race the parent Stop.
+    // Never installed; a hand-wired SubagentStop must stay unrecognized so a child finishing
+    // cannot mark its still-working parent idle.
     let result = normalized_for_test(Agent::Claude, "SubagentStop", generic_native_json());
     assert!(matches!(result, Normalized::Unrecognized));
 }
@@ -559,7 +560,8 @@ fn droid_notification_type_selects_the_right_phase() {
 fn droid_notification_auth_success_is_ignored() {
     let native = r#"{"session_id":"s","notification_type":"auth_success"}"#;
     let result = normalized_for_test(Agent::Droid, "Notification", native);
-    // auth_success is recognized but carries no phase.
+    // Any notification_type outside permission_prompt/elicitation_dialog/idle_prompt is ignored,
+    // not unrecognized.
     assert!(matches!(result, Normalized::Ignored));
 }
 
@@ -1246,19 +1248,24 @@ fn fanout_sends_only_to_status_consumers() {
 }
 
 #[test]
-fn unknown_capability_cannot_be_registered() {
+fn an_unknown_capability_keeps_the_rest_of_the_consumer_readable() {
     let store = consumer_store();
     store
         .register(&consumer("juggler", &["status"], None))
         .unwrap();
-    let unknown = serde_json::from_value::<Consumer>(serde_json::json!({
+    let future = serde_json::from_value::<Consumer>(serde_json::json!({
         "name": "future",
         "protocol": PROTOCOL_VERSION,
-        "capabilities": ["raw"],
+        "capabilities": ["status", "raw"],
         "sink": null
-    }));
-    assert!(unknown.is_err());
-    assert_eq!(store.list().unwrap().len(), 1);
+    }))
+    .expect("a newer capability must not fail the whole record");
+    assert_eq!(
+        future.capabilities,
+        vec![Capability::Status, Capability::Unknown]
+    );
+    store.register(&future).unwrap();
+    assert_eq!(store.list().unwrap().len(), 2);
 }
 
 #[test]
@@ -2229,7 +2236,7 @@ fn every_agent_drops_an_empty_session_id_from_the_ledger() {
 }
 
 #[test]
-fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
+fn a_sink_failure_during_sweep_fan_out_is_reported_without_disturbing_the_ledger() {
     let store = store();
     let consumers = consumer_store();
     consumers
@@ -2281,7 +2288,16 @@ fn a_sink_failure_during_sweep_fan_out_never_changes_ingests_exit_status() {
         721,
     );
 
-    assert!(outcome.problem.is_none());
+    // Sink failures reach stderr so a human running ingest by hand sees them; the exit-0
+    // contract is unaffected and is pinned by the CLI suite.
+    assert!(
+        outcome
+            .problem
+            .as_deref()
+            .is_some_and(|problem| problem.contains("sink juggler failed")),
+        "expected the sink failure to be reported, got {:?}",
+        outcome.problem
+    );
     let remaining = store.running(&other_liveness).unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].session.id, "other-session-2");

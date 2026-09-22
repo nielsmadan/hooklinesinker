@@ -209,6 +209,83 @@ fn adapters_carry_the_binary_placeholder() {
     }
 }
 
+fn run_hook_body(source: &str) -> String {
+    let start = source
+        .find("function runHook(")
+        .expect("adapter defines runHook");
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("runHook body is brace-terminated");
+    rest[..end].to_string()
+}
+
+fn shared_declaration(source: &str, prefix: &str) -> String {
+    source
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("adapter declares {prefix}"))
+        .to_string()
+}
+
+#[test]
+fn both_adapters_share_one_hook_budget() {
+    let opencode = std::fs::read_to_string(repo_root().join(OPENCODE_ADAPTER)).unwrap();
+    let pi = std::fs::read_to_string(repo_root().join(PI_ADAPTER)).unwrap();
+    for prefix in [
+        "const HOOK_TIMEOUT_MS",
+        "const MAX_PENDING_HOOKS",
+        "function isRecord",
+    ] {
+        assert_eq!(
+            shared_declaration(&opencode, prefix),
+            shared_declaration(&pi, prefix),
+            "{prefix} drifted between the two adapters"
+        );
+    }
+    assert_eq!(
+        shared_declaration(&opencode, "const HOOK_TIMEOUT_MS"),
+        format!("const HOOK_TIMEOUT_MS = {ADAPTER_HOOK_TIMEOUT_MS};"),
+        "the adapters' hook budget no longer matches this suite's hang budget"
+    );
+}
+
+#[test]
+fn both_adapters_share_one_run_hook_implementation() {
+    // The two files cannot import a common module, so drift is only caught by comparing them.
+    let opencode =
+        run_hook_body(&std::fs::read_to_string(repo_root().join(OPENCODE_ADAPTER)).unwrap());
+    let pi = run_hook_body(&std::fs::read_to_string(repo_root().join(PI_ADAPTER)).unwrap());
+
+    let differing = opencode
+        .lines()
+        .zip(pi.lines())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        opencode.lines().count(),
+        pi.lines().count(),
+        "runHook bodies differ in length; they must stay line-for-line parallel"
+    );
+    assert_eq!(
+        differing, 3,
+        "runHook bodies differ on {differing} lines; only the agent name and the third \
+         parameter may differ, so reconcile them or update this guard deliberately"
+    );
+
+    let translated = opencode
+        .replace("\"opencode\"", "\"pi\"")
+        .replace("  cwd,", "  reason,")
+        .replace(
+            "if (cwd) native.cwd = cwd;",
+            "if (reason) native.reason = reason;",
+        );
+    assert_eq!(
+        translated, pi,
+        "runHook bodies diverge beyond the agent name and the third parameter"
+    );
+}
+
 // MARK: - Pi
 
 #[test]
@@ -384,7 +461,22 @@ fn pi_a_hanging_binary_cannot_block_the_adapter() {
 }
 
 #[test]
-fn pi_adapter_bounds_its_pending_hook_queue() {
+fn pi_adapter_admits_exactly_its_queue_bound() {
+    // A fast binary lets every admitted hook finish, so the cap is the only thing that can
+    // reduce 100 fired events to a smaller number.
+    let Some(run) = run("pi:queue_bound") else {
+        return;
+    };
+    let prompts = run
+        .events()
+        .iter()
+        .filter(|event| event.as_str() == "permission_prompt")
+        .count();
+    assert_eq!(prompts, 32);
+}
+
+#[test]
+fn pi_adapter_drops_queued_hooks_past_their_deadline() {
     let Some(run) = run("pi:queue_bound:slow") else {
         return;
     };
@@ -393,7 +485,10 @@ fn pi_adapter_bounds_its_pending_hook_queue() {
         .iter()
         .filter(|event| event.as_str() == "permission_prompt")
         .count();
-    assert!((1..=32).contains(&prompts));
+    // Timing decides how many of the 32 admitted hooks outlive their enqueue deadline, so
+    // only the cap and the back-pressure itself are deterministic here.
+    assert!(prompts <= 32, "queue bound exceeded: {prompts}");
+    assert!(prompts >= 1, "every queued hook was dropped");
 }
 
 // MARK: - OpenCode
@@ -514,7 +609,20 @@ fn opencode_a_hanging_binary_cannot_block_the_adapter() {
 }
 
 #[test]
-fn opencode_adapter_bounds_its_pending_hook_queue() {
+fn opencode_adapter_admits_exactly_its_queue_bound() {
+    let Some(run) = run("opencode:queue_bound") else {
+        return;
+    };
+    let idle = run
+        .events()
+        .iter()
+        .filter(|event| event.as_str() == "session.idle")
+        .count();
+    assert_eq!(idle, 32);
+}
+
+#[test]
+fn opencode_adapter_drops_queued_hooks_past_their_deadline() {
     let Some(run) = run("opencode:queue_bound:slow") else {
         return;
     };
@@ -523,7 +631,8 @@ fn opencode_adapter_bounds_its_pending_hook_queue() {
         .iter()
         .filter(|event| event.as_str() == "session.idle")
         .count();
-    assert!((1..=32).contains(&idle));
+    assert!(idle <= 32, "queue bound exceeded: {idle}");
+    assert!(idle >= 1, "every queued hook was dropped");
 }
 
 /// Prevent stale asset paths from silently skipping adapter assertions.

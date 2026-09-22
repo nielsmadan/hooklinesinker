@@ -247,11 +247,14 @@ impl Default for SystemProcessLookup {
 
 impl ProcessLiveness for SystemProcessLookup {
     fn process_is_alive(&self, identity: &ProcessIdentity) -> bool {
+        // Absent only proves the process postdates this snapshot, and sweeping decides
+        // deletion for records another ingest may have written since.
         self.system
             .process(Pid::from_u32(identity.pid))
-            .is_some_and(|process| {
-                format_epoch_seconds(process.start_time()) == identity.started_at
-            })
+            .map_or_else(
+                || pid_is_alive(identity),
+                |process| format_epoch_seconds(process.start_time()) == identity.started_at,
+            )
     }
 }
 
@@ -463,8 +466,8 @@ mod tests {
                 host: local_hostname(),
             };
             assert!(
-                !lookup.process_is_alive(&identity),
-                "a process snapshot must not invent processes started after it"
+                lookup.process_is_alive(&identity),
+                "a process absent from the snapshot must be confirmed live, not swept"
             );
             assert!(SystemProcessLookup::new().process_is_alive(&identity));
             let alive = SystemProcessLiveness.process_is_alive(&identity);
