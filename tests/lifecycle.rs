@@ -1,3 +1,4 @@
+use crate as hooklinesinker;
 use hooklinesinker::consumers::ConsumerStore;
 use hooklinesinker::ingest::{IngestContext, handle_ingest};
 use hooklinesinker::normalize::{HookEnvironment, normalize};

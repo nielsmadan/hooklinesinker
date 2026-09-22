@@ -17,16 +17,12 @@ pub(crate) mod state;
 
 pub use app::run;
 
+// Declared as modules rather than `include!`d so rustfmt reaches them; they need
+// `pub(crate)` access, so they cannot be ordinary test targets.
 #[cfg(test)]
-mod integration_tests {
-    use crate as hooklinesinker;
-
-    include!("../tests/integration.rs");
-}
+#[path = "../tests/integration.rs"]
+mod integration_tests;
 
 #[cfg(test)]
-mod lifecycle_tests {
-    use crate as hooklinesinker;
-
-    include!("../tests/lifecycle.rs");
-}
+#[path = "../tests/lifecycle.rs"]
+mod lifecycle_tests;

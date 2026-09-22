@@ -1,3 +1,4 @@
+use crate as hooklinesinker;
 use hooklinesinker::consumers::ConsumerStore;
 use hooklinesinker::environment::{self, EnvSource};
 use hooklinesinker::hooks::{HookManager, HookRoots, HookState};
