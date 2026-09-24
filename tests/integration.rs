@@ -765,6 +765,56 @@ fn binding_paths_reject_invalid_ids_before_accessing_the_filesystem() {
 }
 
 #[test]
+fn a_live_process_outranks_a_future_timestamp() {
+    // A backward clock step makes every recently written record look future-dated; sweeping
+    // them would delete live sessions and announce each one as gone.
+    let store = store();
+    let mut event = status("clock-step-session", 910, 91);
+    event.observed_at = "2099-01-01T00:00:00Z".into();
+    store.record(&event).unwrap();
+
+    let swept = store.sweep(&all_alive()).unwrap().events;
+    assert!(swept.is_empty(), "swept a live session: {swept:?}");
+    assert_eq!(store.running(&all_alive()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_live_process_outranks_an_unparseable_timestamp() {
+    let store = store();
+    let mut event = status("corrupt-timestamp-session", 911, 92);
+    event.observed_at = "not-a-timestamp".into();
+    store.record(&event).unwrap();
+
+    let swept = store.sweep(&all_alive()).unwrap().events;
+    assert!(swept.is_empty(), "swept a live session: {swept:?}");
+    assert_eq!(store.running(&all_alive()).unwrap().len(), 1);
+}
+
+#[test]
+fn an_unverifiable_record_still_ages_out_on_an_unusable_timestamp() {
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    for (session, observed) in [
+        ("no-process-future", "2099-01-01T00:00:00Z"),
+        ("no-process-corrupt", "not-a-timestamp"),
+    ] {
+        let mut event = status(session, 913, 94);
+        event.binding_id = test_binding_id(session);
+        event.process = None;
+        event.observed_at = observed.into();
+        store.record(&event).unwrap();
+    }
+    assert_eq!(ledger_files(&root), 2);
+
+    store.sweep(&all_alive()).unwrap();
+    assert_eq!(
+        ledger_files(&root),
+        0,
+        "a record with no process and no usable timestamp can never be aged, so it must go"
+    );
+}
+
+#[test]
 fn sweep_removes_dead_bindings_and_returns_them_with_running_false() {
     let store = store();
     store.record(&status("swept-session", 302, 32)).unwrap();

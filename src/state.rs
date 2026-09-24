@@ -570,13 +570,12 @@ fn is_sweepable(
     if is_dead(event, liveness) {
         return true;
     }
+    // A verified-live process outranks its own timestamp: a backward clock step or a corrupt
+    // observedAt must not delete the record and announce the session as gone.
     let Some(observed) = Timestamp::parse(&event.observed_at) else {
-        return true;
+        return event.process.is_none();
     };
-    if observed > now {
-        return true;
-    }
     let age = now.seconds_since(observed);
-    event.process.is_none() && age > UNVERIFIABLE_RECORD_TTL_SECS
+    event.process.is_none() && (observed > now || age > UNVERIFIABLE_RECORD_TTL_SECS)
         || stored.parallel && age > SHARED_RECORD_TTL_SECS
 }
