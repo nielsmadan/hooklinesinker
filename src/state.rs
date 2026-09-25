@@ -283,12 +283,13 @@ impl StatusStore {
                 && !stored.retired
                 && current.is_some_and(|event| {
                     let previous = &stored.status;
+                    let pane = event.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref());
+                    // Attaching or detaching tmux changes the reported terminal within one process.
                     previous.agent == event.agent
                         && previous.session.id != event.session.id
                         && previous.process == event.process
-                        && previous.terminal == event.terminal
-                        && previous.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
-                            == event.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref())
+                        && previous.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref()) == pane
+                        && (pane.is_some() || previous.terminal == event.terminal)
                         && previous.remote_host == event.remote_host
                 })
             {

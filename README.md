@@ -107,6 +107,11 @@ normalized; treat `event` as a diagnostic label rather than a dispatch key.
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which also separates two terminals driving the same native session.
 
+`terminal` is null when no terminal displays the session. That includes an agent inside a tmux
+session with no attached client (`session_attached` and `session_group_attached` are both 0),
+whose inherited terminal variables belong to whichever tab started the tmux server; `tmux` is
+still reported.
+
 An event whose `session.id` is empty (an agent announcing itself before its session id exists)
 is delivered to sinks but never stored, so it can never appear in `sessions --json`.
 

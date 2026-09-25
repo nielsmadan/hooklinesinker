@@ -228,6 +228,7 @@ impl ProcessLookup for FakeProcessLookup {
 struct FakeEnvSource {
     vars: HashMap<String, String>,
     commands: HashMap<(String, Vec<String>), String>,
+    calls: Mutex<Vec<String>>,
     hostname: String,
 }
 
@@ -236,6 +237,7 @@ impl FakeEnvSource {
         Self {
             vars: HashMap::new(),
             commands: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
             hostname: "test-host".into(),
         }
     }
@@ -255,6 +257,15 @@ impl FakeEnvSource {
         );
         self
     }
+
+    fn calls_to(&self, program: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|called| called.as_str() == program)
+            .count()
+    }
 }
 
 impl EnvSource for FakeEnvSource {
@@ -263,6 +274,7 @@ impl EnvSource for FakeEnvSource {
     }
 
     fn command_output(&self, program: &str, args: &[&str]) -> Option<String> {
+        self.calls.lock().unwrap().push(program.to_string());
         let key = (
             program.to_string(),
             args.iter().map(ToString::to_string).collect(),
@@ -1108,13 +1120,134 @@ fn tmux_pane_resolves_session_name_via_the_injected_command_runner() {
         .with_var("TMUX_PANE", "%3")
         .with_command(
             "tmux",
-            &["display-message", "-p", "-t", "%3", "#{session_name}"],
-            "work",
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "%3",
+                environment::TMUX_PANE_FORMAT,
+            ],
+            "1,,work",
         );
     let gathered = environment::gather_environment(&env, "/tmp".into());
     let tmux = gathered.tmux.unwrap();
     assert_eq!(tmux.pane.as_deref(), Some("%3"));
     assert_eq!(tmux.session_name.as_deref(), Some("work"));
+}
+
+const TMUX_VAR: &str = "/private/tmp/tmux-501/default,123,4";
+
+fn tmux_pane_source(terminal: (&str, &str), report: Option<&str>) -> FakeEnvSource {
+    let source = FakeEnvSource::new()
+        .with_var(terminal.0, terminal.1)
+        .with_var("TMUX", TMUX_VAR)
+        .with_var("TMUX_PANE", "%5");
+    match report {
+        Some(report) => source.with_command(
+            "tmux",
+            &[
+                "-S",
+                "/private/tmp/tmux-501/default",
+                "display-message",
+                "-p",
+                "-t",
+                "%5",
+                environment::TMUX_PANE_FORMAT,
+            ],
+            report,
+        ),
+        None => source,
+    }
+}
+
+const ITERM: (&str, &str) = ("ITERM_SESSION_ID", "w2t9p0:10935D3A");
+
+#[test]
+fn detached_tmux_session_withholds_inherited_terminal_identity() {
+    for terminal in [ITERM, ("KITTY_WINDOW_ID", "7"), ("WEZTERM_PANE", "3")] {
+        let source = tmux_pane_source(terminal, Some("0,,juggler-case"));
+        let gathered = environment::gather_environment(&source, "/tmp".into());
+        assert_eq!(gathered.terminal, None, "{terminal:?}");
+        let tmux = gathered.tmux.unwrap();
+        assert_eq!(tmux.pane.as_deref(), Some("%5"));
+        assert_eq!(tmux.session_name.as_deref(), Some("juggler-case"));
+    }
+}
+
+#[test]
+fn attached_tmux_session_keeps_terminal_identity() {
+    for report in ["1,,work", "0,2,work"] {
+        let source = tmux_pane_source(ITERM, Some(report));
+        let gathered = environment::gather_environment(&source, "/tmp".into());
+        assert_eq!(
+            gathered.terminal.unwrap().session_id.as_deref(),
+            Some("w2t9p0:10935D3A"),
+            "{report}"
+        );
+        assert_eq!(gathered.tmux.unwrap().session_name.as_deref(), Some("work"));
+    }
+}
+
+#[test]
+fn unanswered_tmux_query_keeps_terminal_identity() {
+    for report in [None, Some("garbage")] {
+        let source = tmux_pane_source(ITERM, report);
+        let gathered = environment::gather_environment(&source, "/tmp".into());
+        assert_eq!(
+            gathered.terminal.unwrap().session_id.as_deref(),
+            Some("w2t9p0:10935D3A"),
+            "{report:?}"
+        );
+        assert_eq!(gathered.tmux.unwrap().pane.as_deref(), Some("%5"));
+    }
+}
+
+#[test]
+fn tmux_pane_without_tmux_socket_keeps_terminal_identity() {
+    let source = FakeEnvSource::new()
+        .with_var("ITERM_SESSION_ID", "w2t9p0:10935D3A")
+        .with_var("TMUX_PANE", "%5")
+        .with_command(
+            "tmux",
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "%5",
+                environment::TMUX_PANE_FORMAT,
+            ],
+            "0,,work",
+        );
+    let gathered = environment::gather_environment(&source, "/tmp".into());
+    assert_eq!(
+        gathered.terminal.unwrap().session_id.as_deref(),
+        Some("w2t9p0:10935D3A")
+    );
+    assert_eq!(gathered.tmux.unwrap().session_name.as_deref(), Some("work"));
+}
+
+#[test]
+fn no_tmux_pane_runs_no_tmux_query() {
+    let source = FakeEnvSource::new()
+        .with_var("ITERM_SESSION_ID", "w2t9p0:10935D3A")
+        .with_var("TMUX", TMUX_VAR);
+    let gathered = environment::gather_environment(&source, "/tmp".into());
+    assert_eq!(source.calls_to("tmux"), 0);
+    assert_eq!(
+        gathered.terminal.unwrap().session_id.as_deref(),
+        Some("w2t9p0:10935D3A")
+    );
+}
+
+#[test]
+fn detached_remote_tmux_session_keeps_its_remote_host() {
+    let source = tmux_pane_source(ITERM, Some("0,,work"))
+        .with_var("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22")
+        .with_var("USER", "alice")
+        .with_var("HOSTNAME", "build.example.com");
+    let gathered = environment::gather_environment(&source, "/tmp".into());
+    assert_eq!(gathered.terminal, None);
+    assert_eq!(gathered.remote_host.as_deref(), Some("alice@build"));
 }
 
 #[test]
@@ -1167,8 +1300,14 @@ fn a_populated_environment_lands_on_the_normalized_status_event() {
         .with_var("TMUX_PANE", "%3")
         .with_command(
             "tmux",
-            &["display-message", "-p", "-t", "%3", "#{session_name}"],
-            "work",
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "%3",
+                environment::TMUX_PANE_FORMAT,
+            ],
+            "1,,work",
         )
         .with_command(
             "git",
@@ -1365,8 +1504,14 @@ fn claude_replacement_uses_tmux_pane_identity_when_session_names_change() {
         if let Some(name) = name {
             source = source.with_command(
                 "tmux",
-                &["display-message", "-p", "-t", pane, "#{session_name}"],
-                name,
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane,
+                    environment::TMUX_PANE_FORMAT,
+                ],
+                &format!("1,,{name}"),
             );
         }
         environment::gather_environment(&source, "/tmp/project".into())
@@ -1442,6 +1587,57 @@ fn claude_replacement_uses_tmux_pane_identity_when_session_names_change() {
             assert_eq!(ids, ["a", "b"]);
             assert_eq!(client.bodies().len(), 2);
         }
+    }
+}
+
+#[test]
+fn claude_replacement_retires_across_tmux_attachment_changes() {
+    for (old_report, new_report) in [("0,,work", "1,,work"), ("1,,work", "0,,work")] {
+        let store = store();
+        let process = test_process();
+        let liveness = FakeProcessLookup::with_owner(process.clone());
+        liveness.set_alive(process.pid, &process.started_at);
+        let consumers = consumer_store();
+        consumers
+            .register(&consumer(
+                "monitor",
+                &["status"],
+                Some("http://127.0.0.1:7483/hook"),
+            ))
+            .unwrap();
+        let client = RecordingHttpClient::default();
+        let ctx = ingest::IngestContext {
+            store: &store,
+            liveness: &liveness,
+            consumers: Some(&consumers),
+            http_client: &client,
+        };
+        for (event, input, report) in [
+            ("PermissionRequest", r#"{"session_id":"a"}"#, old_report),
+            (
+                "SessionStart",
+                r#"{"session_id":"b","source":"clear"}"#,
+                new_report,
+            ),
+        ] {
+            let env = environment::gather_environment(
+                &tmux_pane_source(ITERM, Some(report)),
+                "/tmp/project".into(),
+            );
+            let outcome =
+                ingest::handle_ingest(&ctx, Agent::Claude, event, input, &env, process.pid);
+            assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+        }
+        let ids: Vec<_> = store
+            .running(&liveness)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session.id)
+            .collect();
+        assert_eq!(ids, ["b"], "{old_report} -> {new_report}");
+        let bodies = client.bodies();
+        assert_eq!(bodies[2]["session"]["id"], "a");
+        assert_eq!(bodies[2]["running"], false);
     }
 }
 

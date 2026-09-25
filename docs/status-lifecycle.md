@@ -10,7 +10,10 @@ The flow starts in [`run_ingest`](../src/main.rs), which delegates to
 [`StatusStore`](../src/state.rs):
 
 1. Read at most 1 MiB of native JSON; gather terminal, tmux, Git, and remote-host
-   context; discover the owning agent by walking the hook process's ancestors.
+   context; discover the owning agent by walking the hook process's ancestors. Terminal
+   identity is withheld when the pane's tmux session has no attached client, since its
+   terminal variables were inherited from the tab that started the tmux server. A failed
+   or unparseable tmux query keeps the terminal identity.
 2. Map command-hook events through `events.rs` and adapter-specific events through
    `normalize.rs` to a phase update, removal, or ignored event. Event names outside an
    agent's vocabulary become ingest diagnostics.
@@ -37,8 +40,10 @@ reaches sinks but cannot enter the ledger. OpenCode's load-time event uses this 
 update a terminal row before a conversation ID becomes available.
 
 Foreground bindings replace one another within the same agent, PID, process start
-time, host, terminal, tmux pane, and remote-host context. Tmux session names are
-navigation metadata: renames or failed name lookups do not change binding identity.
+time, host, terminal, tmux pane, and remote-host context. Inside tmux the pane stands in
+for the terminal, because attaching or detaching changes the reported terminal within one
+process. Tmux session names are navigation metadata: renames or failed name lookups do
+not change binding identity.
 A different nonempty foreground session ID retires the previous foreground binding
 immediately, regardless of its phase. For exclusive CLI sessions, the first status
 update can replace a binding even if the new session's start hook was missed.
