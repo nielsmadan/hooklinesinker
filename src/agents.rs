@@ -31,6 +31,48 @@ impl HookTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildTracking {
+    Untracked,
+    SharedSession {
+        child_start: &'static str,
+        child_stop: &'static str,
+        root_interrupt: &'static str,
+    },
+    LinkedSessions {
+        child_stop: &'static str,
+        completion_wakes_root: bool,
+    },
+}
+
+impl ChildTracking {
+    pub(crate) const fn child_stop(self) -> Option<&'static str> {
+        match self {
+            Self::Untracked => None,
+            Self::SharedSession { child_stop, .. } | Self::LinkedSessions { child_stop, .. } => {
+                Some(child_stop)
+            }
+        }
+    }
+
+    pub(crate) const fn root_interrupt(self) -> Option<&'static str> {
+        match self {
+            Self::Untracked | Self::LinkedSessions { .. } => None,
+            Self::SharedSession { root_interrupt, .. } => Some(root_interrupt),
+        }
+    }
+
+    pub(crate) const fn completion_wakes_root(self) -> bool {
+        matches!(
+            self,
+            Self::LinkedSessions {
+                completion_wakes_root: true,
+                ..
+            }
+        )
+    }
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "a declarative per-agent table, not an argument list"
@@ -46,6 +88,7 @@ pub(crate) struct AgentProfile {
     pub retains_phase_on_selection: bool,
     pub attributed_sessions_share_process: bool,
     pub ambiguous_sessions_share_process: bool,
+    pub child_tracking: ChildTracking,
 }
 
 // An agent whose phase depends on a payload field rather than the event name also needs an
@@ -62,6 +105,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         retains_phase_on_selection: false,
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
+        child_tracking: ChildTracking::Untracked,
     },
     AgentProfile {
         agent: Agent::Codex,
@@ -74,6 +118,11 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         retains_phase_on_selection: false,
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
+        child_tracking: ChildTracking::SharedSession {
+            child_start: "SubagentStart",
+            child_stop: "SubagentStop",
+            root_interrupt: "Interrupt",
+        },
     },
     AgentProfile {
         agent: Agent::Opencode,
@@ -86,6 +135,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         retains_phase_on_selection: true,
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
+        child_tracking: ChildTracking::Untracked,
     },
     AgentProfile {
         agent: Agent::Pi,
@@ -98,6 +148,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         retains_phase_on_selection: false,
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
+        child_tracking: ChildTracking::Untracked,
     },
     AgentProfile {
         agent: Agent::Droid,
@@ -110,6 +161,10 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         retains_phase_on_selection: false,
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: true,
+        child_tracking: ChildTracking::LinkedSessions {
+            child_stop: "Stop",
+            completion_wakes_root: true,
+        },
     },
     AgentProfile {
         agent: Agent::Qwen,
@@ -122,6 +177,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         retains_phase_on_selection: false,
         attributed_sessions_share_process: true,
         ambiguous_sessions_share_process: false,
+        child_tracking: ChildTracking::Untracked,
     },
     AgentProfile {
         agent: Agent::Kimi,
@@ -134,6 +190,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         retains_phase_on_selection: false,
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
+        child_tracking: ChildTracking::Untracked,
     },
 ];
 

@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve as resolvePath } from "node:path";
 
 const HOOKLINESINKER_BIN: string = "__HOOKLINESINKER_BIN__";
 
@@ -22,7 +25,10 @@ interface HookOptions extends HookRequest {
 
 interface PiContext {
   hasUI?: boolean;
-  sessionManager?: { getSessionId?: () => string | undefined };
+  sessionManager?: {
+    getSessionId?: () => string | undefined;
+    getSessionFile?: () => string | undefined;
+  };
 }
 
 interface PiEvents {
@@ -44,7 +50,9 @@ interface PiHost {
   };
 }
 
-type Session = { ui: false } | { ui: true; id: string | undefined };
+type Session =
+  | { ui: false }
+  | { ui: true; id: string | undefined; runOwner: string | undefined };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -55,6 +63,84 @@ function sessionIdFromContext(ctx: PiContext): string | undefined {
     return ctx?.sessionManager?.getSessionId?.() ?? undefined;
   } catch {
     return undefined;
+  }
+}
+
+// Mirrors pi-subagents' resolveCurrentSessionId (src/shared/session-identity.js).
+function runOwnerFromContext(ctx: PiContext): string | undefined {
+  try {
+    return ctx?.sessionManager?.getSessionFile?.() ?? ctx?.sessionManager?.getSessionId?.() ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return isErrnoException(error) && error.code === "EPERM";
+  }
+}
+
+// Mirrors pi-subagents' temp-root layout (src/shared/types.js).
+function asyncRunsDir(): string | undefined {
+  const configured = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
+  if (configured) {
+    return join(resolvePath(configured), "async-subagent-runs");
+  }
+  if (typeof process.getuid === "function") {
+    return join(tmpdir(), `pi-subagents-uid-${process.getuid()}`, "async-subagent-runs");
+  }
+  return undefined;
+}
+
+// Mirrors pi-subagents' currentCompletionOwnerId (src/shared/completion-owner.js).
+function completionOwnerId(): unknown {
+  return Reflect.get(globalThis, Symbol.for("pi-subagents.completion-owner-id"));
+}
+
+async function liveAsyncRun(
+  dir: string,
+  entryName: string,
+  runOwner: string,
+): Promise<[string, number] | undefined> {
+  try {
+    const raw = await readFile(join(dir, entryName, "status.json"), "utf8");
+    const status: unknown = JSON.parse(raw);
+    if (!isRecord(status)) return undefined;
+    if (status.state !== "queued" && status.state !== "running") return undefined;
+    if (status.sessionId !== runOwner) return undefined;
+    // Only the pi process that owns a run is told when it completes.
+    if ("completionOwnerId" in status && status.completionOwnerId !== completionOwnerId()) {
+      return undefined;
+    }
+    if (typeof status.pid !== "number" || !pidAlive(status.pid)) return undefined;
+    const id = typeof status.runId === "string" ? status.runId : entryName;
+    return [id, status.pid];
+  } catch {
+    return undefined;
+  }
+}
+
+async function liveAsyncRuns(runOwner: string): Promise<Map<string, number>> {
+  const dir = asyncRunsDir();
+  if (!dir) return new Map();
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    const found = await Promise.all(
+      entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => liveAsyncRun(dir, entry.name, runOwner)),
+    );
+    return new Map(found.filter((entry): entry is [string, number] => entry !== undefined));
+  } catch {
+    return new Map();
   }
 }
 
@@ -127,6 +213,48 @@ export default function (pi: PiHost) {
   let hookQueue: Promise<void> = Promise.resolve();
   let pendingHooks = 0;
 
+  const liveRuns = new Map<string, number>();
+  let heldWorking = false;
+  let midTurn = false;
+  let epoch = 0;
+  let completedDuringScan: Set<string> | undefined;
+
+  function pruneDeadRuns(): void {
+    for (const [id, pid] of liveRuns) {
+      if (!pidAlive(pid)) liveRuns.delete(id);
+    }
+  }
+
+  async function scanAsyncRuns(
+    runOwner: string,
+    scanEpoch: number,
+    completed: Set<string>,
+  ): Promise<void> {
+    const scanned = await liveAsyncRuns(runOwner);
+    if (completedDuringScan === completed) completedDuringScan = undefined;
+    if (epoch !== scanEpoch) return;
+    for (const [id, pid] of scanned) {
+      if (!completed.has(id)) liveRuns.set(id, pid);
+    }
+    if (liveRuns.size > 0 && !midTurn) {
+      heldWorking = true;
+      await queueHook({ event: "agent_start", sessionId: session.ui ? session.id : undefined });
+    }
+  }
+
+  async function settleOrHold(sessionId: string | undefined, idleEvent: string): Promise<void> {
+    pruneDeadRuns();
+    if (liveRuns.size > 0) {
+      heldWorking = true;
+      midTurn = true;
+      await queueHook({ event: "agent_start", sessionId });
+      return;
+    }
+    heldWorking = false;
+    midTurn = false;
+    await queueHook({ event: idleEvent, sessionId });
+  }
+
   function queueHook(request: HookRequest): Promise<void> {
     if (pendingHooks >= MAX_PENDING_HOOKS) return Promise.resolve();
     const queuedAt = Date.now();
@@ -150,7 +278,8 @@ export default function (pi: PiHost) {
   function rememberSessionId(ctx: PiContext): string | undefined {
     if (!session.ui) return undefined;
     const id = sessionIdFromContext(ctx) ?? session.id;
-    session = { ui: true, id };
+    const runOwner = runOwnerFromContext(ctx) ?? session.runOwner;
+    session = { ui: true, id, runOwner };
     return id;
   }
 
@@ -188,6 +317,31 @@ export default function (pi: PiHost) {
     pendingPermissionRequestIds.delete(requestId);
     queuePermissionResolvedIfNonePending(session.id);
   });
+  pi.events.on("subagent:async-started", (payload) => {
+    if (!session.ui) return;
+    if (!isRecord(payload)) return;
+    if (typeof payload.sessionId !== "string" || payload.sessionId !== session.runOwner) return;
+    if (typeof payload.id !== "string" || typeof payload.pid !== "number") return;
+    liveRuns.set(payload.id, payload.pid);
+  });
+  pi.events.on("subagent:async-complete", (payload) => {
+    if (!session.ui) return;
+    if (!isRecord(payload)) return;
+    const runId =
+      typeof payload.runId === "string"
+        ? payload.runId
+        : typeof payload.id === "string"
+          ? payload.id
+          : undefined;
+    if (!runId) return;
+    completedDuringScan?.add(runId);
+    const wasLive = liveRuns.delete(runId);
+    if (wasLive && liveRuns.size === 0 && heldWorking && payload.triggerTurn === false) {
+      heldWorking = false;
+      midTurn = false;
+      void queueHook({ event: "agent_settled", sessionId: session.id });
+    }
+  });
 
   pi.on("session_start", async (event, ctx) => {
     pendingPermissionRequestIds.clear();
@@ -196,20 +350,33 @@ export default function (pi: PiHost) {
       return;
     }
     const id = sessionIdFromContext(ctx);
-    session = { ui: true, id };
+    const runOwner = runOwnerFromContext(ctx);
+    session = { ui: true, id, runOwner };
+    liveRuns.clear();
+    heldWorking = false;
+    midTurn = false;
+    epoch += 1;
+    const scanEpoch = epoch;
+    const completed = new Set<string>();
+    if (runOwner !== undefined) completedDuringScan = completed;
     const reason = typeof event?.reason === "string" ? event.reason : undefined;
     await queueHook({ event: "session_start", sessionId: id, reason });
+    if (runOwner !== undefined) {
+      void scanAsyncRuns(runOwner, scanEpoch, completed);
+    }
   });
 
   pi.on("agent_start", async (_event, ctx) => {
     if (!session.ui) return;
+    heldWorking = false;
+    midTurn = true;
     await queueHook({ event: "agent_start", sessionId: rememberSessionId(ctx) });
   });
   // agent_settled fires after automatic retries and compaction complete.
   pi.on("agent_settled", async (_event, ctx) => {
     if (!session.ui) return;
     pendingPermissionRequestIds.clear();
-    await queueHook({ event: "agent_settled", sessionId: rememberSessionId(ctx) });
+    await settleOrHold(rememberSessionId(ctx), "agent_settled");
   });
 
   // Automatic compaction resumes the current turn; manual compaction leaves it idle.
@@ -219,8 +386,12 @@ export default function (pi: PiHost) {
   });
   pi.on("session_compact", async (event, ctx) => {
     if (!session.ui) return;
-    const done = event?.reason === "manual" ? "session_compact_idle" : "session_compact_working";
-    await queueHook({ event: done, sessionId: rememberSessionId(ctx) });
+    const sessionId = rememberSessionId(ctx);
+    if (event?.reason === "manual") {
+      await settleOrHold(sessionId, "session_compact_idle");
+      return;
+    }
+    await queueHook({ event: "session_compact_working", sessionId });
   });
 
   // Session switches are reconciled by the next session_start.
@@ -228,6 +399,11 @@ export default function (pi: PiHost) {
     const wasUI = session.ui;
     const id = rememberSessionId(ctx);
     pendingPermissionRequestIds.clear();
+    liveRuns.clear();
+    heldWorking = false;
+    midTurn = false;
+    completedDuringScan = undefined;
+    epoch += 1;
     session = { ui: false };
     if (wasUI && event?.reason === "quit") {
       await queueHook({ event: "session_shutdown", sessionId: id });

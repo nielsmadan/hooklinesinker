@@ -12,6 +12,7 @@ These documents explain the flows and constraints behind that interface.
 | Set up checks, ship a release, or update a consumer's pin | [Development and releases](development-and-releases.md) |
 | Understand why the protocol exposes only status | [Status-only decision](decisions/0001-status-events-only.md) |
 | Understand why consumers share one active version | [Shared installation decision](decisions/0002-shared-versioned-installation.md) |
+| Understand how child agents fold into their root session | [Child-agent aggregation decision](decisions/0003-child-agent-aggregation.md) |
 | Repeat an upgrade check with real release binaries | [Shared upgrade procedure](tests/shared-upgrade/README.md) |
 
 Flow documents track the current code. Decision records preserve rationale; superseding one

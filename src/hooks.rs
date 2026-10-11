@@ -1303,7 +1303,7 @@ mod tests {
         let (manager, base) = manager();
         let status = manager.install(Agent::Codex).unwrap();
         assert_eq!(status.state, HookState::Installed);
-        assert_eq!(status.entries.len(), 10);
+        assert_eq!(status.entries.len(), 12);
 
         let path = base.join("codex").join("hooks.json");
         let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
@@ -1312,6 +1312,12 @@ mod tests {
         assert_eq!(session_start["hooks"][0]["timeout"], 5);
         let session_end = &value["hooks"]["SessionEnd"][0];
         assert_eq!(session_end["hooks"][0]["timeout"], 3);
+        let subagent_start = &value["hooks"]["SubagentStart"][0];
+        assert!(subagent_start.get("matcher").is_none());
+        assert_eq!(subagent_start["hooks"][0]["timeout"], 5);
+        let subagent_stop = &value["hooks"]["SubagentStop"][0];
+        assert!(subagent_stop.get("matcher").is_none());
+        assert_eq!(subagent_stop["hooks"][0]["timeout"], 5);
         assert_eq!(
             value["hooks"]["Interrupt"][0],
             serde_json::json!({"hooks": [{

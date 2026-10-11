@@ -1,10 +1,14 @@
+use crate::agents::{ChildTracking, profile};
+use crate::children::ChildEvent;
 use crate::consumers::ConsumerStore;
-use crate::lifecycle::SessionContext;
+use crate::lifecycle::{ChildClaim, SessionContext, awaits_user, clears_children};
 use crate::normalize::{HookEnvironment, Normalized, normalize};
 use crate::processes::ProcessLookup;
 use crate::protocol::{Agent, StatusEvent};
 use crate::sinks::{HttpClient, SinkFanout};
-use crate::state::{HealthKind, HealthProblem, StatusStore, SweepOutcome};
+use crate::state::{
+    CurrentStatus, HealthKind, HealthProblem, IngestSessionOutcome, StatusStore, SweepOutcome,
+};
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
@@ -46,6 +50,7 @@ pub(crate) fn handle_ingest(
     let store = ctx.store;
     let process = ctx.liveness.owner_of(hook_pid, agent);
     let mut forwarded: Option<StatusEvent> = None;
+    let mut stored = false;
     let mut problems: Vec<HealthProblem> = Vec::new();
     let mut retired = SweepOutcome::default();
     let mut swept_with_ingest = false;
@@ -68,18 +73,10 @@ pub(crate) fn handle_ingest(
                 Ok(())
             }
             Normalized::Recordable(mut status_event) => {
-                let mut context = SessionContext::parse(agent, event, input)?;
-                if status_event
-                    .process
-                    .as_ref()
-                    .is_some_and(|process| !ctx.liveness.has_exclusive_session(process, agent))
-                {
-                    context = context.in_shared_process();
-                }
-                let session_outcome =
-                    store.ingest_session(&mut status_event, context, ctx.liveness)?;
+                let session_outcome = record_session(ctx, agent, event, input, &mut status_event)?;
                 if session_outcome.forward {
                     forwarded = Some(status_event);
+                    stored = true;
                 }
                 retired = session_outcome.retired;
                 swept_with_ingest = true;
@@ -120,7 +117,14 @@ pub(crate) fn handle_ingest(
         }
     }
 
-    problems.extend(fan_out_to_sinks(ctx, forwarded.as_ref(), swept));
+    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
+    let fan_out = fan_out_to_sinks(ctx, forwarded.as_ref(), swept, deadline);
+    problems.extend(fan_out.problems);
+    if needs_convergence(profile(agent).child_tracking, stored, fan_out.had_consumers)
+        && let Some(sent) = forwarded.as_ref()
+    {
+        problems.extend(converge_on_stored_status(ctx, sent, deadline));
+    }
     let messages: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
     let mut problem = (!messages.is_empty()).then(|| messages.join("; "));
     if !problems.is_empty()
@@ -136,17 +140,110 @@ pub(crate) fn handle_ingest(
     IngestOutcome { problem }
 }
 
+fn record_session(
+    ctx: &IngestContext,
+    agent: Agent,
+    event: &str,
+    input: &str,
+    status_event: &mut StatusEvent,
+) -> io::Result<IngestSessionOutcome> {
+    let mut context = SessionContext::parse(agent, event, input)?;
+    if status_event
+        .process
+        .as_ref()
+        .is_some_and(|process| !ctx.liveness.has_exclusive_session(process, agent))
+    {
+        context = context.in_shared_process();
+    }
+    let claim = ChildClaim::parse(agent, event, input, &status_event.session.id)?;
+    let child = ChildEvent {
+        event,
+        mapped: status_event.phase,
+        running: status_event.running,
+        awaiting_user: awaits_user(agent, event, input),
+    };
+    ctx.store.ingest_session(
+        status_event,
+        context,
+        &claim,
+        child,
+        clears_children(event, input),
+        ctx.liveness,
+    )
+}
+
+const fn needs_convergence(
+    child_tracking: ChildTracking,
+    stored: bool,
+    had_consumers: bool,
+) -> bool {
+    stored && had_consumers && !matches!(child_tracking, ChildTracking::Untracked)
+}
+
+fn resend_labelled(status: &StatusEvent) -> StatusEvent {
+    StatusEvent {
+        event: format!("resend:{}", status.event),
+        ..status.clone()
+    }
+}
+
+// Fan-out runs unlocked, so a concurrent ingest can deliver an older aggregate after ours.
+fn converge_on_stored_status(
+    ctx: &IngestContext,
+    sent: &StatusEvent,
+    deadline: Instant,
+) -> Vec<HealthProblem> {
+    match ctx.store.current_status(sent) {
+        Ok(CurrentStatus::Stored(current))
+            if current.phase != sent.phase || current.running != sent.running =>
+        {
+            fan_out_to_sinks(ctx, Some(&resend_labelled(&current)), Vec::new(), deadline).problems
+        }
+        Ok(CurrentStatus::Adopted(root)) if sent.running => {
+            fan_out_to_sinks(
+                ctx,
+                Some(&resend_labelled(&root)),
+                vec![sent.clone()],
+                deadline,
+            )
+            .problems
+        }
+        Ok(CurrentStatus::Gone) if sent.running => {
+            let mut removed = sent.clone();
+            removed.running = false;
+            fan_out_to_sinks(ctx, Some(&removed), Vec::new(), deadline).problems
+        }
+        Ok(_) => Vec::new(),
+        Err(e) => vec![HealthProblem::new(
+            HealthKind::Ingest,
+            format!("failed to re-read the session status after delivery: {e}"),
+        )],
+    }
+}
+
+struct FanOutOutcome {
+    problems: Vec<HealthProblem>,
+    had_consumers: bool,
+}
+
 fn fan_out_to_sinks(
     ctx: &IngestContext,
     forwarded: Option<&StatusEvent>,
     swept: Vec<StatusEvent>,
-) -> Vec<HealthProblem> {
+    deadline: Instant,
+) -> FanOutOutcome {
     let mut problems = Vec::new();
     if forwarded.is_none() && swept.is_empty() {
-        return problems;
+        return FanOutOutcome {
+            problems,
+            had_consumers: false,
+        };
     }
     let Some(consumers) = ctx.consumers else {
-        return problems;
+        return FanOutOutcome {
+            problems,
+            had_consumers: false,
+        };
     };
 
     let snapshot = match consumers.snapshot() {
@@ -156,7 +253,10 @@ fn fan_out_to_sinks(
                 HealthKind::Other,
                 format!("sink consumer lookup failed: {e}"),
             ));
-            return problems;
+            return FanOutOutcome {
+                problems,
+                had_consumers: false,
+            };
         }
     };
     for problem in snapshot.problems {
@@ -167,7 +267,10 @@ fn fan_out_to_sinks(
     }
     let status_consumers = snapshot.consumers;
     if status_consumers.is_empty() {
-        return problems;
+        return FanOutOutcome {
+            problems,
+            had_consumers: false,
+        };
     }
 
     let fanout = SinkFanout::new(ctx.http_client);
@@ -185,7 +288,6 @@ fn fan_out_to_sinks(
         }
     };
 
-    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
     let mut undelivered = 0usize;
     if let Some(event) = forwarded {
         let outcome = fanout.send_until(event, &status_consumers, Some(deadline));
@@ -210,7 +312,10 @@ fn fan_out_to_sinks(
             ),
         ));
     }
-    problems
+    FanOutOutcome {
+        problems,
+        had_consumers: true,
+    }
 }
 
 fn synthetic_swept_event(mut swept: StatusEvent) -> StatusEvent {
@@ -219,4 +324,30 @@ fn synthetic_swept_event(mut swept: StatusEvent) -> StatusEvent {
     swept.running = false;
     swept.observed_at = crate::processes::now_rfc3339();
     swept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convergence_needs_a_stored_tracked_status_that_reached_a_consumer() {
+        let tracked = ChildTracking::LinkedSessions {
+            child_stop: "Stop",
+            completion_wakes_root: true,
+        };
+        let cases = [
+            (tracked, true, true, true),
+            (tracked, true, false, false),
+            (tracked, false, true, false),
+            (ChildTracking::Untracked, true, true, false),
+        ];
+        for (child_tracking, stored, had_consumers, expected) in cases {
+            assert_eq!(
+                needs_convergence(child_tracking, stored, had_consumers),
+                expected,
+                "{child_tracking:?} stored={stored} had_consumers={had_consumers}"
+            );
+        }
+    }
 }

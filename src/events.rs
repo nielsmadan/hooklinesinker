@@ -58,6 +58,8 @@ pub(crate) const CODEX: &[EventSpec] = &[
     event!("PreCompact", None, 5, Update(Phase::Compacting)),
     event!("PostCompact", None, 5, Update(Phase::Working)),
     event!("PermissionRequest", None, 5, Update(Phase::Permission)),
+    event!("SubagentStart", None, 5, Update(Phase::Working)),
+    event!("SubagentStop", None, 5, Update(Phase::Idle)),
     event!("Stop", None, 5, Update(Phase::Idle)),
     event!("Interrupt", None, 3, Update(Phase::Idle)),
     event!("SessionEnd", None, 3, Remove),
@@ -142,9 +144,13 @@ pub(crate) fn native_event_lookup(
     event: &str,
     tool_name: Option<&str>,
     notification_type: Option<&str>,
+    background_work: bool,
 ) -> EventLookup {
     use EventLookup::{Mapped, Unmapped, Unrecognized};
     match (agent, event) {
+        (Agent::Claude, "Stop") if background_work => {
+            return Mapped(Update(Phase::Working));
+        }
         (Agent::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
             return Mapped(Update(Phase::Idle));
         }

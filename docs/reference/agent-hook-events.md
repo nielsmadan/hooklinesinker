@@ -142,18 +142,22 @@ it. These findings are not end-to-end verification of installed agent versions.
 
 | Agent | Session and child identity | Evidence and limits |
 |---|---|---|
-| Claude Code | Documented subagent examples use the parent `session_id` with a separate child `agent_id`; tool hooks inside children carry `agent_id` and `agent_type`. | **Documented:** [hook inputs and subagent events](https://code.claude.com/docs/en/hooks). In-process teammates also exist; do not assume every child has a separate PID. |
-| Codex | A child has its own thread/session ID. Tool hook inputs carry the subagent's `agent_id` and `agent_type`; children can share a host process. | **Source-inspected:** [hook runtime](https://github.com/openai/codex/blob/main/codex-rs/core/src/hook_runtime.rs) and [PreToolUse payload](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/events/pre_tool_use.rs). Thread-spawn children use subagent lifecycle events, distinct from root session starts. |
-| OpenCode | Child sessions have their own IDs and a `parentID`. One backend can host multiple root and child sessions. | **Source-inspected:** [task session creation](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/opencode/src/tool/task.ts) and [backend plugin event subscription](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/opencode/src/plugin/index.ts). A root session is not necessarily the currently viewed session. |
-| Pi | SDK extensions can create child sessions with distinct IDs inside the parent process. Headless extension contexts expose `hasUI: false`. | **Source-inspected:** [pi-subagents session construction](https://github.com/gotgenes/pi-packages/blob/9bfe0369940766f4571f7c46fd1ab74ecb330166/packages/pi-subagents/src/lifecycle/create-subagent-session.ts) and [Pi extension context](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts). `hasUI` also includes RPC contexts; it does not establish exclusive ownership of a terminal. Custom extensions may behave differently. |
+| Claude Code | Documented subagent examples use the parent `session_id` with a separate child `agent_id`; tool hooks inside children carry `agent_id` and `agent_type`. | **Documented:** [hook inputs and subagent events](https://code.claude.com/docs/en/hooks). In-process teammates also exist; do not assume every child has a separate PID. `Stop`'s `background_tasks[]` array, used to keep a parent `working` while a background agent runs, was verified live on Claude Code 2.1.280. |
+| Codex | A child shares the root's `session_id`; its own `agent_id` (plus `agent_type`) on `SubagentStart`/`SubagentStop` and tool hook inputs is what distinguishes it from the root. | **Source-inspected** (rust-v0.155.1): [hook runtime](https://github.com/openai/codex/blob/main/codex-rs/core/src/hook_runtime.rs) and [PreToolUse payload](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/events/pre_tool_use.rs). The shared `session_id` was re-verified against a codex-cli 0.157.0 subagent rollout; installed 0.161.0 has no subagent rollout yet to re-check live. `SubagentStart`/`SubagentStop` are distinct lifecycle events from root session starts/stops. |
+| OpenCode | Child sessions have their own IDs and a `parentID`. One backend can host multiple root and child sessions. | **Source-inspected:** [task session creation](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/opencode/src/tool/task.ts) and [backend plugin event subscription](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/opencode/src/plugin/index.ts). A root session is not necessarily the currently viewed session. SDK 1.17.0 types confirm `permission.asked`/`permission.replied` carry `properties.id`/`properties.requestID`, keyed to the session that asked. |
+| Pi | SDK extensions can create child sessions with distinct IDs inside the parent process. Headless extension contexts expose `hasUI: false`. | **Source-inspected:** [pi-subagents session construction](https://github.com/gotgenes/pi-packages/blob/9bfe0369940766f4571f7c46fd1ab74ecb330166/packages/pi-subagents/src/lifecycle/create-subagent-session.ts) and [Pi extension context](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts). `hasUI` also includes RPC contexts; it does not establish exclusive ownership of a terminal. Custom extensions may behave differently. pi-subagents **0.71.0**'s `subagent:async-started`/`subagent:async-complete` events and its `status.json` run-state files were inspected to track async runs without blocking session start. |
 | Qwen Code | The inspected native subagent path shares the parent hook system; base hook input gets `session_id` from its configuration. It also exposes optional `source_type` and `source_id` attribution. | **Source-inspected:** [subagent manager](https://github.com/QwenLM/qwen-code/blob/be9d5e8d3f1470d80ec36546788c801225d66e3e/packages/core/src/subagents/subagent-manager.ts) and [hook input construction](https://github.com/QwenLM/qwen-code/blob/be9d5e8d3f1470d80ec36546788c801225d66e3e/packages/core/src/hooks/hookEventHandler.ts). This path does not establish that every ACP or custom integration uses the same identity model. |
 | Kimi Code CLI | In the inspected Python implementation, a child runtime reuses the parent session and does not inherit its hook engine. | **Source-inspected:** [runtime copy for subagents](https://github.com/MoonshotAI/kimi-cli/blob/main/src/kimi_cli/soul/agent.py). Scope this finding to that implementation; it is not a guarantee for other Kimi clients or shared server modes. |
-| Factory Droid | The hook contract exposes `session_id`, and subagents can run concurrently. A reliable hook-level child discriminator or guaranteed separate owner process has not been established. | **Documented, with unresolved identity behavior:** [hooks](https://docs.factory.ai/harness/hooks.md) and [subagents](https://docs.factory.ai/harness/subagents.md). Do not infer process separation from the existence of a task ID. |
+| Factory Droid | A Task child's `SessionStart` (startup or resume) carries `calling_session_id`, naming the parent's `session_id` — or, for a grandchild, another tracked child's. A `SessionStart` without it is always a root. | **Verified** against a local capture (2026-10-06, droid 0.218.2): see [Sources](#sources) and [child agents](../status-lifecycle.md#child-agents). A reliable discriminator for same-process Droid sessions *without* that marker is still unestablished; do not infer process separation from the existence of a task ID alone. |
 
-Preserving a marked child prevents it from replacing another conversation. It
-does not automatically isolate phase updates when parent and child hooks share
-one session ID. Session retirement and aggregation of child activity are separate
-integration decisions.
+Preserving a marked child prevents it from replacing another conversation. For Codex and Droid
+it now does more than that: child activity is aggregated onto the parent's phase rather than
+only being kept from replacing it — see [child agents](../status-lifecycle.md#child-agents). Pi
+and OpenCode aggregate child and async-run activity inside their own adapters instead of the
+shared ledger. Claude, Qwen and Kimi still get only the isolation half: a recognized child cannot
+replace the parent, but when parent and child hooks share one session ID a child's hook still
+overwrites the parent's phase. Claude alone also keeps its own `Stop` at `working` while
+`background_tasks[]` names live child work; its children are not tracked.
 
 ## OpenCode selection is navigation
 
@@ -194,8 +198,13 @@ The external lifecycle comparison constrains normalization:
 
 - Event registration and current phase mapping are canonical in
   [`src/events.rs`](../../src/events.rs).
-- [`src/normalize.rs`](../../src/normalize.rs) extracts `tool_name` and
-  `notification_type`; it does not combine them with the event name.
+- [`src/normalize.rs`](../../src/normalize.rs) extracts `tool_name`,
+  `notification_type`, and whether `background_tasks[]` still names live child work; it does
+  not combine them with the event name.
+- Child-agent phase arithmetic is canonical in [`src/children.rs`](../../src/children.rs);
+  [`src/lifecycle.rs`](../../src/lifecycle.rs) classifies each event as a root or child claim,
+  and [`src/state.rs`](../../src/state.rs) routes a child claim onto its root's record. Pi and
+  OpenCode instead resolve child/async-run activity inside their own adapters.
 - Droid command hooks can overlap. Pi avoids the same race by serializing its
   adapter calls through one promise queue.
 - Generic tool completion is not strong enough to clear an unrelated waiting
@@ -206,6 +215,8 @@ The external lifecycle comparison constrains normalization:
 
 - Verified Droid behavior: two local Droid 0.218.2 session transcript probes,
   inspected 2026-09-16
+- Verified Droid `calling_session_id`/Task-child behavior, including grandchildren: a local
+  Droid 0.218.2 session transcript capture, inspected 2026-10-06
 - OpenCode adapter: [`adapters/opencode-hooklinesinker.ts`](../../adapters/opencode-hooklinesinker.ts)
 - Pi adapter: [`adapters/pi-hooklinesinker.ts`](../../adapters/pi-hooklinesinker.ts)
 - Factory Droid hook contract:

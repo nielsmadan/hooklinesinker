@@ -101,8 +101,19 @@ be decoded; consumers in other languages should provide the same fallback.
 
 `event` carries each agent's own spelling and has no single casing: PascalCase for the native
 agents (`SessionStart`), snake_case for Pi (`session_start`), dot-case for OpenCode
-(`session.created`), plus the synthetic `swept`. Branch on `phase` and `running`, which are
-normalized; treat `event` as a diagnostic label rather than a dispatch key.
+(`session.created`), plus the synthetic `swept`. A corrective re-send after fan-out carries the
+stored event prefixed `resend:` (for example `resend:UserPromptSubmit`) instead of repeating it
+verbatim. Branch on `phase` and `running`, which are normalized; treat `event` as a diagnostic
+label rather than a dispatch key.
+
+`phase` aggregates a session with any child agents it is tracking (Codex subagents, Droid Task
+children) — a child's own activity can hold an idle parent `working` or surface its permission
+request, but a child never gets its own row in `sessions --json`. A child-caused update carries
+an `event` value prefixed `child:` (for example `child:PermissionRequest`), so a consumer can
+tell it apart from the parent's own events. Claude's background tasks are tracked separately
+from that mechanism: a live one just holds `Stop` at `working` instead of settling `idle`, with
+no `child:` prefix and no permission surfacing. See
+[status lifecycle](docs/status-lifecycle.md#child-agents) for the aggregation rule.
 
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which also separates two terminals driving the same native session.
@@ -226,6 +237,12 @@ approval in Codex's `/hooks` or the consumer's trust UI. Codex caps `Interrupt` 
 at three seconds, including the timeout used in their trust hashes.
 Codex's `config.toml` (including its `trusted_hash` machinery) is **not** touched. Trusting a
 hook is the host application's business.
+
+Codex's `SubagentStart`/`SubagentStop` hooks are what let a parent session stay `working` while
+its subagents run (see [status lifecycle](docs/status-lifecycle.md#child-agents)). Existing
+installations need the same `hooks install --agent codex` plus trust approval as above; Juggler
+re-trusts newly registered entries automatically for users who had already trusted its hooks,
+but first-time trust still goes through Juggler's "Enable in Codex" or `/hooks` directly.
 
 ## Consumer ownership
 

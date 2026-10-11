@@ -1,4 +1,6 @@
-use crate::agents::{EventSource, profile};
+use crate::agents::{ChildTracking, EventSource, profile};
+use crate::children::child_key;
+use crate::normalize::capped;
 use crate::protocol::Agent;
 use std::io;
 
@@ -29,6 +31,91 @@ impl Hints {
     }
 }
 
+fn invalid_metadata(e: &serde_json::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "invalid lifecycle metadata at line {} column {}",
+            e.line(),
+            e.column()
+        ),
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ChildClaim {
+    Root,
+    Agent {
+        child_key: String,
+        starts: bool,
+    },
+    Spawned {
+        child_key: String,
+        parent_session_id: String,
+    },
+    MaybeLinked {
+        child_key: String,
+    },
+}
+
+impl ChildClaim {
+    pub(crate) fn parse(
+        agent: Agent,
+        event: &str,
+        input: &str,
+        session_id: &str,
+    ) -> io::Result<Self> {
+        match profile(agent).child_tracking {
+            ChildTracking::Untracked => Ok(Self::Root),
+            ChildTracking::SharedSession { child_start, .. } => {
+                let hints = Hints::parse(input).map_err(|e| invalid_metadata(&e))?;
+                Ok(match hints.text("agent_id") {
+                    Some(agent_id) if !agent_id.is_empty() => Self::Agent {
+                        child_key: child_key(agent_id),
+                        starts: event == child_start,
+                    },
+                    _ => Self::Root,
+                })
+            }
+            ChildTracking::LinkedSessions { .. } => {
+                if event != "SessionStart" {
+                    return Ok(Self::MaybeLinked {
+                        child_key: child_key(session_id),
+                    });
+                }
+                let hints = Hints::parse(input).map_err(|e| invalid_metadata(&e))?;
+                Ok(
+                    match hints
+                        .text("calling_session_id")
+                        .map(|value| capped(value.to_string()))
+                    {
+                        Some(parent) if !parent.is_empty() && parent != session_id => {
+                            Self::Spawned {
+                                child_key: child_key(session_id),
+                                parent_session_id: parent,
+                            }
+                        }
+                        _ => Self::Root,
+                    },
+                )
+            }
+        }
+    }
+}
+
+pub(crate) fn awaits_user(agent: Agent, event: &str, input: &str) -> bool {
+    agent == Agent::Codex
+        && event == "PreToolUse"
+        && Hints::parse(input)
+            .is_ok_and(|hints| hints.text("tool_name") == Some("request_user_input"))
+}
+
+// Codex runs a `compact` SessionStart mid-turn, while the root's children keep running.
+pub(crate) fn clears_children(event: &str, input: &str) -> bool {
+    event == "SessionStart"
+        && !Hints::parse(input).is_ok_and(|hints| hints.text("source") == Some("compact"))
+}
+
 impl SessionContext {
     pub(crate) const fn in_shared_process(self) -> Self {
         match self {
@@ -38,16 +125,7 @@ impl SessionContext {
     }
 
     pub(crate) fn parse(agent: Agent, event: &str, input: &str) -> io::Result<Self> {
-        let invalid = |e: serde_json::Error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid lifecycle metadata at line {} column {}",
-                    e.line(),
-                    e.column()
-                ),
-            )
-        };
+        let invalid = |e: serde_json::Error| invalid_metadata(&e);
         let profile = profile(agent);
         match profile.event_source {
             EventSource::Pi => {

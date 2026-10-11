@@ -27,6 +27,51 @@ struct NativeEvent {
     tool_name: Option<String>,
     cwd: Option<String>,
     notification_type: Option<String>,
+    #[serde(
+        default,
+        rename = "background_tasks",
+        deserialize_with = "background_work"
+    )]
+    background_work: bool,
+}
+
+const CHILD_WORK_TYPES: &[&str] = &[
+    "subagent",
+    "workflow",
+    "teammate",
+    "MCP task",
+    "cloud session",
+];
+
+fn background_work<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(has_live_child_work(&value))
+}
+
+fn has_live_child_work(value: &serde_json::Value) -> bool {
+    let Some(tasks) = value.as_array() else {
+        return false;
+    };
+    tasks.iter().any(|task| {
+        let Some(task) = task.as_object() else {
+            return false;
+        };
+        let is_child_type = task
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| CHILD_WORK_TYPES.contains(&t));
+        if !is_child_type {
+            return false;
+        }
+        match task.get("status") {
+            None => true,
+            Some(serde_json::Value::String(status)) => status == "running" || status == "pending",
+            Some(_) => false,
+        }
+    })
 }
 
 enum MappedAction {
@@ -61,6 +106,7 @@ fn map_event(
     event: &str,
     tool_name: Option<&str>,
     notification_type: Option<&str>,
+    background_work: bool,
 ) -> MappedAction {
     use MappedAction::{Ignore, Remove, Unrecognized, Update};
     match profile(agent).event_source {
@@ -87,7 +133,7 @@ fn map_event(
             _ => Unrecognized,
         },
         EventSource::Native => {
-            match native_event_lookup(agent, event, tool_name, notification_type) {
+            match native_event_lookup(agent, event, tool_name, notification_type, background_work) {
                 EventLookup::Mapped(EventAction::Update(phase)) => Update(phase),
                 EventLookup::Mapped(EventAction::Remove) => Remove,
                 EventLookup::Unmapped => Ignore,
@@ -120,6 +166,7 @@ pub(crate) fn normalize(
         event,
         native.tool_name.as_deref(),
         native.notification_type.as_deref(),
+        native.background_work,
     ) {
         MappedAction::Ignore => return Ok(Normalized::Ignored),
         MappedAction::Unrecognized => return Ok(Normalized::Unrecognized),
@@ -165,7 +212,7 @@ pub(crate) fn normalize(
 // the store lock on every ingest, so an agent must not be able to grow either without bound.
 const MAX_FIELD_BYTES: usize = 4096;
 
-fn capped(mut value: String) -> String {
+pub(crate) fn capped(mut value: String) -> String {
     if value.len() > MAX_FIELD_BYTES {
         let mut end = MAX_FIELD_BYTES;
         while end > 0 && !value.is_char_boundary(end) {

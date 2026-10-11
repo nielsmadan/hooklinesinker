@@ -19,8 +19,10 @@ also change the privacy boundary.
 Protocol 1 offers the named `status` capability. Install the native hooks needed for status,
 normalize their inputs into a typed, allowlisted event, retain the latest status per binding,
 and offer CLI snapshots plus best-effort sink delivery. Do not persist, log, or forward raw
-native input. The original input does pass through a capped memory buffer; only the five
-fields in [NativeEvent](../../src/normalize.rs) are deserialized into the native event model.
+native input. The original input does pass through a capped memory buffer; only the six fields
+in [NativeEvent](../../src/normalize.rs) are deserialized into the native event model —
+`session_id`, `transcript_path`, `tool_name`, `cwd`, `notification_type`, and a boolean derived
+from `background_tasks`.
 
 Capture a second event class only when a concrete consumer needs it. That addition must add
 a `Capability` variant, its hook-event subscription, an allowlisted schema, and explicit
@@ -43,3 +45,20 @@ the current [installers](../../src/hooks.rs) use a fixed status hook set.
 The capability and public event contracts live in [protocol.rs](../../src/protocol.rs).
 [events.rs](../../src/events.rs) maps each capability to the native hook events it requires,
 and sink dispatch matches the typed capability rather than comparing open-ended strings.
+
+## Amendment (2026-10-08): child agents
+
+Tracking a session's child/background agents (Codex subagents, Droid Task children, Claude
+background tasks) extends the private ledger record, not the wire protocol or this decision's
+privacy boundary:
+
+- The ledger may store only a child's opaque ID digest (the first 8 bytes of a SHA-256 hash of
+  its native session or agent ID, hex-encoded) and its current phase. It never stores a raw
+  child ID, a prompt, a task name or result, or a `background_tasks[]` description or command.
+- Normalization derives exactly one boolean from Claude's `background_tasks[]` — whether it
+  still names a live subagent, workflow, teammate, MCP task, or cloud session — and discards
+  the rest of the array; nothing else from it reaches the ledger or a sink.
+- `ownPhase` and `children` are additive, private record fields (see
+  [child agents](../status-lifecycle.md#child-agents)). `status.phase`, the only phase a
+  consumer ever sees, stays the protocol 1 aggregate — no capability or schema change follows
+  from this.

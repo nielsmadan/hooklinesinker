@@ -57,9 +57,15 @@ errors exit zero. See [status lifecycle](status-lifecycle.md) for sink deadlines
 Registration and normalization must move together. `events.rs` owns native command-hook
 registration and actions; `normalize.rs` adds Pi and OpenCode adapter mappings and
 metadata-dependent refinements. For example, Codex `Interrupt` keeps the binding live and sets
-it idle; `request_user_input` also maps to idle. Claude's `SubagentStop` is ignored so a child
-finishing cannot mark its still-working parent idle. Qwen's `SessionDelete` is ignored because
-it names a different conversation.
+it idle; `request_user_input` also maps to idle for its own binding, though child tracking (see
+[child agents](status-lifecycle.md#child-agents)) treats it as that child waiting on the user.
+Codex's `SubagentStart`/`SubagentStop` map to working/idle like any other event, but only ever
+have a visible effect through a root's tracked children — a subagent event with no known root
+starts a parallel binding that tracks that one child, so it still reports working, then idle. Claude's `Stop` stays `working` instead of
+settling `idle` when `background_tasks[]` still names a live subagent, workflow, teammate, MCP
+task, or cloud session; Claude's `SubagentStop` is ignored so a child finishing still cannot
+mark its still-working parent idle on its own. Qwen's `SessionDelete` is ignored because it
+names a different conversation.
 
 [`agents.rs`](../src/agents.rs) is the inventory for adding an agent. Each profile ties the
 wire agent to its event source, hook backend, status-event table, executable names, shared-host
@@ -88,6 +94,32 @@ requests without retiring other conversations; ordinary TUI navigation is not vi
 this backend plugin. Instance disposal emits deletion for every known session ID that was
 not already deleted.
 
+A child session — one whose `info.parentID` is set — is tracked under its root rather than
+reported under its own ID. The adapter follows `parentID` to the end of the chain to resolve a
+root (so grandchildren resolve the same way), and computes a tree phase over every session that
+resolves to it: `permission` if any has an open `permission.asked`, else `working` if any is
+busy or retrying, else `idle`. A child's `session.created` and `session.compacted` never
+forward their native event; they emit the root's current tree phase instead, and only when it
+differs from the phase last actually sent for that root — a dropped or superseded hook does not
+count as sent. A child learned late, whose `parentID` arrives after its own row was already
+forwarded as a root, has that stray row deleted — after its root's tree phase is re-sent, so
+the root reclaims a terminal row the stray had taken over before the stray's removal arrives. `permission.replied` resolves the pending ask
+named by its `requestID` and, like `session.updated`, re-evaluates and (if changed) re-emits the
+root's tree phase; an idle-meaning event for the root while the tree is still working or waiting
+on permission re-emits the tree phase instead of forwarding idle. When background subagents are
+enabled in OpenCode's process (`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` set to `true`, `yes`,
+`on`, `1` or `y`, read once at plugin load), a child event that would take the root's queued
+phase from `working` to `idle` sends nothing and holds the root: OpenCode injects the finished
+child's result into the root as a new prompt right after, so idle would only flash. The default
+foreground mode never holds, because an aborted root's cancelled child can report idle after the
+root's own idle with no wake to follow. While held, the root's own `session.updated` and
+`permission.replied` cannot release idle either, and a late `parentID` that links a stray under
+the root reports it `working`; the root's own status, `session.idle`, `session.error` and
+`permission.asked` clear the hold and report as usual, so the injected prompt's busy keeps it
+working and its next idle settles it. A child's permission still surfaces on a held root. Deleting a child session
+re-resolves and re-emits its root's phase (a deletion is not a completion, so it releases an
+unheld root to idle); deleting a root forgets every descendant and emits one `session.deleted`.
+
 Pi queues hooks serially and suppresses sessions whose `hasUI` is false.
 Session starts forward their native `reason` so resumes can reactivate retired bindings;
 new and fork starts replace the previous foreground binding. `agent_settled` marks idle;
@@ -96,6 +128,21 @@ only the pending prompt with the same request ID;
 settlement clears pending prompts. Only a shutdown with reason `quit` emits
 removal. Every shutdown drains hooks and clears pending prompts; permission listeners remain
 registered so new, resumed, forked and reloaded sessions continue reporting permission state.
+
+Pi also tracks this session's live `pi-subagents` async runs (run ID → PID) from
+`subagent:async-started`/`subagent:async-complete`, independent of the permission listeners.
+When `agent_settled` or a manual compaction would otherwise report idle, it first drops any run
+whose PID is no longer alive; if a run remains, it reports `working` instead. A run completing
+while held only releases that hold when its payload says `triggerTurn === false` — Pi normally
+wakes the parent to consume the result right away, so releasing on every completion would flash
+idle before that wake arrives. On `session_start`, live runs are rebuilt from `status.json`
+files on disk without blocking startup: a session epoch, and a short-lived set of runs that
+complete during the scan, keep that race from resurrecting a run that already finished. A run
+whose `completionOwnerId` names another Pi process (for example one started before a quit and
+`pi --resume`) is not rebuilt: pi-subagents announces its completion only in that process.
+`asyncRunsDir()` reads `PI_SUBAGENTS_TEMP_ROOT` when set, mirroring `pi-subagents`' own
+temp-root layout, and otherwise falls back to its default per-UID temp directory.
+`session_shutdown` forgets every live run.
 
 ## Validation
 

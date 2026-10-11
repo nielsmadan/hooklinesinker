@@ -1,8 +1,14 @@
-use crate::lifecycle::SessionContext;
+use crate::agents::{ChildTracking, profile};
+use crate::children::{
+    ChildEvent, Children, aggregate_phase, all_idle, child_key, child_phase, completion_holds_root,
+    with_child,
+};
+use crate::lifecycle::{ChildClaim, SessionContext};
 use crate::persistence::{LockGuard, read_json_records, write_private_atomic};
 use crate::processes::{ProcessLiveness, Timestamp};
-use crate::protocol::{Agent, StatusEvent};
+use crate::protocol::{Agent, Phase, ProcessIdentity, StatusEvent};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -82,13 +88,22 @@ struct StoredStatusWire {
         skip_serializing_if = "std::ops::Not::not"
     )]
     retired: bool,
+    #[serde(default)]
+    own_phase: Option<Phase>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    children: Children,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    held: bool,
 }
 
-// `parallel` is resolved once, at the read boundary: a legacy record without the field
-// infers it from the agent there, so nothing downstream carries the tri-state.
+// `parallel` and `own_phase` are resolved once, at the read boundary: a legacy record
+// without them infers them there, so nothing downstream carries the optional forms.
 #[derive(Clone)]
 struct StoredStatus {
     status: StatusEvent,
+    own_phase: Phase,
+    children: Children,
+    held: bool,
     parallel: bool,
     retired: bool,
 }
@@ -99,6 +114,9 @@ impl From<StoredStatusWire> for StoredStatus {
             .parallel
             .unwrap_or(wire.status.agent == Agent::Opencode);
         Self {
+            own_phase: wire.own_phase.unwrap_or(wire.status.phase),
+            children: wire.children,
+            held: wire.held,
             status: wire.status,
             parallel,
             retired: wire.retired,
@@ -112,6 +130,9 @@ impl StoredStatus {
             status: self.status.clone(),
             parallel: Some(self.parallel),
             retired: self.retired,
+            own_phase: Some(self.own_phase),
+            children: self.children.clone(),
+            held: self.held,
         };
         let bytes = serde_json::to_vec_pretty(&wire)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -123,6 +144,12 @@ impl StoredStatus {
 pub(crate) struct SweepOutcome {
     pub events: Vec<StatusEvent>,
     pub problems: Vec<String>,
+}
+
+pub(crate) enum CurrentStatus {
+    Stored(StatusEvent),
+    Adopted(StatusEvent),
+    Gone,
 }
 
 pub(crate) struct IngestSessionOutcome {
@@ -206,6 +233,9 @@ impl StatusStore {
         &self,
         event: &mut StatusEvent,
         context: SessionContext,
+        claim: &ChildClaim,
+        child: ChildEvent<'_>,
+        clears_children: bool,
         liveness: &(impl ProcessLiveness + ?Sized),
     ) -> io::Result<IngestSessionOutcome> {
         let _guard = self.lock()?;
@@ -213,6 +243,36 @@ impl StatusStore {
         let previous = snapshot.records.iter().find_map(|(_, stored)| {
             (stored.status.binding_id == event.binding_id).then_some(stored)
         });
+        if let ChildClaim::Agent { child_key, starts } = claim
+            && let Some(root) = previous
+        {
+            let root = root.clone();
+            return self.ingest_child(event, &root, child_key, *starts, child, snapshot, liveness);
+        }
+        if let ChildClaim::Spawned {
+            child_key,
+            parent_session_id,
+        } = claim
+            && let Some(root) = find_spawn_root(&snapshot.records, event, parent_session_id)
+        {
+            let root = root.clone();
+            let stray = previous.cloned();
+            return self.ingest_spawned_child(
+                event,
+                &root,
+                child_key,
+                stray.as_ref(),
+                snapshot,
+                liveness,
+            );
+        }
+        if let ChildClaim::MaybeLinked { child_key } = claim
+            && previous.is_none_or(|stored| stored.retired)
+            && let Some(root) = find_linked_root(&snapshot.records, event, child_key)
+        {
+            let root = root.clone();
+            return self.ingest_child(event, &root, child_key, false, child, snapshot, liveness);
+        }
         let SessionDisposition::Store(mode) = session_disposition(event, previous, context) else {
             // Ingest is the only sweeper, so a hook for a retired binding still owes the
             // ledger its pass or dead bindings for other agents go unannounced.
@@ -227,15 +287,23 @@ impl StatusStore {
                 ),
             });
         };
-        if matches!(
-            context,
-            SessionContext::Selected | SessionContext::SelectedParallel
-        ) && crate::agents::profile(event.agent).retains_phase_on_selection
-            && let Some(previous) = previous
-        {
-            event.phase = previous.status.phase;
-        }
-        self.persist_session(event, mode.is_parallel())?;
+        let (own_phase, children) = if let Some(rootless) = rootless_child(event, claim, child) {
+            rootless
+        } else {
+            let own_phase = if matches!(
+                context,
+                SessionContext::Selected | SessionContext::SelectedParallel
+            ) && crate::agents::profile(event.agent).retains_phase_on_selection
+                && let Some(previous) = previous
+            {
+                previous.own_phase
+            } else {
+                event.phase
+            };
+            (own_phase, root_children(event, previous, clears_children))
+        };
+        event.phase = aggregate_phase(own_phase, &children, false);
+        self.persist_session(event, own_phase, children, mode.is_parallel())?;
         let retired = Self::reconcile_existing_records(
             Some(event),
             snapshot.records,
@@ -249,9 +317,148 @@ impl StatusStore {
         })
     }
 
-    fn persist_session(&self, event: &StatusEvent, parallel: bool) -> io::Result<()> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the ingest seam plus the snapshot it already read under the lock"
+    )]
+    fn ingest_child(
+        &self,
+        event: &mut StatusEvent,
+        root: &StoredStatus,
+        child_key: &str,
+        starts: bool,
+        child: ChildEvent<'_>,
+        snapshot: StatusSnapshot,
+        liveness: &(impl ProcessLiveness + ?Sized),
+    ) -> io::Result<IngestSessionOutcome> {
+        let update = (!root.retired)
+            .then(|| child_update(root, event, child_key, starts, child))
+            .flatten();
+        let Some(ChildUpdate { stored, visible }) = update else {
+            let current = (!root.retired).then_some(&root.status);
+            return Ok(IngestSessionOutcome {
+                forward: false,
+                retired: Self::reconcile_existing_records(
+                    current,
+                    snapshot.records,
+                    snapshot.problems,
+                    false,
+                    liveness,
+                ),
+            });
+        };
+        stored.write(&self.binding_path(&stored.status.binding_id)?)?;
+        *event = stored.status;
+        let retired = Self::reconcile_existing_records(
+            Some(event),
+            snapshot.records,
+            snapshot.problems,
+            false,
+            liveness,
+        );
+        Ok(IngestSessionOutcome {
+            forward: visible,
+            retired,
+        })
+    }
+
+    // A stray record already reached the sinks, so its deletion is reported too.
+    fn ingest_spawned_child(
+        &self,
+        event: &mut StatusEvent,
+        root: &StoredStatus,
+        child_key: &str,
+        stray: Option<&StoredStatus>,
+        mut snapshot: StatusSnapshot,
+        liveness: &(impl ProcessLiveness + ?Sized),
+    ) -> io::Result<IngestSessionOutcome> {
+        if let Some(stray) = stray {
+            self.remove_binding(&stray.status.binding_id)?;
+            snapshot
+                .records
+                .retain(|(_, stored)| stored.status.binding_id != stray.status.binding_id);
+        }
+        let Some(ChildUpdate { stored, visible }) =
+            attach_child(root, event, child_key, Phase::Working, true)
+        else {
+            let mut retired = Self::reconcile_existing_records(
+                Some(&root.status),
+                snapshot.records,
+                snapshot.problems,
+                false,
+                liveness,
+            );
+            if let Some(stray) = stray {
+                retired.events.push(stray_removal(stray));
+                *event = child_labelled(&root.status, event);
+            }
+            return Ok(IngestSessionOutcome {
+                forward: stray.is_some(),
+                retired,
+            });
+        };
+        stored.write(&self.binding_path(&stored.status.binding_id)?)?;
+        *event = stored.status;
+        let mut retired = Self::reconcile_existing_records(
+            Some(event),
+            snapshot.records,
+            snapshot.problems,
+            false,
+            liveness,
+        );
+        if let Some(stray) = stray {
+            retired.events.push(stray_removal(stray));
+        }
+        Ok(IngestSessionOutcome {
+            forward: visible || stray.is_some(),
+            retired,
+        })
+    }
+
+    pub(crate) fn current_status(&self, sent: &StatusEvent) -> io::Result<CurrentStatus> {
+        let _guard = self.lock()?;
+        let path = self.binding_path(&sent.binding_id)?;
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<StoredStatusWire>(&bytes)
+                .map(|wire| CurrentStatus::Stored(wire.status))
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("failed to parse status record {}: {e}", path.display()),
+                    )
+                }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if !matches!(
+                    profile(sent.agent).child_tracking,
+                    ChildTracking::LinkedSessions { .. }
+                ) {
+                    return Ok(CurrentStatus::Gone);
+                }
+                let snapshot = self.read_all()?;
+                Ok(
+                    find_linked_root(&snapshot.records, sent, &child_key(&sent.session.id))
+                        .filter(|root| !root.retired)
+                        .map_or(CurrentStatus::Gone, |root| {
+                            CurrentStatus::Adopted(root.status.clone())
+                        }),
+                )
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn persist_session(
+        &self,
+        event: &StatusEvent,
+        own_phase: Phase,
+        children: Children,
+        parallel: bool,
+    ) -> io::Result<()> {
         let stored = StoredStatus {
             status: event.clone(),
+            own_phase,
+            children,
+            held: false,
             parallel,
             retired: !event.running && event.process.is_some(),
         };
@@ -295,6 +502,9 @@ impl StatusStore {
             {
                 stored.status.running = false;
                 stored.retired = true;
+                stored.children = all_idle(&stored.children);
+                stored.held = false;
+                stored.status.phase = aggregate_phase(stored.own_phase, &stored.children, false);
                 match stored.write(&path) {
                     Ok(()) => {
                         outcome.events.push(stored.status.clone());
@@ -515,6 +725,165 @@ impl StatusStore {
     }
 }
 
+struct ChildUpdate {
+    stored: StoredStatus,
+    visible: bool,
+}
+
+fn child_update(
+    root: &StoredStatus,
+    event: &StatusEvent,
+    child_key: &str,
+    starts: bool,
+    child: ChildEvent<'_>,
+) -> Option<ChildUpdate> {
+    let child_stop = profile(event.agent).child_tracking.child_stop()?;
+    attach_child(
+        root,
+        event,
+        child_key,
+        child_phase(child_stop, child),
+        starts,
+    )
+}
+
+fn stray_removal(stray: &StoredStatus) -> StatusEvent {
+    let mut status = stray.status.clone();
+    status.running = false;
+    status
+}
+
+fn child_labelled(root: &StatusEvent, child: &StatusEvent) -> StatusEvent {
+    StatusEvent {
+        event: format!("child:{}", child.event),
+        observed_at: child.observed_at.clone(),
+        ..root.clone()
+    }
+}
+
+fn attach_child(
+    root: &StoredStatus,
+    event: &StatusEvent,
+    child_key: &str,
+    phase: Phase,
+    create: bool,
+) -> Option<ChildUpdate> {
+    let children = with_child(&root.children, child_key, phase, create);
+    let tracking = profile(event.agent).child_tracking;
+    let held = root.held
+        || tracking.completion_wakes_root()
+            && tracking.child_stop() == Some(event.event.as_str())
+            && completion_holds_root(
+                root.own_phase,
+                root.children.get(child_key).copied(),
+                phase,
+                &children,
+            );
+    let mut status = root.status.clone();
+    status.phase = aggregate_phase(root.own_phase, &children, held);
+    if event.process.is_some() && event.process == root.status.process {
+        status.terminal.clone_from(&event.terminal);
+        status.tmux.clone_from(&event.tmux);
+        status.git.clone_from(&event.git);
+        status.remote_host.clone_from(&event.remote_host);
+    }
+    let visible = status.phase != root.status.phase
+        || status.terminal != root.status.terminal
+        || status.tmux != root.status.tmux;
+    if !visible && children == root.children && held == root.held {
+        return None;
+    }
+    Some(ChildUpdate {
+        stored: StoredStatus {
+            status: child_labelled(&status, event),
+            own_phase: root.own_phase,
+            children,
+            held,
+            parallel: root.parallel,
+            retired: root.retired,
+        },
+        visible,
+    })
+}
+
+// Same-process candidate wins; otherwise the most recently observed one does.
+fn best_root<'a>(
+    candidates: impl Iterator<Item = &'a StoredStatus>,
+    process: Option<&ProcessIdentity>,
+) -> Option<&'a StoredStatus> {
+    candidates.max_by_key(|stored| {
+        let same_process = process.is_some() && stored.status.process.as_ref() == process;
+        (same_process, Timestamp::parse(&stored.status.observed_at))
+    })
+}
+
+// The parent is a running root, or already a child of one (grandchild spawn).
+fn find_spawn_root<'a>(
+    records: &'a [(PathBuf, StoredStatus)],
+    event: &StatusEvent,
+    parent_session_id: &str,
+) -> Option<&'a StoredStatus> {
+    let parent_key = child_key(parent_session_id);
+    best_root(
+        records.iter().map(|(_, stored)| stored).filter(|stored| {
+            stored.status.agent == event.agent
+                && !stored.retired
+                && ((stored.status.session.id == parent_session_id && stored.status.running)
+                    || stored.children.contains_key(&parent_key))
+        }),
+        event.process.as_ref(),
+    )
+}
+
+// Includes retired roots so a late child event is ignored.
+fn find_linked_root<'a>(
+    records: &'a [(PathBuf, StoredStatus)],
+    event: &StatusEvent,
+    child_key: &str,
+) -> Option<&'a StoredStatus> {
+    best_root(
+        records.iter().map(|(_, stored)| stored).filter(|stored| {
+            stored.status.agent == event.agent && stored.children.contains_key(child_key)
+        }),
+        event.process.as_ref(),
+    )
+}
+
+fn rootless_child(
+    event: &StatusEvent,
+    claim: &ChildClaim,
+    child: ChildEvent<'_>,
+) -> Option<(Phase, Children)> {
+    let ChildClaim::Agent { child_key, .. } = claim else {
+        return None;
+    };
+    let child_stop = profile(event.agent).child_tracking.child_stop()?;
+    let phase = child_phase(child_stop, child);
+    Some((
+        Phase::Idle,
+        with_child(&Children::new(), child_key, phase, true),
+    ))
+}
+
+fn root_children(
+    event: &StatusEvent,
+    previous: Option<&StoredStatus>,
+    clears_children: bool,
+) -> Children {
+    let Some(previous) = previous else {
+        return Children::new();
+    };
+    if clears_children {
+        Children::new()
+    } else if !event.running
+        || profile(event.agent).child_tracking.root_interrupt() == Some(event.event.as_str())
+    {
+        all_idle(&previous.children)
+    } else {
+        previous.children.clone()
+    }
+}
+
 fn session_disposition(
     event: &StatusEvent,
     previous: Option<&StoredStatus>,
@@ -579,4 +948,150 @@ fn is_sweepable(
     let age = now.seconds_since(observed);
     event.process.is_none() && (observed > now || age > UNVERIFIABLE_RECORD_TTL_SECS)
         || stored.parallel && age > SHARED_RECORD_TTL_SECS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn legacy_record() -> Value {
+        json!({
+            "protocol": 1,
+            "bindingId": "0".repeat(64),
+            "agent": "codex",
+            "event": "PreToolUse",
+            "phase": "working",
+            "running": true,
+            "observedAt": "2026-10-08T00:00:00Z",
+            "session": {"id": "a", "cwd": "/tmp", "transcriptPath": null},
+            "process": null,
+            "terminal": null,
+            "tmux": null,
+            "git": null,
+            "remoteHost": null,
+            "parallel": false
+        })
+    }
+
+    fn written(stored: &StoredStatus, name: &str) -> Value {
+        let path =
+            std::env::temp_dir().join(format!("hls-state-{}-{name}.json", std::process::id()));
+        stored.write(&path).unwrap();
+        let value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+        value
+    }
+
+    #[test]
+    fn legacy_records_resolve_own_phase_from_their_phase() {
+        let stored = StoredStatus::from(
+            serde_json::from_value::<StoredStatusWire>(legacy_record()).unwrap(),
+        );
+        assert_eq!(stored.own_phase, Phase::Working);
+        assert_eq!(stored.children, Children::new());
+        assert!(!stored.held);
+    }
+
+    #[test]
+    fn records_write_own_phase_and_omit_empty_children() {
+        let stored = StoredStatus::from(
+            serde_json::from_value::<StoredStatusWire>(legacy_record()).unwrap(),
+        );
+        let empty = written(&stored, "empty");
+        assert_eq!(empty["ownPhase"], "working");
+        assert!(empty.get("children").is_none());
+        assert!(empty.get("held").is_none());
+
+        let held = written(
+            &StoredStatus {
+                held: true,
+                ..stored.clone()
+            },
+            "held",
+        );
+        assert_eq!(held["held"], true);
+
+        let key = crate::children::child_key("worker");
+        let with_child = StoredStatus {
+            children: Children::from([(key.clone(), Phase::Working)]),
+            ..stored
+        };
+        let value = written(&with_child, "child");
+        assert_eq!(value["ownPhase"], "working");
+        assert_eq!(value["children"], json!({ key.as_str(): "working" }));
+        assert_eq!(key.len(), 16);
+    }
+
+    fn candidate_root(pid: u32, observed_at: &str) -> StoredStatus {
+        let mut record = legacy_record();
+        record["session"]["id"] = json!("p");
+        record["observedAt"] = json!(observed_at);
+        record["process"] = json!({"pid": pid, "startedAt": "2026-10-08T00:00:00Z", "host": "h"});
+        StoredStatus::from(serde_json::from_value::<StoredStatusWire>(record).unwrap())
+    }
+
+    #[test]
+    fn spawned_children_prefer_the_parent_in_their_own_process() {
+        let elsewhere = candidate_root(1, "2026-10-08T00:00:05Z");
+        let same_process = candidate_root(2, "2026-10-08T00:00:00Z");
+        let records = vec![
+            (PathBuf::from("elsewhere"), elsewhere),
+            (PathBuf::from("same-process"), same_process),
+        ];
+        let mut event_value = legacy_record();
+        event_value["session"]["id"] = json!("c");
+        event_value["process"] =
+            json!({"pid": 2, "startedAt": "2026-10-08T00:00:00Z", "host": "h"});
+        let event: StatusEvent = serde_json::from_value(event_value).unwrap();
+
+        let found = find_spawn_root(&records, &event, "p").unwrap();
+        assert_eq!(found.status.process.as_ref().unwrap().pid, 2);
+    }
+
+    #[test]
+    fn spawned_children_fall_back_to_the_most_recently_observed_candidate() {
+        let older = candidate_root(1, "2026-10-08T00:00:00Z");
+        let newer = candidate_root(2, "2026-10-08T00:00:05Z");
+        let records = vec![
+            (PathBuf::from("older"), older),
+            (PathBuf::from("newer"), newer),
+        ];
+        let mut event_value = legacy_record();
+        event_value["session"]["id"] = json!("c");
+        event_value["process"] =
+            json!({"pid": 3, "startedAt": "2026-10-08T00:00:00Z", "host": "h"});
+        let event: StatusEvent = serde_json::from_value(event_value).unwrap();
+
+        let found = find_spawn_root(&records, &event, "p").unwrap();
+        assert_eq!(found.status.process.as_ref().unwrap().pid, 2);
+    }
+
+    #[test]
+    fn children_without_a_known_process_keep_the_root_terminal() {
+        let mut record = legacy_record();
+        record["terminal"] = json!({
+            "sessionId": "w1t0p0:root",
+            "terminalType": "iterm2",
+            "kittyListenOn": null,
+            "kittyPid": null
+        });
+        let root = StoredStatus::from(serde_json::from_value::<StoredStatusWire>(record).unwrap());
+        let mut event_value = legacy_record();
+        event_value["session"]["id"] = json!("c");
+        event_value["terminal"] = json!({
+            "sessionId": "w1t0p0:elsewhere",
+            "terminalType": "iterm2",
+            "kittyListenOn": null,
+            "kittyPid": null
+        });
+        let event: StatusEvent = serde_json::from_value(event_value).unwrap();
+
+        let update = attach_child(&root, &event, "k", Phase::Permission, true).unwrap();
+        assert_eq!(
+            update.stored.status.terminal.unwrap().session_id.as_deref(),
+            Some("w1t0p0:root")
+        );
+        assert_eq!(update.stored.status.phase, Phase::Permission);
+    }
 }

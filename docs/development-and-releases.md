@@ -102,6 +102,11 @@ Wait for both CI and the release workflow to succeed, then verify the published 
 must separately update their helper version/source pins and verify release artifacts in their
 own repositories; publishing does not update Juggler or ringleader automatically.
 
+A release that registers new hook events for an agent whose consumer gates on them (Codex
+`SubagentStart`/`SubagentStop` and Juggler's Codex trust) must reach users only after that
+consumer's matching change has shipped: the shared installation is never downgraded, so whichever
+consumer bundles the newer helper first activates it for all of them.
+
 Failed preparation or push leaves local files, commits or tags available for inspection.
 A failed workflow leaves the remote tag in place. Inspect the Actions failure and fix or
 rerun the workflow; never replace a public tag. The local helper does not automatically resume.

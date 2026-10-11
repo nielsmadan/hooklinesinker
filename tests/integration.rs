@@ -469,6 +469,8 @@ fn every_normalized_phase_maps_correctly() {
         (Agent::Codex, "PostCompact", Phase::Working),
         (Agent::Codex, "PermissionRequest", Phase::Permission),
         (Agent::Codex, "PreCompact", Phase::Compacting),
+        (Agent::Codex, "SubagentStart", Phase::Working),
+        (Agent::Codex, "SubagentStop", Phase::Idle),
         (Agent::Opencode, "session.created", Phase::Idle),
         (Agent::Opencode, "session.status.idle", Phase::Idle),
         (Agent::Opencode, "session.idle", Phase::Idle),
@@ -553,6 +555,117 @@ fn claude_subagent_stop_is_outside_the_installed_vocabulary() {
     // cannot mark its still-working parent idle.
     let result = normalized_for_test(Agent::Claude, "SubagentStop", generic_native_json());
     assert!(matches!(result, Normalized::Unrecognized));
+}
+
+#[test]
+fn claude_stop_with_background_agents_stays_working() {
+    let cases = [
+        r#"{"session_id":"s","background_tasks":[{"type":"subagent","status":"running"}]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"workflow","status":"pending"}]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"teammate"}]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"MCP task","status":"running"}]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"cloud session","status":"pending"}]}"#,
+        r#"{"session_id":"s","background_tasks":[
+            {"id":"sh1","type":"shell","status":"running","command":"echo hi"},
+            {"id":"sa1","type":"subagent","status":"running","description":"explore the repo","agent_type":"general-purpose"}
+        ]}"#,
+    ];
+    for native in cases {
+        let result = normalize_for_test(Agent::Claude, "Stop", native);
+        assert_eq!(result.phase, Phase::Working, "{native}");
+        assert!(result.running, "{native}");
+    }
+}
+
+#[test]
+fn claude_stop_without_background_agents_settles_idle() {
+    let cases = [
+        r#"{"session_id":"s","background_tasks":[]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"shell"}]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"monitor"}]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"subagents"}]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":"subagent","status":"completed"}]}"#,
+        r#"{"session_id":"s"}"#,
+        r#"{"session_id":"s","session_crons":[{"id":"c1","schedule":"* * * * *"}]}"#,
+    ];
+    for native in cases {
+        let result = normalize_for_test(Agent::Claude, "Stop", native);
+        assert_eq!(result.phase, Phase::Idle, "{native}");
+        assert!(result.running, "{native}");
+    }
+}
+
+#[test]
+fn claude_stop_tolerates_malformed_background_tasks() {
+    let cases = [
+        r#"{"session_id":"s","background_tasks":"x"}"#,
+        r#"{"session_id":"s","background_tasks":[1]}"#,
+        r#"{"session_id":"s","background_tasks":[{"type":3}]}"#,
+        r#"{"session_id":"s","background_tasks":{}}"#,
+    ];
+    for native in cases {
+        match normalized_for_test(Agent::Claude, "Stop", native) {
+            Normalized::Recordable(event) | Normalized::ForwardOnly(event) => {
+                assert_eq!(event.phase, Phase::Idle, "{native}");
+            }
+            other => panic!("{native} should normalize, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn claude_stop_failure_ignores_background_tasks() {
+    let native =
+        r#"{"session_id":"s","background_tasks":[{"type":"subagent","status":"running"}]}"#;
+    let result = normalize_for_test(Agent::Claude, "StopFailure", native);
+    assert_eq!(result.phase, Phase::Idle);
+    assert!(result.running);
+}
+
+#[test]
+fn background_task_descriptions_never_reach_sinks_or_the_ledger() {
+    let root = temp_home();
+    let store = StatusStore::open(root.clone()).unwrap();
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let liveness = all_alive();
+    let client = RecordingHttpClient::default();
+    let ctx = ingest::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    let input = r#"{
+        "session_id": "claude-bg-session",
+        "background_tasks": [
+            {"id": "t1", "type": "subagent", "status": "running", "description": "private-desc", "agent_type": "general-purpose"},
+            {"id": "t2", "type": "shell", "status": "running", "command": "private-cmd"}
+        ]
+    }"#;
+
+    ingest(&ctx, Agent::Claude, "Stop", input, 1);
+
+    for (_, body) in client.calls.lock().unwrap().iter() {
+        let text = String::from_utf8_lossy(body);
+        assert!(!text.contains("private-desc"), "{text}");
+        assert!(!text.contains("private-cmd"), "{text}");
+        assert!(!text.contains("description"), "{text}");
+        assert!(!text.contains("command"), "{text}");
+    }
+
+    let status_dir = root.join("status");
+    for entry in std::fs::read_dir(&status_dir).unwrap() {
+        let contents = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        assert!(!contents.contains("private-desc"), "{contents}");
+        assert!(!contents.contains("private-cmd"), "{contents}");
+    }
 }
 
 #[test]

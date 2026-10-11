@@ -57,8 +57,8 @@ ledger transaction in `state.rs`:
 | Agent | Foreground selection and replacement | Parallel protection |
 |---|---|---|
 | Claude | Ordinary activity; `SessionStart source: resume` reactivates a retired binding | `source: fork` starts parallel; `agent_id` identifies child activity |
-| Codex | Ordinary activity, including a root `source: fork`; `source: resume` reactivates | `agent_id` identifies child activity; app-server and legacy mcp-server modes stay independent |
-| Droid | Ordinary activity; `SessionStart source: resume` reactivates | Distinct owner processes stay independent; ambiguous same-process sessions are retained conservatively |
+| Codex | Ordinary activity, including a root `source: fork`; `source: resume` reactivates | Any event carrying `agent_id` attaches to the root's tracked children instead of starting its own binding (only `SubagentStart` creates a new entry there); an `agent_id` with no known root starts a parallel binding that tracks that one child; app-server and legacy mcp-server modes stay independent |
+| Droid | Ordinary activity; `SessionStart source: resume` reactivates | A child `SessionStart` naming its parent's (or grandparent's) `calling_session_id` attaches to that root instead of starting its own session; distinct owner processes stay independent; ambiguous same-process sessions are retained conservatively |
 | Qwen | Ordinary activity, including `source: branch`; `source: resume` reactivates | ACP/serve modes and attributed `source_type`/`source_id` sessions stay independent |
 | Kimi | Ordinary activity; `SessionStart source: resume` reactivates | ACP, web and wire launch modes stay independent |
 | Pi | UI session activity, including new/fork; `session_start reason: resume` reactivates | Adapter suppresses contexts with `hasUI: false` |
@@ -78,9 +78,13 @@ boundary. The backend plugin does not observe ordinary session-picker navigation
 display selection would require a separate TUI integration. See the
 [external identity and navigation evidence](reference/agent-hook-events.md#opencode-selection-is-navigation).
 
-**Unverified Droid case:** a child with a different ID, the same owner process, and no child
-marker is retained as parallel because exclusivity is unknown. Real child hook
-metadata/process ancestry still needs verification.
+**Droid task children:** a child `SessionStart` whose `calling_session_id` differs from its own
+`session_id` (verified against a local capture, 2026-10-06, droid 0.218.2) attaches to that
+parent's root — or, for a grandchild, to the root whose tracked children already include the
+parent's digest — instead of starting its own session; see
+[child agents](#child-agents). A `SessionStart` without `calling_session_id` is always a root. A
+same-process Droid session with a different ID and no such marker is still retained as parallel,
+since exclusivity among those is unverified.
 The [cross-agent reference](reference/agent-hook-events.md#session-identity-subagents-and-shared-processes)
 distinguishes documented contracts, inspected source, and unresolved behavior. Current
 regression tests exercise synthetic metadata; they do not verify real subagents across agents.
@@ -112,9 +116,11 @@ hook process's directory. Missing metadata does not prevent a status update.
 ## Liveness and phase
 
 `running` and `phase` answer separate questions. A live process can be idle,
-working, waiting for permission, or compacting. `phase` records the latest mapped
-hook event; process inspection cannot reconstruct a missed working-to-idle event.
-It stays at its previous value until another relevant event arrives.
+working, waiting for permission, or compacting. `phase` is an aggregate of the session's own
+latest mapped hook event and any child agents it is tracking (see
+[Child agents](#child-agents) below); process inspection cannot reconstruct a missed
+working-to-idle event. Each input to the aggregate stays at its previous value until another
+relevant event arrives.
 
 Only ingest removes ledger records. `running()`, `sessions --json`, and `doctor`
 filter or count dead bindings without deleting them. The next ingest sweep
@@ -127,6 +133,98 @@ A poll between process exit and the next hook cannot consume that event. If no
 further hook arrives, dead files remain while live-session reads exclude them. A sweep
 retains successful removals alongside per-record failures and sends those removal events
 even if another record could not be read or deleted.
+
+### Child agents
+
+A session can track child agents (Codex subagents, Droid Task children) on its own ledger
+record. The aggregate rule: `permission` if the session's own phase or any tracked child is
+`permission`; else `working` if the session's own phase is `idle` or `unknown` and any child is
+`working` or `compacting` or the session is held for a wake (below); else the session's own
+phase. A child that has already finished (`idle`) keeps its entry — so a late event for it is
+still recognised — but never holds the session working.
+
+The private record carries `ownPhase` (the session's own latest mapped phase), `children`
+(child key → phase, omitted when empty) and `held` (omitted when false; a record without it
+reads as not held); none of them reaches the wire. `sessions --json` and sink
+bodies only ever see the resolved `phase`. A child key is the first 8 bytes of a SHA-256 digest
+of the child's native session or agent ID, hex-encoded (a provisional entry, below, prefixes it
+with `prov:`) — raw child IDs are never stored. At
+most 64 children are tracked per session; a new child past that cap first evicts an idle entry,
+and is not tracked at all if none is idle.
+
+Only a child's start event creates its entry (Codex `SubagentStart`; Droid's child
+`SessionStart` with `calling_session_id`). Every other child event can only update an existing
+entry — an idle one may be reopened — and otherwise changes nothing, with one exception: a
+child's own permission request, seen before its start event (or without one ever arriving),
+creates a provisional entry so the approval prompt is not lost. A provisional entry is promoted
+to a normal one by the child's start event, is otherwise cleared by that child's next
+non-permission event, and never holds the session `working` on its own.
+
+A child's phase follows its own event: its stop event or `running: false` sets it `idle`; a
+mapped `permission` sets it `permission` (this includes Codex `PreToolUse` for
+`request_user_input`, which the ordinary event mapping marks `idle` but which counts as
+`permission` once it is a tracked child waiting on the user); anything else mapped `working` or
+`compacting` sets it `working`; everything else sets it `idle`. A child event never changes the
+session's own phase and never creates a ledger record for the child itself. The update is
+persisted when the session's aggregate phase, terminal, or tmux identity changed, or the child
+map itself did; it reaches sinks only when phase, terminal, or tmux changed — a child-map-only
+change is written but not forwarded. The forwarded event carries the session's own binding ID,
+session, and process, with `event` set to `child:` followed by the child's event name (so a
+consumer never sees a bare `UserPromptSubmit` from a child) and `observedAt` from the child
+event. When the child event comes from the session's own process, its `terminal`, `tmux`,
+`git`, and `remote_host` are refreshed from the child event, which keeps a tmux attach/detach
+reported correctly; a git- or remote-host-only change does not by itself make the update
+persist or forward.
+
+Fan-out to sinks runs after the ledger lock is released, so two concurrent children can deliver
+out of order. After fan-out, hooklinesinker re-reads the session's stored record and, if its
+phase or `running` no longer matches what was just sent, sends it once more — reusing the first
+fan-out's remaining time budget rather than opening a fresh one, and skipping the re-check
+entirely when the first fan-out had no consumers. If the record is gone because a Droid child's
+stray record was folded into its parent meanwhile, the parent's status is sent first and the
+stray's removal (`swept`) second, so the parent keeps a row the stray had taken over. Either
+re-send carries the stored record's own `event` prefixed with `resend:` (e.g.
+`resend:UserPromptSubmit`) rather than repeating it verbatim, so a consumer matching on exact
+event names does not treat the correction as a second instance of that event. There is no
+timer and no retry loop beyond that single re-check.
+
+A session's own `SessionStart` clears its `children`, except `source: compact`, which Codex runs
+mid-turn after compaction while the children keep running. Retirement — a superseded binding, or
+`SessionEnd` with a process identity — keeps the child keys but sets every one `idle`, so a late
+child event is still recognised (and ignored) rather than mistaken for a new session; physical
+removal deletes the record and its children together. There is no time-based expiry for a child
+that never stops: it holds the session `working` until the session's own `Interrupt` (Codex),
+its next `SessionStart`, or its `SessionEnd`. Codex's `interrupt_agent` is known not to send a
+`SubagentStop` (upstream: [openai/codex#38142](https://github.com/openai/codex/issues/38142)),
+so an interrupted subagent otherwise keeps holding its parent working until one of those events
+arrives.
+
+Each agent sources child tracking differently:
+
+- **Codex** shares its root `session_id` across children, each carrying its own `agent_id`.
+  `SubagentStart`/`SubagentStop` attach and release a child; the root's `Interrupt` releases
+  every child at once.
+- **Factory Droid** children are separate sessions linked by `calling_session_id`, including
+  grandchildren (a child whose `calling_session_id` names another tracked child). A child event
+  that beats its own `SessionStart` is stored as a stray root in the meantime; once the
+  `SessionStart` attaches it to its real parent, that stray record is deleted and reported to
+  sinks as a `swept` event — the same cleanup OpenCode does for a late `parentID`.
+  Droid wakes an idle parent with a `UserPromptSubmit` once a background Task child finishes,
+  so a child's own `Stop` that takes it from non-`idle` to `idle` and would otherwise settle the
+  aggregate `idle` while the parent's own phase is `idle` or `unknown` instead sets `held`: the
+  aggregate stays `working` and nothing is forwarded. A child that goes idle any other way (its
+  `SessionEnd` when a task is killed, an `idle_prompt` `Notification`) releases the parent as
+  before, since no wake follows it. Any event of the parent's own (the wake,
+  its `Stop`, `SessionStart`, `SessionEnd`) or its retirement clears `held`; other children's
+  events do not, and a child's `permission` still outranks it. If the wake never comes, the
+  parent reads `working` until its next own event. Codex completions do not wake the parent,
+  so Codex never holds (`completion_wakes_root` in [`agents.rs`](../src/agents.rs)).
+- **Claude Code** is stateless here: `Stop` stays `working` instead of settling `idle` when
+  `background_tasks[]` still lists an entry of type `subagent`, `workflow`, `teammate`,
+  `MCP task`, or `cloud session` with no `status` field or a `status` of `running`/`pending`; no
+  `children` map is kept, and Claude's `SubagentStop` stays outside the installed vocabulary.
+- **Pi** and **OpenCode** track children inside their adapters instead of this ledger — see
+  [hooks and adapters](hooks-and-adapters.md).
 
 ## Consumer contract and delivery
 
@@ -160,12 +258,16 @@ adapters also retain at most 32 pending ingest calls.
 ## Privacy and failures
 
 The capped raw input exists in memory while parsing. `NativeEvent` extracts
-session ID, transcript path, tool name, working directory, and notification type.
+session ID, transcript path, tool name, working directory, notification type, and whether
+Claude's `background_tasks[]` still names a live child agent (one boolean, derived from each
+entry's `type` and `status`; nothing else in that array is read).
 Lifecycle handling also reads native `source`, `agent_id`, `source_type`, `source_id`,
-and Pi `reason`, retaining only parallel and retired flags alongside private status.
-Raw payloads are never persisted or forwarded; tool inputs, outputs, and prompts
-do not enter status records. JSON errors report position without the offending
-value. A transcript path is metadata; ingest does not open the transcript.
+`calling_session_id`, and Pi `reason`, retaining only parallel/retired flags and, for a tracked
+child, its opaque key digest and phase, alongside private status. Raw payloads are never
+persisted or forwarded; tool inputs, outputs, prompts, task names/results, and
+`background_tasks[]` descriptions or commands do not enter status records, and a child's raw
+session or agent ID is never stored, only its digest. JSON errors report position without the
+offending value. A transcript path is metadata; ingest does not open the transcript.
 
 Handled ingest failures exit zero and record health when the store is available; ingest
 also prints the joined problem to stderr, which agent hosts ignore. An event name outside

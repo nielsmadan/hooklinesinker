@@ -108,6 +108,18 @@ impl Run {
     fn stdin(&self, index: usize) -> &Value {
         &self.invocations[index]["stdin"]
     }
+
+    fn session_ids(&self) -> Vec<String> {
+        self.invocations
+            .iter()
+            .map(|invocation| {
+                invocation["stdin"]["session_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
 }
 
 /// The whole suite runs in a single node process, once, behind a `OnceLock`: cargo's parallel
@@ -349,11 +361,21 @@ fn pi_prompt_and_decision_produce_the_permission_lifecycle() {
     assert_eq!(run.stdin(0)["session_id"], "pi-parent");
     assert_eq!(
         run.registered_channels,
-        ["permissions:ui_prompt", "permissions:decision"]
+        [
+            "permissions:ui_prompt",
+            "permissions:decision",
+            "subagent:async-started",
+            "subagent:async-complete"
+        ]
     );
     assert_eq!(
         run.subscribed_channels,
-        ["permissions:ui_prompt", "permissions:decision"]
+        [
+            "permissions:ui_prompt",
+            "permissions:decision",
+            "subagent:async-started",
+            "subagent:async-complete"
+        ]
     );
 }
 
@@ -491,6 +513,184 @@ fn pi_adapter_drops_queued_hooks_past_their_deadline() {
     assert!(prompts >= 1, "every queued hook was dropped");
 }
 
+#[test]
+fn pi_async_runs_hold_working_until_the_woken_parent_settles() {
+    let Some(run) = run("pi:async_runs_hold_working_until_the_woken_parent_settles") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "agent_start",
+            "agent_start",
+            "agent_start",
+            "agent_settled"
+        ]
+    );
+}
+
+#[test]
+fn pi_async_run_completing_without_a_wake_settles() {
+    let Some(run) = run("pi:async_run_completing_without_a_wake_settles") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "agent_start",
+            "agent_start",
+            "agent_settled"
+        ]
+    );
+}
+
+#[test]
+fn pi_dead_async_runs_do_not_hold_working() {
+    let Some(run) = run("pi:dead_async_runs_do_not_hold_working") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start", "agent_settled"]);
+}
+
+#[test]
+fn pi_async_runs_of_other_sessions_are_ignored() {
+    let Some(run) = run("pi:async_runs_of_other_sessions_are_ignored") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start", "agent_settled"]);
+}
+
+#[test]
+fn pi_async_run_finishing_mid_turn_settles_normally() {
+    let Some(run) = run("pi:async_run_finishing_mid_turn_settles_normally") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "agent_start", "agent_settled"]
+    );
+}
+
+#[test]
+fn pi_async_runs_rebuilt_on_start() {
+    let Some(run) = run("pi:async_runs_rebuilt_on_start") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "agent_start",
+            "agent_start",
+            "agent_settled"
+        ]
+    );
+}
+
+#[test]
+fn pi_scan_excludes_dead_pids_before_any_settle() {
+    let Some(run) = run("pi:scan_excludes_dead_pids_before_any_settle") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start", "agent_settled"]);
+}
+
+#[test]
+fn pi_completion_during_rebuild_is_not_resurrected() {
+    let Some(run) = run("pi:completion_during_rebuild_is_not_resurrected") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "agent_settled", "agent_settled"]
+    );
+}
+
+#[test]
+fn pi_shutdown_forgets_async_runs() {
+    let Some(run) = run("pi:shutdown_forgets_async_runs") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start", "session_shutdown"]);
+}
+
+#[test]
+fn pi_scan_skips_runs_owned_by_another_process() {
+    let Some(run) = run("pi:scan_skips_runs_owned_by_another_process") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "agent_start",
+            "agent_start",
+            "agent_settled",
+            "session_before_compact"
+        ]
+    );
+}
+
+#[test]
+fn pi_completion_without_a_wake_mid_turn_settles_once() {
+    let Some(run) = run("pi:completion_without_a_wake_mid_turn_settles_once") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "agent_start", "agent_settled"]
+    );
+}
+
+#[test]
+fn pi_one_of_two_runs_completing_keeps_the_hold() {
+    let Some(run) = run("pi:one_of_two_runs_completing_keeps_the_hold") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "agent_start",
+            "agent_start",
+            "permission_prompt",
+            "agent_settled",
+            "session_before_compact"
+        ]
+    );
+}
+
+#[test]
+fn pi_unknown_completion_keeps_the_hold() {
+    let Some(run) = run("pi:unknown_completion_keeps_the_hold") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "agent_start",
+            "agent_start",
+            "permission_prompt",
+            "agent_start",
+            "agent_settled"
+        ]
+    );
+}
+
+#[test]
+fn pi_manual_compaction_with_live_runs_holds_working() {
+    let Some(run) = run("pi:manual_compaction_with_live_runs_holds_working") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "agent_start", "agent_start"]
+    );
+}
+
 // MARK: - OpenCode
 
 #[test]
@@ -592,6 +792,503 @@ fn opencode_session_ids_use_the_first_valid_string() {
         assert_eq!(run.stdin(index + 1)["session_id"], *id);
     }
     assert_eq!(run.stdin(4), &serde_json::json!({ "cwd": "/work/repo" }));
+}
+
+#[test]
+fn opencode_child_sessions_report_through_the_root() {
+    let Some(run) = run("opencode:child_sessions_report_through_the_root") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_background_child_sessions_hold_the_root_until_its_own_idle() {
+    let Some(run) = run("opencode:child_sessions_report_through_the_root:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_child_permission_surfaces_on_the_root() {
+    let Some(run) = run("opencode:child_permission_surfaces_on_the_root") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "permission.asked",
+            "session.status.busy"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_root_permission_reply_resumes_working() {
+    let Some(run) = run("opencode:root_permission_reply_resumes_working") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "permission.asked",
+            "session.status.busy"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_grandchildren_resolve_to_the_root() {
+    let Some(run) = run("opencode:grandchildren_resolve_to_the_root") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        ["session.created", "session.status.busy"]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R"]);
+}
+
+#[test]
+fn opencode_child_learned_late_loses_its_row() {
+    let Some(run) = run("opencode:child_learned_late_loses_its_row") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.deleted"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "X", "R", "X"]);
+}
+
+#[test]
+fn opencode_child_learned_late_through_an_update_loses_its_row() {
+    let Some(run) = run("opencode:child_learned_late_through_an_update") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.deleted"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "X", "R", "X"]);
+}
+
+#[test]
+fn opencode_late_link_under_a_busy_root_reclaims_the_row_first() {
+    let Some(run) = run("opencode:late_link_under_a_busy_root_reclaims_the_row_first") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.busy",
+            "session.deleted"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "X", "R", "X"]);
+}
+
+#[test]
+fn opencode_child_selection_selects_the_root() {
+    let Some(run) = run("opencode:child_selection_selects_the_root") else {
+        return;
+    };
+    assert_eq!(run.events()[1..], ["session.created", "tui.session.select"]);
+    assert_eq!(run.session_ids()[1..], ["R", "R"]);
+}
+
+#[test]
+fn opencode_root_busy_under_a_pending_child_ask_stays_permission() {
+    let Some(run) = run("opencode:root_busy_under_a_pending_child_ask_stays_permission") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        ["session.created", "permission.asked", "permission.asked"]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R"]);
+}
+
+#[test]
+fn opencode_each_pending_ask_is_tracked() {
+    let Some(run) = run("opencode:each_pending_ask_is_tracked") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "permission.asked",
+            "tui.session.select",
+            "session.status.busy"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_child_idle_clears_its_asks() {
+    let Some(run) = run("opencode:child_idle_clears_its_asks") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "permission.asked",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_deleting_a_busy_child_releases_its_root() {
+    let Some(run) = run("opencode:deleting_a_busy_child_releases_its_root") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R"]);
+}
+
+#[test]
+fn opencode_disposal_removes_only_roots() {
+    let Some(run) = run("opencode:disposal_removes_only_roots") else {
+        return;
+    };
+    assert_eq!(run.events()[1..], ["session.created", "session.deleted"]);
+    assert_eq!(run.session_ids()[1..], ["R", "R"]);
+}
+
+#[test]
+fn opencode_child_compaction_keeps_the_root_phase() {
+    let Some(run) = run("opencode:child_compaction_keeps_the_root_phase") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.idle",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_background_child_compaction_holds_the_root_until_its_own_idle() {
+    let Some(run) = run("opencode:child_compaction_keeps_the_root_phase:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_root_deletion_forgets_its_descendants() {
+    let Some(run) = run("opencode:root_deletion_forgets_its_descendants") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.deleted",
+            "session.created",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_sessionless_tree_events_are_dropped() {
+    let Some(run) = run("opencode:sessionless_tree_events_are_dropped") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session.created"]);
+}
+
+#[test]
+fn opencode_overlapping_child_events_settle_on_the_tree_phase() {
+    let Some(run) = run("opencode:overlapping_child_events_settle_on_the_tree_phase") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "permission.asked",
+            "session.status.busy",
+            "permission.asked",
+            "session.status.busy",
+            "permission.asked"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_background_child_completion_holds_the_root_until_its_wake() {
+    let Some(run) =
+        run("opencode:background_child_completion_holds_the_root_until_its_wake:background")
+    else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_experimental_flag_also_enables_the_background_hold() {
+    let Some(run) =
+        run("opencode:background_child_completion_holds_the_root_until_its_wake:experimental")
+    else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+}
+
+#[test]
+fn opencode_the_roots_own_event_releases_its_hold() {
+    let Some(run) = run("opencode:the_roots_own_event_releases_its_hold:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_deleting_a_child_keeps_a_held_root_held() {
+    let Some(run) = run("opencode:deleting_a_child_keeps_a_held_root_held:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_child_permission_interrupts_a_hold() {
+    let Some(run) = run("opencode:child_permission_interrupts_a_hold:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "permission.asked",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_the_roots_own_idle_and_error_release_its_hold() {
+    let Some(run) = run("opencode:the_roots_own_idle_and_error_release_its_hold:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.idle",
+            "session.status.busy",
+            "session.error"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R", "R", "R"]);
+}
+
+#[test]
+fn opencode_root_deletion_drops_its_hold() {
+    let Some(run) = run("opencode:root_deletion_drops_its_hold:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.deleted",
+            "session.created",
+            "session.status.busy",
+            "session.status.idle",
+            "session.status.idle",
+            "session.deleted"
+        ]
+    );
+    assert_eq!(
+        run.session_ids()[1..],
+        ["R", "R", "R", "R", "X", "X", "R", "X"]
+    );
+}
+
+#[test]
+fn opencode_late_link_under_a_held_root_keeps_it_working() {
+    let Some(run) = run("opencode:late_link_under_a_held_root_keeps_it_working:background") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.busy",
+            "session.status.idle",
+            "session.status.busy",
+            "session.deleted",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(
+        run.session_ids()[1..],
+        ["R", "R", "X", "X", "R", "X", "R", "R"]
+    );
+}
+
+#[test]
+fn opencode_foreground_child_completion_under_a_busy_root() {
+    let Some(run) = run("opencode:foreground_child_completion_under_a_busy_root") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        [
+            "session.created",
+            "session.status.busy",
+            "session.status.idle"
+        ]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R", "R"]);
+}
+
+#[test]
+fn opencode_phase_dropped_by_the_queue_bound_is_resent() {
+    let Some(run) = run("opencode:phase_dropped_by_the_queue_bound_is_resent") else {
+        return;
+    };
+    let events = run.events();
+    assert_eq!(events.len(), 35);
+    assert_eq!(events[1], "session.created");
+    assert!(events[2..34].iter().all(|event| event == "session.idle"));
+    assert_eq!(events[34], "session.status.busy");
+    assert_eq!(run.session_ids()[34], "R");
+}
+
+#[test]
+fn opencode_phase_dropped_by_the_deadline_is_resent() {
+    let Some(run) = run("opencode:phase_dropped_by_the_deadline_is_resent:stubborn") else {
+        return;
+    };
+    assert_eq!(
+        run.events()[1..],
+        ["session.created", "session.status.busy"]
+    );
+    assert_eq!(run.session_ids()[1..], ["R", "R"]);
 }
 
 #[test]
