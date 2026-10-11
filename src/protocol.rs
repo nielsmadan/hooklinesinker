@@ -370,7 +370,7 @@ mod tests {
             "problems": []
         }))
         .unwrap();
-        assert!(consumers.consumers.is_empty());
+        assert_eq!(consumers.consumers, [] as [crate::protocol::Consumer; 0]);
 
         let doctor: DoctorResponse = serde_json::from_value(serde_json::json!({
             "protocol": 1,

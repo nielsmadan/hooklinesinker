@@ -997,7 +997,7 @@ fn codex_subagent_lifecycle_tracks_each_child() {
     let ended = last_body(&fixture);
     assert_eq!(ended["running"], false);
     assert_eq!(ended["session"]["id"], "a");
-    assert!(fixture.ids().is_empty());
+    assert_eq!(fixture.ids(), [] as [String; 0]);
 }
 
 #[test]
@@ -1191,7 +1191,7 @@ fn droid_task_children_report_through_the_parent() {
     let ended = last_body(&fixture);
     assert_eq!(ended["running"], false);
     assert_eq!(ended["session"]["id"], "P");
-    assert!(fixture.ids().is_empty());
+    assert_eq!(fixture.ids(), [] as [String; 0]);
 }
 
 fn attributed(id: &str, source: Option<&str>) -> Value {

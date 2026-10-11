@@ -274,7 +274,7 @@ mod tests {
                 .register(&consumer("-juggler", &["status"], None))
                 .is_err()
         );
-        assert!(store.list().unwrap().is_empty());
+        assert_eq!(store.list().unwrap(), [] as [crate::protocol::Consumer; 0]);
     }
 
     #[test]

@@ -494,7 +494,7 @@ fn uninstall_removes_a_registered_consumer() {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
-    assert!(consumer_files.is_empty());
+    assert_eq!(consumer_files, [] as [std::path::PathBuf; 0]);
 }
 
 #[test]
@@ -916,7 +916,7 @@ fn ingest_writes_a_ledger_record_that_sessions_json_can_read() {
         .output()
         .unwrap();
     assert!(ingest.status.success());
-    assert!(ingest.stderr.is_empty());
+    assert_eq!(ingest.stderr, [] as [u8; 0]);
 
     let ledger_files: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/status"))
         .unwrap()
@@ -964,7 +964,7 @@ fn ingest_captures_terminal_and_remote_host_from_the_process_environment() {
         .output()
         .unwrap();
     assert!(ingest.status.success());
-    assert!(ingest.stderr.is_empty());
+    assert_eq!(ingest.stderr, [] as [u8; 0]);
 
     let ledger_files: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/status"))
         .unwrap()

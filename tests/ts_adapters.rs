@@ -479,7 +479,7 @@ fn pi_a_hanging_binary_cannot_block_the_adapter() {
         "adapter took {}ms to give up on a hanging binary, budget is {HANG_BUDGET_MS}ms",
         run.elapsed_ms
     );
-    assert!(run.running_pids.is_empty());
+    assert_eq!(run.running_pids, [] as [u64; 0]);
 }
 
 #[test]
@@ -1302,7 +1302,7 @@ fn opencode_a_hanging_binary_cannot_block_the_adapter() {
         "adapter took {}ms to give up on a hanging binary, budget is {HANG_BUDGET_MS}ms",
         run.elapsed_ms
     );
-    assert!(run.running_pids.is_empty());
+    assert_eq!(run.running_pids, [] as [u64; 0]);
 }
 
 #[test]

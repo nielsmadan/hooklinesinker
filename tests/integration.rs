@@ -860,7 +860,10 @@ fn running_excludes_dead_bindings_without_deleting_them() {
     store.record(&status("dead-session", 301, 31)).unwrap();
     let liveness = FakeProcessLookup::new();
 
-    assert!(store.running(&liveness).unwrap().is_empty());
+    assert_eq!(
+        store.running(&liveness).unwrap(),
+        [] as [crate::protocol::StatusEvent; 0]
+    );
     assert_eq!(store.dead_records(&liveness).unwrap(), 1);
     assert_eq!(
         ledger_files(&root),
@@ -948,7 +951,10 @@ fn sweep_removes_dead_bindings_and_returns_them_with_running_false() {
     assert_eq!(swept.len(), 1);
     assert!(!swept[0].running);
     assert_eq!(swept[0].session.id, "swept-session");
-    assert!(store.running(&all_alive()).unwrap().is_empty());
+    assert_eq!(
+        store.running(&all_alive()).unwrap(),
+        [] as [crate::protocol::StatusEvent; 0]
+    );
 }
 
 #[test]
@@ -963,7 +969,10 @@ fn a_binding_that_was_alive_is_swept_once_its_process_exits() {
     let swept = store.sweep(&liveness).unwrap().events;
     assert_eq!(swept.len(), 1);
     assert_eq!(swept[0].session.id, "exiting-session");
-    assert!(store.running(&liveness).unwrap().is_empty());
+    assert_eq!(
+        store.running(&liveness).unwrap(),
+        [] as [crate::protocol::StatusEvent; 0]
+    );
 }
 
 #[test]
@@ -972,7 +981,10 @@ fn pid_reuse_is_treated_as_a_dead_binding() {
     store.record(&status("reused-session", 400, 1)).unwrap();
     let liveness = FakeProcessLookup::new();
     liveness.set_alive(400, "2");
-    assert!(store.running(&liveness).unwrap().is_empty());
+    assert_eq!(
+        store.running(&liveness).unwrap(),
+        [] as [crate::protocol::StatusEvent; 0]
+    );
 }
 
 #[test]
@@ -983,10 +995,19 @@ fn records_without_process_identity_are_diagnostics_not_running() {
     event.process = None;
     event.observed_at = hooklinesinker::processes::now_rfc3339();
     store.record(&event).unwrap();
-    assert!(store.running(&all_alive()).unwrap().is_empty());
+    assert_eq!(
+        store.running(&all_alive()).unwrap(),
+        [] as [crate::protocol::StatusEvent; 0]
+    );
     assert_eq!(store.dead_records(&all_alive()).unwrap(), 0);
-    assert!(store.sweep(&all_alive()).unwrap().events.is_empty());
-    assert!(store.running(&all_alive()).unwrap().is_empty());
+    assert_eq!(
+        store.sweep(&all_alive()).unwrap().events,
+        [] as [crate::protocol::StatusEvent; 0]
+    );
+    assert_eq!(
+        store.running(&all_alive()).unwrap(),
+        [] as [crate::protocol::StatusEvent; 0]
+    );
     assert_eq!(ledger_files(&root), 1);
 }
 
@@ -1000,7 +1021,10 @@ fn unverifiable_records_expire_without_emitting_removal_events() {
     store.record(&event).unwrap();
 
     assert_eq!(store.dead_records(&all_alive()).unwrap(), 1);
-    assert!(store.sweep(&all_alive()).unwrap().events.is_empty());
+    assert_eq!(
+        store.sweep(&all_alive()).unwrap().events,
+        [] as [crate::protocol::StatusEvent; 0]
+    );
     assert_eq!(ledger_files(&root), 0);
 }
 
@@ -1475,7 +1499,7 @@ fn sessions_envelope_reports_a_problem_when_records_cannot_be_read() {
 
     std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    assert!(envelope.sessions.is_empty());
+    assert_eq!(envelope.sessions, [] as [crate::protocol::StatusEvent; 0]);
     assert!(
         !envelope.problems.is_empty(),
         "expected a diagnostic when the ledger could not be read"
@@ -1491,7 +1515,7 @@ fn sessions_envelope_omits_a_dead_binding_but_leaves_it_for_the_sweep() {
     let liveness = FakeProcessLookup::new();
     let envelope = store.sessions_envelope(&liveness);
 
-    assert!(envelope.sessions.is_empty());
+    assert_eq!(envelope.sessions, [] as [crate::protocol::StatusEvent; 0]);
     assert!(envelope.problems.is_empty());
     assert_eq!(ledger_files(&root), 1);
 }
@@ -2276,7 +2300,10 @@ fn claude_end_retains_a_guard_until_process_exit_without_duplicate_removals() {
     assert_eq!(before.len(), 2);
     assert_eq!(before[1]["event"], "SessionEnd");
     assert_eq!(before[1]["running"], false);
-    assert!(store.running(&liveness).unwrap().is_empty());
+    assert_eq!(
+        store.running(&liveness).unwrap(),
+        [] as [crate::protocol::StatusEvent; 0]
+    );
     assert!(
         ingest(
             &ctx,
@@ -2482,7 +2509,7 @@ fn a_read_between_the_kill_and_the_next_ingest_still_lets_the_sweep_fan_out() {
     other_liveness.set_alive(731, "76");
     // Read-only polls must leave dead bindings for the next ingest sweep.
     let envelope = store.sessions_envelope(&other_liveness);
-    assert!(envelope.sessions.is_empty());
+    assert_eq!(envelope.sessions, [] as [crate::protocol::StatusEvent; 0]);
     assert_eq!(store.dead_records(&other_liveness).unwrap(), 1);
     assert_eq!(ledger_files(&root), 1);
 
@@ -2541,7 +2568,10 @@ fn an_event_without_a_session_id_reaches_sinks_but_never_the_ledger() {
     assert_eq!(bodies[0]["session"]["id"], "");
     assert_eq!(bodies[0]["running"], true);
     assert_eq!(ledger_files(&root), 0);
-    assert!(store.sessions_envelope(&liveness).sessions.is_empty());
+    assert_eq!(
+        store.sessions_envelope(&liveness).sessions,
+        [] as [crate::protocol::StatusEvent; 0]
+    );
 
     ingest(
         &ctx,
