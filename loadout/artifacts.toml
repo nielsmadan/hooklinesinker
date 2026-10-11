@@ -1,19 +1,9 @@
 [[artifact]]
-agents = ["codex", "droid", "opencode", "pi"]
+agents = ["claude", "codex", "droid", "opencode", "pi"]
 output = "AGENTS.md"
 format = "copy"
 category = "instructions"
 source = "instructions/native/codex+droid+opencode+pi/AGENTS.md"
-mode = 420
-emit_empty = true
-template_instructions = true
-
-[[artifact]]
-agents = ["claude", "opencode"]
-output = "CLAUDE.md"
-format = "copy"
-category = "instructions"
-source = "instructions/native/claude+opencode/CLAUDE.md"
 mode = 420
 emit_empty = true
 template_instructions = true
