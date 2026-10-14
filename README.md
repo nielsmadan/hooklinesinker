@@ -85,7 +85,7 @@ envelope whose `protocol` is not one they speak, and skip individual records who
       "session": { "id": "…", "cwd": "/path", "transcriptPath": null },
       "process": { "pid": 42, "startedAt": "…", "host": "…" },
       "terminal": { "sessionId": "…", "terminalType": "iterm", "kittyListenOn": null, "kittyPid": null },
-      "tmux": { "pane": "%1", "sessionName": "main" },
+      "tmux": { "pane": "%1", "sessionName": "main", "socket": "/private/tmp/tmux-501/default" },
       "git": { "branch": "main", "repo": "hooklinesinker" },
       "remoteHost": null
     }
@@ -121,10 +121,18 @@ no `child:` prefix and no permission surfacing. See
 `terminal` is null when no terminal displays the session. That includes an agent inside a tmux
 session with no attached client (`session_attached` and `session_group_attached` are both 0),
 whose inherited terminal variables belong to whichever tab started the tmux server; `tmux` is
-still reported.
+still reported. `sessions --json` asks tmux again when it reads a record, so a session detached
+since its last hook reports a null `terminal` too. The recheck only withholds: a session
+attached since its last hook gets its terminal back at its next hook, and a record whose tmux
+server cannot be reached keeps the terminal it had. `tmux.socket` is null when the agent ran
+without `$TMUX`; such a record is rechecked against the default tmux server only when that
+server reports the same tmux session name.
 
 An event whose `session.id` is empty (an agent announcing itself before its session id exists)
 is delivered to sinks but never stored, so it can never appear in `sessions --json`.
+
+`sessions --json` lists records oldest `observedAt` first, so a consumer replaying them in
+order ends on the newest record for each terminal.
 
 `sessions --json` and `doctor` never mutate the ledger. A record whose process is gone is
 filtered out of both, and removed by the next `ingest`, which fans out one `running:false`

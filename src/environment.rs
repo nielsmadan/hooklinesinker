@@ -1,12 +1,17 @@
 use crate::normalize::HookEnvironment;
 use crate::processes::local_hostname;
-use crate::protocol::{GitIdentity, TerminalIdentity, TmuxIdentity};
+use crate::protocol::{GitIdentity, StatusEvent, TerminalIdentity, TmuxIdentity};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
+
+// Apps launched from Finder get launchd's PATH, which leaves out Homebrew.
+const FALLBACK_BIN_DIRS: [&str; 3] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
 
 #[allow(
     clippy::literal_string_with_formatting_args,
@@ -14,6 +19,15 @@ const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
 )]
 pub(crate) const TMUX_PANE_FORMAT: &str =
     "#{session_attached},#{session_group_attached},#{session_name}";
+
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "tmux expands its own format expressions"
+)]
+pub(crate) const TMUX_PANES_FORMAT: &str =
+    "#{pane_id},#{session_attached},#{session_group_attached},#{session_name}";
+
+type PaneReports = HashMap<String, (TmuxAttachment, Option<String>)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TmuxAttachment {
@@ -36,12 +50,7 @@ impl EnvSource for SystemEnv {
     }
 
     fn command_output(&self, program: &str, args: &[&str]) -> Option<String> {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+        let mut child = spawn_with_fallback(program, args).ok()?;
         let deadline = Instant::now() + COMMAND_TIMEOUT;
         let status = loop {
             match child.try_wait() {
@@ -74,6 +83,27 @@ impl EnvSource for SystemEnv {
 
 fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
+}
+
+fn spawn_with_fallback(program: &str, args: &[&str]) -> io::Result<Child> {
+    let spawn = |path: &str| {
+        Command::new(path)
+            .args(args)
+            // Without -S, tmux follows the caller's $TMUX instead of the default server.
+            .env_remove("TMUX")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    match spawn(program) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !program.contains('/') => {
+            FALLBACK_BIN_DIRS
+                .iter()
+                .find_map(|dir| spawn(&format!("{dir}/{program}")).ok())
+                .ok_or(e)
+        }
+        result => result,
+    }
 }
 
 pub(crate) fn gather_environment(env: &dyn EnvSource, cwd: String) -> HookEnvironment {
@@ -133,16 +163,7 @@ fn detect_tmux(env: &dyn EnvSource) -> (Option<TmuxIdentity>, TmuxAttachment) {
     };
     let tmux_var = env.var("TMUX");
     let socket = tmux_var.as_deref().and_then(tmux_socket);
-    let mut args = Vec::new();
-    if let Some(socket) = socket {
-        args.extend(["-S", socket]);
-    }
-    args.extend(["display-message", "-p", "-t", &pane, TMUX_PANE_FORMAT]);
-    let (attachment, session_name) = env
-        .command_output("tmux", &args)
-        .map_or((TmuxAttachment::Unknown, None), |output| {
-            parse_pane_report(&output)
-        });
+    let (attachment, session_name) = query_pane(env, socket, &pane);
     // Pane ids are per server, so without $TMUX the default server may not own this pane.
     let attachment = if socket.is_some() {
         attachment
@@ -153,9 +174,98 @@ fn detect_tmux(env: &dyn EnvSource) -> (Option<TmuxIdentity>, TmuxAttachment) {
         Some(TmuxIdentity {
             pane: Some(pane),
             session_name,
+            socket: socket.map(str::to_string),
         }),
         attachment,
     )
+}
+
+fn query_pane(
+    env: &dyn EnvSource,
+    socket: Option<&str>,
+    pane: &str,
+) -> (TmuxAttachment, Option<String>) {
+    let mut args = Vec::new();
+    if let Some(socket) = socket {
+        args.extend(["-S", socket]);
+    }
+    args.extend(["display-message", "-p", "-t", pane, TMUX_PANE_FORMAT]);
+    env.command_output("tmux", &args)
+        .map_or((TmuxAttachment::Unknown, None), |output| {
+            parse_pane_report(&output)
+        })
+}
+
+// A record keeps the terminal it saw at its last hook, so a session detached since then
+// would still claim the tab it left.
+pub(crate) fn withhold_detached_terminals(
+    env: &dyn EnvSource,
+    sessions: Vec<StatusEvent>,
+) -> Vec<StatusEvent> {
+    let sockets: BTreeSet<Option<&str>> = sessions
+        .iter()
+        .filter_map(rechecked_tmux)
+        .map(|tmux| tmux.socket.as_deref())
+        .collect();
+    let reports: BTreeMap<Option<String>, PaneReports> = sockets
+        .into_iter()
+        .map(|socket| (socket.map(str::to_string), list_panes(env, socket)))
+        .collect();
+    sessions
+        .into_iter()
+        .map(|status| recheck_terminal(status, &reports))
+        .collect()
+}
+
+fn rechecked_tmux(status: &StatusEvent) -> Option<&TmuxIdentity> {
+    status.terminal.as_ref()?;
+    status.tmux.as_ref().filter(|tmux| tmux.pane.is_some())
+}
+
+fn list_panes(env: &dyn EnvSource, socket: Option<&str>) -> PaneReports {
+    let mut args = Vec::new();
+    if let Some(socket) = socket {
+        args.extend(["-S", socket]);
+    }
+    args.extend(["list-panes", "-a", "-F", TMUX_PANES_FORMAT]);
+    env.command_output("tmux", &args)
+        .map(|output| {
+            output
+                .lines()
+                .filter_map(|line| {
+                    let (pane, report) = line.split_once(',')?;
+                    Some((pane.to_string(), parse_pane_report(report)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn recheck_terminal(
+    status: StatusEvent,
+    reports: &BTreeMap<Option<String>, PaneReports>,
+) -> StatusEvent {
+    let Some(tmux) = rechecked_tmux(&status) else {
+        return status;
+    };
+    let Some((attachment, session_name)) = tmux
+        .pane
+        .as_deref()
+        .and_then(|pane| reports.get(&tmux.socket)?.get(pane))
+    else {
+        return status;
+    };
+    // Without a socket, the default server's answer counts only if it names the same session.
+    let identified =
+        tmux.socket.is_some() || (session_name.is_some() && *session_name == tmux.session_name);
+    if !identified {
+        return status;
+    }
+    let attachment = *attachment;
+    StatusEvent {
+        terminal: displayed_terminal(status.terminal, attachment),
+        ..status
+    }
 }
 
 fn tmux_socket(tmux_var: &str) -> Option<&str> {

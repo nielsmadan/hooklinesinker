@@ -240,6 +240,10 @@ impl StatusStore {
     ) -> io::Result<IngestSessionOutcome> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
+        if let Some(earlier) = binding_before_host_rename(event, &snapshot.records) {
+            event.binding_id.clone_from(&earlier.binding_id);
+            event.process.clone_from(&earlier.process);
+        }
         let previous = snapshot.records.iter().find_map(|(_, stored)| {
             (stored.status.binding_id == event.binding_id).then_some(stored)
         });
@@ -485,20 +489,19 @@ impl StatusStore {
             if current.is_some_and(|event| event.binding_id == stored.status.binding_id) {
                 continue;
             }
+            if current.is_some_and(|event| is_same_session_in_process(event, &stored.status)) {
+                if let Err(e) = remove_record(&path) {
+                    outcome.problems.push(format!(
+                        "failed to remove status record {}: {e}",
+                        path.display()
+                    ));
+                }
+                continue;
+            }
             if retire_superseded
                 && !stored.parallel
                 && !stored.retired
-                && current.is_some_and(|event| {
-                    let previous = &stored.status;
-                    let pane = event.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref());
-                    // Attaching or detaching tmux changes the reported terminal within one process.
-                    previous.agent == event.agent
-                        && previous.session.id != event.session.id
-                        && previous.process == event.process
-                        && previous.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref()) == pane
-                        && (pane.is_some() || previous.terminal == event.terminal)
-                        && previous.remote_host == event.remote_host
-                })
+                && current.is_some_and(|event| is_superseded_record(event, &stored.status))
             {
                 stored.status.running = false;
                 stored.retired = true;
@@ -516,16 +519,12 @@ impl StatusStore {
                 }
             }
             if is_sweepable(&stored, liveness, now) {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        outcome.problems.push(format!(
-                            "failed to remove status record {}: {e}",
-                            path.display()
-                        ));
-                        continue;
-                    }
+                if let Err(e) = remove_record(&path) {
+                    outcome.problems.push(format!(
+                        "failed to remove status record {}: {e}",
+                        path.display()
+                    ));
+                    continue;
                 }
                 if stored.status.process.is_some() && !stored.retired {
                     stored.status.running = false;
@@ -543,11 +542,7 @@ impl StatusStore {
     }
 
     fn remove_binding(&self, binding_id: &str) -> io::Result<()> {
-        match fs::remove_file(self.binding_path(binding_id)?) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        remove_record(&self.binding_path(binding_id)?)
     }
 
     fn read_all(&self) -> io::Result<StatusSnapshot> {
@@ -697,7 +692,7 @@ impl StatusStore {
     ) -> io::Result<SessionsEnvelope> {
         let _guard = self.lock()?;
         let snapshot = self.read_all()?;
-        let sessions = snapshot
+        let mut sessions: Vec<_> = snapshot
             .records
             .into_iter()
             .filter(|(_, stored)| !stored.retired)
@@ -705,6 +700,8 @@ impl StatusStore {
             .filter(|(_, event)| is_live(event, liveness))
             .map(|(_, event)| event)
             .collect();
+        // Consumers replay these in order, so the newest record for a terminal lands last.
+        sessions.sort_by_cached_key(|event| Timestamp::parse(&event.observed_at));
         let mut problems: Vec<_> = snapshot
             .problems
             .into_iter()
@@ -781,7 +778,7 @@ fn attach_child(
             );
     let mut status = root.status.clone();
     status.phase = aggregate_phase(root.own_phase, &children, held);
-    if event.process.is_some() && event.process == root.status.process {
+    if same_process(event.process.as_ref(), root.status.process.as_ref()) {
         status.terminal.clone_from(&event.terminal);
         status.tmux.clone_from(&event.tmux);
         status.git.clone_from(&event.git);
@@ -812,8 +809,8 @@ fn best_root<'a>(
     process: Option<&ProcessIdentity>,
 ) -> Option<&'a StoredStatus> {
     candidates.max_by_key(|stored| {
-        let same_process = process.is_some() && stored.status.process.as_ref() == process;
-        (same_process, Timestamp::parse(&stored.status.observed_at))
+        let in_process = same_process(stored.status.process.as_ref(), process);
+        (in_process, Timestamp::parse(&stored.status.observed_at))
     })
 }
 
@@ -922,6 +919,54 @@ fn is_live(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> b
         .process
         .as_ref()
         .is_some_and(|identity| liveness.process_is_alive(identity))
+}
+
+fn remove_record(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn same_process(a: Option<&ProcessIdentity>, b: Option<&ProcessIdentity>) -> bool {
+    a.zip(b).is_some_and(|(a, b)| a.is_same_process(b))
+}
+
+fn is_same_session_in_process(a: &StatusEvent, b: &StatusEvent) -> bool {
+    a.agent == b.agent
+        && a.session.id == b.session.id
+        && a.remote_host == b.remote_host
+        && same_process(a.process.as_ref(), b.process.as_ref())
+}
+
+fn is_superseded_record(current: &StatusEvent, previous: &StatusEvent) -> bool {
+    let pane = current.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref());
+    // Attaching or detaching tmux changes the reported terminal within one process.
+    previous.agent == current.agent
+        && previous.session.id != current.session.id
+        && same_process(previous.process.as_ref(), current.process.as_ref())
+        && previous.tmux.as_ref().and_then(|tmux| tmux.pane.as_deref()) == pane
+        && (pane.is_some() || previous.terminal == current.terminal)
+        && previous.remote_host == current.remote_host
+}
+
+// The binding hashes the hostname, which macOS renames as networks change; a session keeps
+// the binding it already has so consumers never see it re-keyed.
+fn binding_before_host_rename<'a>(
+    event: &StatusEvent,
+    records: &'a [(PathBuf, StoredStatus)],
+) -> Option<&'a StatusEvent> {
+    if records
+        .iter()
+        .any(|(_, stored)| stored.status.binding_id == event.binding_id)
+    {
+        return None;
+    }
+    records
+        .iter()
+        .map(|(_, stored)| &stored.status)
+        .filter(|status| is_same_session_in_process(event, status))
+        .max_by_key(|status| Timestamp::parse(&status.observed_at))
 }
 
 fn is_dead(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> bool {
@@ -1047,6 +1092,43 @@ mod tests {
 
         let found = find_spawn_root(&records, &event, "p").unwrap();
         assert_eq!(found.status.process.as_ref().unwrap().pid, 2);
+    }
+
+    #[test]
+    fn spawned_children_find_their_parent_across_a_host_rename() {
+        let elsewhere = candidate_root(1, "2026-10-08T00:00:05Z");
+        let same_process = candidate_root(2, "2026-10-08T00:00:00Z");
+        let records = vec![
+            (PathBuf::from("elsewhere"), elsewhere),
+            (PathBuf::from("same-process"), same_process),
+        ];
+        let mut event_value = legacy_record();
+        event_value["session"]["id"] = json!("c");
+        event_value["process"] =
+            json!({"pid": 2, "startedAt": "2026-10-08T00:00:00Z", "host": "renamed"});
+        let event: StatusEvent = serde_json::from_value(event_value).unwrap();
+
+        let found = find_spawn_root(&records, &event, "p").unwrap();
+        assert_eq!(found.status.process.as_ref().unwrap().pid, 2);
+    }
+
+    #[test]
+    fn child_events_from_a_renamed_host_refresh_the_root_terminal() {
+        let root = candidate_root(2, "2026-10-08T00:00:00Z");
+        let mut event_value = legacy_record();
+        event_value["process"] =
+            json!({"pid": 2, "startedAt": "2026-10-08T00:00:00Z", "host": "renamed"});
+        event_value["terminal"] = json!({
+            "sessionId": "w1t0p0:moved",
+            "terminalType": "iterm2",
+            "kittyListenOn": null,
+            "kittyPid": null
+        });
+        let event: StatusEvent = serde_json::from_value(event_value).unwrap();
+
+        let update = attach_child(&root, &event, "k", Phase::Working, true).unwrap();
+        let terminal = update.stored.status.terminal.unwrap();
+        assert_eq!(terminal.session_id.as_deref(), Some("w1t0p0:moved"));
     }
 
     #[test]

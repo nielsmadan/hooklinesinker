@@ -225,6 +225,13 @@ pub struct ProcessIdentity {
     pub host: String,
 }
 
+impl ProcessIdentity {
+    // macOS renames the host as networks change, so the hostname cannot identify a process.
+    pub(crate) fn is_same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.started_at == other.started_at
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -241,6 +248,8 @@ pub struct TerminalIdentity {
 pub struct TmuxIdentity {
     pub pane: Option<String>,
     pub session_name: Option<String>,
+    #[serde(default)]
+    pub socket: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -314,6 +323,7 @@ mod tests {
             tmux: Some(TmuxIdentity {
                 pane: Some("%1".into()),
                 session_name: Some("main".into()),
+                socket: None,
             }),
             git: Some(GitIdentity {
                 branch: Some("main".into()),

@@ -13,7 +13,13 @@ The flow starts in [`run_ingest`](../src/main.rs), which delegates to
    context; discover the owning agent by walking the hook process's ancestors. Terminal
    identity is withheld when the pane's tmux session has no attached client, since its
    terminal variables were inherited from the tab that started the tmux server. A failed
-   or unparseable tmux query keeps the terminal identity.
+   or unparseable tmux query keeps the terminal identity. `sessions --json` repeats the check
+   for every record with a tmux pane and a terminal, with one `list-panes` per stored socket,
+   so a session detached since its last hook stops claiming the tab. A record without a socket
+   asks the default server, which counts only when it names the stored tmux session. Commands
+   run with `$TMUX` removed, and `tmux` is looked up in `/opt/homebrew/bin`, `/usr/local/bin`
+   and `/usr/bin` when it is not on `PATH`, since apps started from Finder get launchd's
+   `PATH`.
 2. Map command-hook events through `events.rs` and adapter-specific events through
    `normalize.rs` to a phase update, removal, or ignored event. Event names outside an
    agent's vocabulary become ingest diagnostics.
@@ -23,7 +29,14 @@ The flow starts in [`run_ingest`](../src/main.rs), which delegates to
 
 `session.id` identifies an agent conversation. `bindingId` hashes the agent,
 session ID, host, PID, and process start time. Resuming one conversation in two
-processes therefore produces two bindings. PID reuse does not preserve a binding:
+processes therefore produces two bindings. macOS renames the host as networks change
+(`MacBookPro.fritz.box`, then `…local`). When an event's binding has no record but the same
+agent, session ID, remote host, PID, and start time already have one, the event takes over that
+record's `bindingId` and `process`, so the session keeps its binding, children, and retired
+marker, and consumers never see it re-keyed. Other records of that session and process, left
+by versions that re-keyed on a rename, are deleted without a removal event: a `running:false`
+carrying the live session's terminal and session ID would remove its row in consumers that key
+on the terminal. PID reuse does not preserve a binding:
 [`SystemProcessLookup`](../src/processes.rs) checks both PID and start time. Liveness checks
 reuse the ancestor-discovery snapshot during one ingest transaction, avoiding a second full
 process-table scan. `sessions` and `doctor` use `SystemProcessLiveness`, which refreshes only
@@ -40,7 +53,8 @@ reaches sinks but cannot enter the ledger. OpenCode's load-time event uses this 
 update a terminal row before a conversation ID becomes available.
 
 Foreground bindings replace one another within the same agent, PID, process start
-time, host, terminal, tmux pane, and remote-host context. Inside tmux the pane stands in
+time, terminal, tmux pane, and remote-host context. The host is not compared, for the same
+renaming reason. Inside tmux the pane stands in
 for the terminal, because attaching or detaching changes the reported terminal within one
 process. Tmux session names are navigation metadata: renames or failed name lookups do
 not change binding identity.

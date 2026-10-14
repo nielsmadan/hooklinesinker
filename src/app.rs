@@ -2,7 +2,7 @@
 mod cli;
 
 use crate::consumers::ConsumerStore;
-use crate::environment::{self, SystemEnv};
+use crate::environment::{self, EnvSource, SystemEnv};
 use crate::hooks::{HookManager, HookRoots, HookState, HookStatus};
 use crate::ingest::{self, IngestContext};
 use crate::install::{InstalledVersion, Installer, UninstallOutcome};
@@ -119,6 +119,17 @@ fn run_ingest(agent: Agent, event: &str) {
     std::process::exit(0);
 }
 
+pub(crate) fn sessions_response(
+    envelope: SessionsEnvelope,
+    env: &dyn EnvSource,
+) -> SessionsResponse<HealthProblem> {
+    SessionsResponse {
+        protocol: PROTOCOL_VERSION,
+        sessions: environment::withhold_detached_terminals(env, envelope.sessions),
+        problems: envelope.problems,
+    }
+}
+
 fn run_sessions(json: bool) {
     // A read that answered exits 0 even when the health log carries problems; only an
     // unreadable store means the query itself failed.
@@ -137,11 +148,7 @@ fn run_sessions(json: bool) {
         }
     };
     if json {
-        print_json(&SessionsResponse {
-            protocol: PROTOCOL_VERSION,
-            sessions: envelope.sessions,
-            problems: envelope.problems,
-        });
+        print_json(&sessions_response(envelope, &SystemEnv));
         return;
     }
     if envelope.sessions.is_empty() {

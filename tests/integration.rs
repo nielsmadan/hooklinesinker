@@ -1273,6 +1273,7 @@ fn tmux_pane_resolves_session_name_via_the_injected_command_runner() {
 }
 
 const TMUX_VAR: &str = "/private/tmp/tmux-501/default,123,4";
+const TMUX_SOCKET: &str = "/private/tmp/tmux-501/default";
 
 fn tmux_pane_source(terminal: (&str, &str), report: Option<&str>) -> FakeEnvSource {
     let source = FakeEnvSource::new()
@@ -1284,7 +1285,7 @@ fn tmux_pane_source(terminal: (&str, &str), report: Option<&str>) -> FakeEnvSour
             "tmux",
             &[
                 "-S",
-                "/private/tmp/tmux-501/default",
+                TMUX_SOCKET,
                 "display-message",
                 "-p",
                 "-t",
@@ -1308,6 +1309,7 @@ fn detached_tmux_session_withholds_inherited_terminal_identity() {
         let tmux = gathered.tmux.unwrap();
         assert_eq!(tmux.pane.as_deref(), Some("%5"));
         assert_eq!(tmux.session_name.as_deref(), Some("juggler-case"));
+        assert_eq!(tmux.socket.as_deref(), Some(TMUX_SOCKET));
     }
 }
 
@@ -1385,6 +1387,137 @@ fn detached_remote_tmux_session_keeps_its_remote_host() {
     let gathered = environment::gather_environment(&source, "/tmp".into());
     assert_eq!(gathered.terminal, None);
     assert_eq!(gathered.remote_host.as_deref(), Some("alice@build"));
+}
+
+fn stored_tmux_status(pane: &str, socket: Option<&str>) -> StatusEvent {
+    StatusEvent {
+        terminal: Some(hooklinesinker::protocol::TerminalIdentity {
+            session_id: Some("w2t9p0:10935D3A".into()),
+            terminal_type: Some("iterm2".into()),
+            kitty_listen_on: None,
+            kitty_pid: None,
+        }),
+        tmux: Some(hooklinesinker::protocol::TmuxIdentity {
+            pane: Some(pane.into()),
+            session_name: Some("juggler-case".into()),
+            socket: socket.map(str::to_string),
+        }),
+        ..status(pane, 1, 1)
+    }
+}
+
+fn list_panes_source(socket: Option<&str>, panes: &str) -> FakeEnvSource {
+    let mut args = Vec::new();
+    if let Some(socket) = socket {
+        args.extend(["-S", socket]);
+    }
+    args.extend(["list-panes", "-a", "-F", environment::TMUX_PANES_FORMAT]);
+    FakeEnvSource::new().with_command("tmux", &args, panes)
+}
+
+fn recheck(source: &FakeEnvSource, status: StatusEvent) -> StatusEvent {
+    environment::withhold_detached_terminals(source, vec![status]).remove(0)
+}
+
+#[test]
+fn stored_session_detached_since_its_last_hook_loses_its_terminal() {
+    for socket in [Some(TMUX_SOCKET), None] {
+        let source = list_panes_source(socket, "%1,1,,other\n%5,0,,juggler-case");
+        let read = recheck(&source, stored_tmux_status("%5", socket));
+        assert_eq!(read.terminal, None, "{socket:?}");
+        assert_eq!(
+            read.tmux,
+            stored_tmux_status("%5", socket).tmux,
+            "{socket:?}"
+        );
+    }
+}
+
+#[test]
+fn stored_session_still_attached_keeps_its_terminal() {
+    let source = list_panes_source(Some(TMUX_SOCKET), "%5,1,,juggler-case");
+    let stored = stored_tmux_status("%5", Some(TMUX_SOCKET));
+    assert_eq!(recheck(&source, stored.clone()), stored);
+}
+
+#[test]
+fn unanswered_or_missing_panes_keep_the_terminal() {
+    let stored = stored_tmux_status("%5", Some(TMUX_SOCKET));
+    for source in [
+        FakeEnvSource::new(),
+        list_panes_source(Some(TMUX_SOCKET), "%6,0,,juggler-case"),
+        list_panes_source(Some(TMUX_SOCKET), "%5,x,,juggler-case"),
+    ] {
+        assert_eq!(recheck(&source, stored.clone()), stored);
+    }
+}
+
+#[test]
+fn default_server_must_name_the_same_session_for_a_socketless_record() {
+    let stored = stored_tmux_status("%5", None);
+    let unnamed = StatusEvent {
+        tmux: Some(hooklinesinker::protocol::TmuxIdentity {
+            session_name: None,
+            ..stored.tmux.clone().unwrap()
+        }),
+        ..stored.clone()
+    };
+    assert_eq!(
+        recheck(&list_panes_source(None, "%5,0,,other"), stored.clone()),
+        stored
+    );
+    assert_eq!(
+        recheck(&list_panes_source(None, "%5,0,,"), unnamed.clone()),
+        unnamed
+    );
+}
+
+#[test]
+fn records_sharing_a_socket_cost_one_tmux_query() {
+    let source = list_panes_source(Some(TMUX_SOCKET), "%5,0,,juggler-case\n%6,0,,juggler-case");
+    let read = environment::withhold_detached_terminals(
+        &source,
+        vec![
+            stored_tmux_status("%5", Some(TMUX_SOCKET)),
+            stored_tmux_status("%6", Some(TMUX_SOCKET)),
+        ],
+    );
+    let terminals: Vec<_> = read.into_iter().map(|status| status.terminal).collect();
+    assert_eq!(terminals, [None, None]);
+    assert_eq!(source.calls_to("tmux"), 1);
+}
+
+#[test]
+fn records_without_a_terminal_or_a_tmux_pane_run_no_tmux_query() {
+    let source = FakeEnvSource::new();
+    let stored = stored_tmux_status("%5", Some(TMUX_SOCKET));
+    let unchecked = vec![
+        StatusEvent {
+            tmux: None,
+            ..stored.clone()
+        },
+        StatusEvent {
+            terminal: None,
+            ..stored
+        },
+    ];
+    assert_eq!(
+        environment::withhold_detached_terminals(&source, unchecked.clone()),
+        unchecked
+    );
+    assert_eq!(source.calls_to("tmux"), 0);
+}
+
+#[test]
+fn sessions_json_rechecks_tmux_attachment() {
+    let source = list_panes_source(Some(TMUX_SOCKET), "%5,0,,juggler-case");
+    let envelope = hooklinesinker::state::SessionsEnvelope {
+        sessions: vec![stored_tmux_status("%5", Some(TMUX_SOCKET))],
+        problems: Vec::new(),
+    };
+    let response = hooklinesinker::app::sessions_response(envelope, &source);
+    assert_eq!(response.sessions[0].terminal, None);
+    assert_eq!(response.sessions[0].session.id, "%5");
 }
 
 #[test]
@@ -1518,6 +1651,32 @@ fn sessions_envelope_omits_a_dead_binding_but_leaves_it_for_the_sweep() {
     assert_eq!(envelope.sessions, [] as [crate::protocol::StatusEvent; 0]);
     assert!(envelope.problems.is_empty());
     assert_eq!(ledger_files(&root), 1);
+}
+
+#[test]
+fn sessions_envelope_lists_the_oldest_record_first() {
+    let store = store();
+    for (session, observed_at) in [
+        ("second", "2026-10-02T00:00:00Z"),
+        ("third", "2026-10-03T00:00:00Z"),
+        ("first", "2026-10-01T00:00:00Z"),
+    ] {
+        store
+            .record(&StatusEvent {
+                observed_at: observed_at.into(),
+                ..status(session, 1, 1)
+            })
+            .unwrap();
+    }
+
+    let order: Vec<_> = store
+        .sessions_envelope(&all_alive())
+        .sessions
+        .into_iter()
+        .map(|status| status.session.id)
+        .collect();
+
+    assert_eq!(order, ["first", "second", "third"]);
 }
 
 #[test]
@@ -2020,27 +2179,23 @@ fn claude_replacement_preserves_other_bindings() {
         "SessionStart",
         r#"{"session_id":"original"}"#,
     );
-    let mut expected = Vec::new();
-    for (index, case) in [
+    let cases = [
         "pid",
         "start",
-        "host",
         "agent",
         "terminal",
         "tmux",
         "remote",
         "unverifiable",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ];
+    let mut expected = Vec::new();
+    for (index, case) in cases.into_iter().enumerate() {
         let mut other = base.clone();
         other.binding_id = format!("{index:064x}");
         other.session.id = case.into();
         match case {
             "pid" => other.process.as_mut().unwrap().pid += 1,
             "start" => other.process.as_mut().unwrap().started_at = "2026-09-03T00:00:00Z".into(),
-            "host" => other.process.as_mut().unwrap().host = "another-host".into(),
             "agent" => other.agent = Agent::Codex,
             "terminal" => {
                 other.terminal = Some(hooklinesinker::protocol::TerminalIdentity {
@@ -2054,6 +2209,7 @@ fn claude_replacement_preserves_other_bindings() {
                 other.tmux = Some(hooklinesinker::protocol::TmuxIdentity {
                     pane: Some("%2".into()),
                     session_name: Some("work".into()),
+                    socket: None,
                 });
             }
             "remote" => other.remote_host = Some("remote-host".into()),
@@ -2089,7 +2245,244 @@ fn claude_replacement_preserves_other_bindings() {
         .collect();
     actual.sort();
     assert_eq!(actual, expected);
-    assert!(root.join(format!("status/{:064x}.json", 7)).is_file());
+    let unverifiable = cases
+        .iter()
+        .position(|case| *case == "unverifiable")
+        .unwrap();
+    assert!(
+        root.join(format!("status/{unverifiable:064x}.json"))
+            .is_file()
+    );
+}
+
+struct RenameFixture {
+    root: PathBuf,
+    store: StatusStore,
+    consumers: ConsumerStore,
+    client: RecordingHttpClient,
+}
+
+impl RenameFixture {
+    fn new() -> Self {
+        let root = temp_home();
+        let consumers = consumer_store();
+        consumers
+            .register(&consumer(
+                "juggler",
+                &["status"],
+                Some("http://127.0.0.1:7483/hook"),
+            ))
+            .unwrap();
+        Self {
+            store: StatusStore::open(&root).unwrap(),
+            root,
+            consumers,
+            client: RecordingHttpClient::default(),
+        }
+    }
+
+    fn ingest_on(&self, host: &str, agent: Agent, event: &str, input: &str) {
+        let process = ProcessIdentity {
+            host: host.into(),
+            ..test_process()
+        };
+        let liveness = FakeProcessLookup::with_owner(process.clone());
+        liveness.set_alive(process.pid, &process.started_at);
+        let outcome = ingest(
+            &ingest::IngestContext {
+                store: &self.store,
+                liveness: &liveness,
+                consumers: Some(&self.consumers),
+                http_client: &self.client,
+            },
+            agent,
+            event,
+            input,
+            process.pid,
+        );
+        assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+    }
+
+    fn record_on(&self, host: &str, binding: u8, session_id: &str, observed_at: &str) {
+        let mut event = normalize_for_test(
+            Agent::Claude,
+            "Stop",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+        );
+        event.binding_id = format!("{binding:064x}");
+        event.observed_at = observed_at.into();
+        event.process.as_mut().unwrap().host = host.into();
+        self.store.record(&event).unwrap();
+    }
+
+    fn sessions(&self) -> Vec<StatusEvent> {
+        self.store.sessions_envelope(&all_alive()).sessions
+    }
+
+    fn delivered(&self) -> Vec<(String, String, bool)> {
+        self.client
+            .bodies()
+            .iter()
+            .map(|body| {
+                (
+                    body["bindingId"].as_str().unwrap().to_string(),
+                    body["event"].as_str().unwrap().to_string(),
+                    body["running"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn host_rename_keeps_the_session_binding() {
+    let fixture = RenameFixture::new();
+    let input = r#"{"session_id":"same"}"#;
+    fixture.ingest_on(
+        "MacBookPro.fritz.box",
+        Agent::Claude,
+        "UserPromptSubmit",
+        input,
+    );
+    let binding = fixture.sessions()[0].binding_id.clone();
+
+    fixture.ingest_on("Nielss-MacBook-Pro-2.local", Agent::Claude, "Stop", input);
+
+    let sessions = fixture.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].binding_id, binding);
+    assert_eq!(sessions[0].phase, Phase::Idle);
+    assert_eq!(ledger_files(&fixture.root), 1);
+    assert_eq!(
+        fixture.delivered(),
+        [
+            (binding.clone(), "UserPromptSubmit".into(), true),
+            (binding, "Stop".into(), true),
+        ]
+    );
+}
+
+#[test]
+fn host_rename_keeps_running_children_on_the_root() {
+    let fixture = RenameFixture::new();
+    fixture.ingest_on(
+        "MacBookPro.fritz.box",
+        Agent::Codex,
+        "UserPromptSubmit",
+        r#"{"session_id":"a"}"#,
+    );
+    fixture.ingest_on(
+        "MacBookPro.fritz.box",
+        Agent::Codex,
+        "SubagentStart",
+        r#"{"session_id":"a","agent_id":"w"}"#,
+    );
+
+    fixture.ingest_on(
+        "Nielss-MacBook-Pro-2.local",
+        Agent::Codex,
+        "Stop",
+        r#"{"session_id":"a"}"#,
+    );
+
+    let sessions = fixture.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].phase, Phase::Working);
+}
+
+#[test]
+fn host_rename_does_not_revive_an_ended_session() {
+    let fixture = RenameFixture::new();
+    let input = r#"{"session_id":"ended"}"#;
+    fixture.ingest_on(
+        "MacBookPro.fritz.box",
+        Agent::Claude,
+        "UserPromptSubmit",
+        input,
+    );
+    fixture.ingest_on("MacBookPro.fritz.box", Agent::Claude, "SessionEnd", input);
+
+    fixture.ingest_on(
+        "Nielss-MacBook-Pro-2.local",
+        Agent::Claude,
+        "PostToolUse",
+        input,
+    );
+
+    assert_eq!(fixture.sessions(), [] as [StatusEvent; 0]);
+    assert_eq!(ledger_files(&fixture.root), 1);
+}
+
+#[test]
+fn records_left_by_earlier_renames_collapse_into_the_newest() {
+    let fixture = RenameFixture::new();
+    fixture.record_on("MacBookPro.fritz.box", 1, "same", "2026-09-29T00:00:00Z");
+    fixture.record_on(
+        "Nielss-MacBook-Pro-2.fritz.box",
+        2,
+        "same",
+        "2026-09-30T00:00:00Z",
+    );
+
+    fixture.ingest_on(
+        "Nielss-MacBook-Pro-2.local",
+        Agent::Claude,
+        "UserPromptSubmit",
+        r#"{"session_id":"same"}"#,
+    );
+
+    let newest = format!("{:064x}", 2);
+    let sessions = fixture.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].binding_id, newest);
+    assert_eq!(ledger_files(&fixture.root), 1);
+    assert_eq!(
+        fixture.delivered(),
+        [(newest, "UserPromptSubmit".into(), true)]
+    );
+}
+
+#[test]
+fn a_session_seen_through_another_remote_host_keeps_its_own_record() {
+    let fixture = RenameFixture::new();
+    let mut remote = normalize_for_test(Agent::Claude, "Stop", r#"{"session_id":"same"}"#);
+    remote.binding_id = format!("{:064x}", 1);
+    remote.remote_host = Some("alice@build".into());
+    fixture.store.record(&remote).unwrap();
+
+    fixture.ingest_on(
+        "test-host",
+        Agent::Claude,
+        "UserPromptSubmit",
+        r#"{"session_id":"same"}"#,
+    );
+
+    assert_eq!(ledger_files(&fixture.root), 2);
+}
+
+#[test]
+fn claude_replacement_retires_a_session_recorded_under_a_previous_hostname() {
+    let fixture = RenameFixture::new();
+    fixture.record_on(
+        "MacBookPro.fritz.box",
+        1,
+        "original",
+        "2026-09-29T00:00:00Z",
+    );
+
+    fixture.ingest_on(
+        "test-host",
+        Agent::Claude,
+        "PermissionRequest",
+        r#"{"session_id":"current"}"#,
+    );
+
+    let ids: Vec<_> = fixture
+        .sessions()
+        .into_iter()
+        .map(|status| status.session.id)
+        .collect();
+    assert_eq!(ids, ["current"]);
 }
 
 #[test]
