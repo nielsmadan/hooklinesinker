@@ -21,10 +21,12 @@ pub(super) enum Command {
         #[arg(long, help = "Native agent event name")]
         event: String,
     },
-    #[command(about = "List currently running sessions")]
+    #[command(about = "List running sessions, or delete every session record")]
     Sessions {
-        #[arg(long, help = "Emit the versioned JSON envelope")]
+        #[arg(long, global = true, help = "Emit the versioned JSON envelope")]
         json: bool,
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
     },
     #[command(about = "List registered consumers")]
     Consumers {
@@ -64,6 +66,14 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: HooksCommand,
     },
+}
+
+#[derive(Clone, Copy, Subcommand)]
+pub(super) enum SessionsCommand {
+    #[command(
+        about = "Delete every session record, live, dead or retired; hooks and consumer registrations are kept"
+    )]
+    Reset,
 }
 
 #[derive(Clone, Copy, Subcommand)]

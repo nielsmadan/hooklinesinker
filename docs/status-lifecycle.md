@@ -136,7 +136,8 @@ latest mapped hook event and any child agents it is tracking (see
 working-to-idle event. Each input to the aggregate stays at its previous value until another
 relevant event arrives.
 
-Only ingest removes ledger records. `running()`, `sessions --json`, and `doctor`
+Only ingest removes ledger records, apart from an explicit
+[`sessions reset`](#reset). `running()`, `sessions --json`, and `doctor`
 filter or count dead bindings without deleting them. The next ingest sweep
 removes each dead binding and emits an event named `swept`, with `running: false`
 and a fresh `observedAt`. Sweeping preserves the last phase, so consumers must
@@ -240,6 +241,34 @@ Each agent sources child tracking differently:
 - **Pi** and **OpenCode** track children inside their adapters instead of this ledger — see
   [hooks and adapters](hooks-and-adapters.md).
 
+## Reset
+
+`sessions reset` deletes every `.json` record in the status directory under the ledger lock, so
+it waits for an ingest in progress and an ingest after it starts from an empty ledger. Live,
+dead, retired and unreadable records all go; a record is read only to tell whether its session
+is dead. Consumer registrations, the health log, hooks and the installed binaries are kept.
+
+Reset announces dead sessions the way the ingest sweep would. After releasing the lock it sends
+a `swept` event with `running: false` for each removed record the sweep would have removed and
+announced, so no push consumer keeps a dead row that no later event would clear. A sink that
+fails is recorded in the health log, as during ingest, and does not fail the reset.
+
+Reset sends nothing for live sessions. A `running:false` carries the session's terminal, and a
+consumer keyed on terminal identity would delete a live row that the session's next hook
+recreates moments later. A consumer that offers reset clears its own rows instead. One ingest
+can still send one: a Codex or Droid hook whose sink delivery straddles the reset re-reads its
+record after delivery, finds it gone and sends `running:false` for that session, which its next
+hook restores.
+
+Each running session reappears at its next hook, normally under the same `bindingId`, since the
+binding is derived from the session and its process. A session whose host was renamed since it
+started gets a new `bindingId`, because the record that carried its original binding across the
+rename is gone. Until then, state that only the ledger held is gone. Child agents that were
+already running no longer hold their root working: only a child's start event creates its
+entry, so the root reads its own phase until children started after the reset report. A binding
+retired before the reset is no longer protected from late hooks; a late end hook for it is
+stored as retired again and forwarded as `running:false`.
+
 ## Consumer contract and delivery
 
 [`protocol.rs`](../src/protocol.rs) defines the wire contract: camelCase keys,
@@ -306,6 +335,6 @@ unverifiable records, empty-ID fanout, late hooks, resume, and fork isolation,
 privacy, and polling before a later sweep;
 [`tests/lifecycle.rs`](../tests/lifecycle.rs) covers cross-agent replacement, independent
 sessions, marker migration and wire privacy; [`tests/cli.rs`](../tests/cli.rs) covers
-envelopes and ingest failure exits.
+envelopes, ingest failure exits and reset.
 See [hooks and adapters](hooks-and-adapters.md) for event production and host
 timeouts, and [installation](installation.md) for consumer registration.

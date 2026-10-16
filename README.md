@@ -51,6 +51,7 @@ See [installation](docs/installation.md) for the three installation lifecycles.
 hooklinesinker version [--json]                  # version + protocol major
 hooklinesinker --version                         # standard CLI version string
 hooklinesinker sessions [--json]                 # every live session (the point of all this)
+hooklinesinker sessions reset [--json]           # delete every session record; hooks and consumers stay
 hooklinesinker consumers [--json]                # who is registered
 hooklinesinker doctor [--json]                   # every self-check; nonzero on a real fault
 hooklinesinker install --consumer NAME [--sink URL]
@@ -134,7 +135,8 @@ is delivered to sinks but never stored, so it can never appear in `sessions --js
 `sessions --json` lists records oldest `observedAt` first, so a consumer replaying them in
 order ends on the newest record for each terminal.
 
-`sessions --json` and `doctor` never mutate the ledger. A record whose process is gone is
+`sessions --json` and `doctor` never mutate the ledger; `sessions reset` is the one
+explicit exception. A record whose process is gone is
 filtered out of both, and removed by the next `ingest`, which fans out one `running:false`
 event as it goes, so a poll landing between the kill and the next hook event cannot swallow
 that notification.
@@ -144,6 +146,24 @@ in the same process and terminal. Retired bindings ignore late hooks and can be 
 resumed. Independent server sessions and recognized child sessions are preserved. OpenCode
 sessions remain independent when another conversation is selected. The
 [status lifecycle](docs/status-lifecycle.md) documents identity checks and fork handling.
+
+`sessions reset --json` deletes every session record, live, dead or retired, and emits:
+
+```json
+{ "protocol": 1, "removed": 3, "problems": [] }
+```
+
+It exits 1 when the state store could not be opened, the ledger lock was not released within
+10 seconds (retry later), the status directory could not be listed, or a record could not be
+removed; and 0 otherwise, including when there was nothing to remove. The envelope is printed
+on exit 1 too, with `removed` counting what was deleted. Its problems are plain strings, as in
+`consumers --json`, and are also written to stderr as `problem: …` lines in both modes, so a
+caller that treats a nonzero exit as failure can show them without parsing stdout. Without
+`--json`, the `removed` line is printed only when the reset ran.
+Consumer registrations, hooks, the health log and the active binary are kept. Reset announces
+each dead session with the same `swept` event as the ingest sweep and sends nothing for live
+ones: each reappears with its next hook, normally under the same `bindingId` (see
+[reset](docs/status-lifecycle.md#reset) for the exceptions).
 
 `problems` is never dropped on the floor: a consumer that cannot answer must say so rather than
 report an empty, healthy-looking result.
@@ -188,6 +208,9 @@ Register a sink and receive every event as it happens.
    event racing your hydration must not create two rows.
 4. A `running:false` event removes the binding it names. Missed events are recoverable by
    re-running `sessions --json`; sink delivery is best-effort by design.
+5. `sessions reset` sends a `swept` event for each dead session and nothing for live ones. A
+   consumer that offers a reset drops its own rows once the command succeeds; other push
+   consumers keep live rows until each session's next event or their next hydration.
 
 This is Juggler's model (`juggler/Services/HooklinesinkerClient.swift`, `HookServer.swift`).
 
@@ -286,6 +309,12 @@ hooklinesinker consumers --json
 `doctor` exits nonzero on a real fault (unparseable records, drifted or unsupported hooks, a
 state root with the wrong permissions) and zero otherwise. Its `dead_records` check counts
 records whose process is gone; it does not remove them.
+
+When the ledger holds records that are wrong rather than dead, `hooklinesinker sessions reset`
+clears it for every consumer. Running sessions come back with their next hook. Push consumers
+keep the rows they already show, including the wrong ones, until they hydrate again; use the
+consumer's own reset when it offers one (Juggler: Settings → General → Reset Sessions), or
+restart it after resetting from the shell.
 
 ## Development
 

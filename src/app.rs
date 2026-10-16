@@ -10,12 +10,12 @@ use crate::paths;
 use crate::processes::{SystemProcessLiveness, SystemProcessLookup};
 use crate::protocol::{
     Agent, Capability, Consumer, ConsumersResponse, DoctorCheck, DoctorResponse, PROTOCOL_VERSION,
-    ProtocolResponse, SessionsResponse, VersionResponse,
+    ProtocolResponse, SessionsResetResponse, SessionsResponse, VersionResponse,
 };
 use crate::sinks::UreqHttpClient;
-use crate::state::{HealthKind, HealthProblem, SessionsEnvelope, StatusStore};
+use crate::state::{HealthKind, HealthProblem, ResetOutcome, SessionsEnvelope, StatusStore};
 use clap::Parser;
-use cli::{Cli, Command, HooksCommand};
+use cli::{Cli, Command, HooksCommand, SessionsCommand};
 use std::io::{self, Write};
 
 macro_rules! stdoutln {
@@ -30,7 +30,14 @@ pub fn run() {
     match cli.command {
         Command::Version { json } => print_version(json),
         Command::Ingest { agent, event } => run_ingest(agent, &event),
-        Command::Sessions { json } => run_sessions(json),
+        Command::Sessions {
+            json,
+            command: Some(SessionsCommand::Reset),
+        } => run_sessions_reset(json),
+        Command::Sessions {
+            json,
+            command: None,
+        } => run_sessions(json),
         Command::Consumers { json } => run_consumers(json),
         Command::Doctor { json } => run_doctor(json),
         Command::Install {
@@ -170,6 +177,53 @@ fn run_sessions(json: bool) {
     if !answered {
         std::process::exit(1);
     }
+}
+
+fn run_sessions_reset(json: bool) {
+    let (removed, problems) = match reset_ledger() {
+        Ok(outcome) => (Some(outcome.removed), outcome.problems),
+        Err(problem) => (None, vec![problem]),
+    };
+    for problem in &problems {
+        eprintln!("problem: {problem}");
+    }
+    let failed = !problems.is_empty();
+    if json {
+        print_json(&SessionsResetResponse {
+            protocol: PROTOCOL_VERSION,
+            removed: removed.unwrap_or(0),
+            problems,
+        });
+    } else if let Some(removed) = removed {
+        let noun = if removed == 1 { "record" } else { "records" };
+        stdoutln!("removed {removed} session {noun}");
+    }
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+fn reset_ledger() -> Result<ResetOutcome, String> {
+    let root = paths::state_root().map_err(|e| format!("failed to locate the state store: {e}"))?;
+    let store = StatusStore::open(&root)
+        .map_err(|e| format!("failed to open state store {}: {e}", root.display()))?;
+    let consumers = ConsumerStore::open(&root)
+        .inspect_err(|e| {
+            let _ = store.record_health(HealthProblem::new(
+                HealthKind::Other,
+                format!("failed to open consumer store: {e}"),
+            ));
+        })
+        .ok();
+    let liveness = SystemProcessLookup::new();
+    let http_client = UreqHttpClient::new();
+    let ctx = IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: consumers.as_ref(),
+        http_client: &http_client,
+    };
+    ingest::reset_sessions(&ctx).map_err(|e| e.to_string())
 }
 
 fn run_consumers(json: bool) {

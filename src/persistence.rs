@@ -15,6 +15,38 @@ pub(crate) struct JsonRecords<T> {
     pub problems: Vec<String>,
 }
 
+#[derive(Default)]
+pub(crate) struct JsonRecordPaths {
+    pub paths: Vec<std::path::PathBuf>,
+    pub problems: Vec<String>,
+}
+
+pub(crate) fn json_record_paths(dir: &Path, label: &str) -> io::Result<JsonRecordPaths> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(JsonRecordPaths::default());
+        }
+        Err(e) => return Err(e),
+    };
+    let (paths, problems): (Vec<_>, Vec<_>) = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|e| format!("failed to read {label} directory entry: {e}"))
+        })
+        .filter(|path| {
+            path.as_ref().map_or(true, |path| {
+                path.extension().and_then(|e| e.to_str()) == Some("json")
+            })
+        })
+        .partition(Result::is_ok);
+    Ok(JsonRecordPaths {
+        paths: paths.into_iter().filter_map(Result::ok).collect(),
+        problems: problems.into_iter().filter_map(Result::err).collect(),
+    })
+}
+
 // Both stores keep one JSON file per record and must report a bad file as a problem rather
 // than failing the whole read.
 pub(crate) fn read_json_records<T>(
@@ -22,27 +54,12 @@ pub(crate) fn read_json_records<T>(
     label: &str,
     parse: impl Fn(&Path, &[u8]) -> Result<T, String>,
 ) -> io::Result<JsonRecords<T>> {
+    let listed = json_record_paths(dir, label)?;
     let mut out = JsonRecords {
         records: Vec::new(),
-        problems: Vec::new(),
+        problems: listed.problems,
     };
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let path = match entry {
-            Ok(entry) => entry.path(),
-            Err(e) => {
-                out.problems
-                    .push(format!("failed to read {label} directory entry: {e}"));
-                continue;
-            }
-        };
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    for path in listed.paths {
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) => {

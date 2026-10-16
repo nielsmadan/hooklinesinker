@@ -4,7 +4,7 @@ use crate::children::{
     with_child,
 };
 use crate::lifecycle::{ChildClaim, SessionContext};
-use crate::persistence::{LockGuard, read_json_records, write_private_atomic};
+use crate::persistence::{LockGuard, json_record_paths, read_json_records, write_private_atomic};
 use crate::processes::{ProcessLiveness, Timestamp};
 use crate::protocol::{Agent, Phase, ProcessIdentity, StatusEvent};
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,12 @@ impl StoredStatus {
 #[derive(Default)]
 pub(crate) struct SweepOutcome {
     pub events: Vec<StatusEvent>,
+    pub problems: Vec<String>,
+}
+
+pub(crate) struct ResetOutcome {
+    pub removed: usize,
+    pub ended: Vec<StatusEvent>,
     pub problems: Vec<String>,
 }
 
@@ -490,12 +496,7 @@ impl StatusStore {
                 continue;
             }
             if current.is_some_and(|event| is_same_session_in_process(event, &stored.status)) {
-                if let Err(e) = remove_record(&path) {
-                    outcome.problems.push(format!(
-                        "failed to remove status record {}: {e}",
-                        path.display()
-                    ));
-                }
+                outcome.problems.extend(removal_problem(&path));
                 continue;
             }
             if retire_superseded
@@ -519,17 +520,11 @@ impl StatusStore {
                 }
             }
             if is_sweepable(&stored, liveness, now) {
-                if let Err(e) = remove_record(&path) {
-                    outcome.problems.push(format!(
-                        "failed to remove status record {}: {e}",
-                        path.display()
-                    ));
+                if let Some(problem) = removal_problem(&path) {
+                    outcome.problems.push(problem);
                     continue;
                 }
-                if stored.status.process.is_some() && !stored.retired {
-                    stored.status.running = false;
-                    outcome.events.push(stored.status);
-                }
+                outcome.events.extend(ended_status(stored));
             }
         }
         outcome
@@ -621,6 +616,41 @@ impl StatusStore {
             false,
             liveness,
         ))
+    }
+
+    pub(crate) fn reset<L: ProcessLiveness + ?Sized>(
+        &self,
+        liveness: &L,
+    ) -> io::Result<ResetOutcome> {
+        let _guard = self
+            .lock()
+            .map_err(|e| io::Error::new(e.kind(), format!("failed to lock the ledger: {e}")))?;
+        let listed = json_record_paths(&self.bindings_dir, "status").map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("failed to list {}: {e}", self.bindings_dir.display()),
+            )
+        })?;
+        let now = Timestamp::now();
+        let mut outcome = ResetOutcome {
+            removed: 0,
+            ended: Vec::new(),
+            problems: listed.problems,
+        };
+        for path in &listed.paths {
+            let stored = read_stored(path);
+            if let Some(problem) = removal_problem(path) {
+                outcome.problems.push(problem);
+                continue;
+            }
+            outcome.removed += 1;
+            outcome.ended.extend(
+                stored
+                    .filter(|stored| is_sweepable(stored, liveness, now))
+                    .and_then(ended_status),
+            );
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn record_health(&self, problem: HealthProblem) -> io::Result<()> {
@@ -919,6 +949,26 @@ fn is_live(event: &StatusEvent, liveness: &(impl ProcessLiveness + ?Sized)) -> b
         .process
         .as_ref()
         .is_some_and(|identity| liveness.process_is_alive(identity))
+}
+
+fn read_stored(path: &Path) -> Option<StoredStatus> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice::<StoredStatusWire>(&bytes)
+        .ok()
+        .map(StoredStatus::from)
+}
+
+fn removal_problem(path: &Path) -> Option<String> {
+    remove_record(path)
+        .err()
+        .map(|e| format!("failed to remove status record {}: {e}", path.display()))
+}
+
+fn ended_status(mut stored: StoredStatus) -> Option<StatusEvent> {
+    (stored.status.process.is_some() && !stored.retired).then(|| {
+        stored.status.running = false;
+        stored.status
+    })
 }
 
 fn remove_record(path: &Path) -> io::Result<()> {

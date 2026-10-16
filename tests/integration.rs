@@ -3559,3 +3559,169 @@ fn a_slow_sink_cannot_stretch_a_sweep_backlog_past_the_fanout_budget() {
         "the dropped events were not recorded: {problems:?}"
     );
 }
+
+#[test]
+fn reset_removes_every_status_record_including_retired_and_unparseable_ones() {
+    let fixture = RenameFixture::new();
+    let host = "MacBookPro.fritz.box";
+    fixture.ingest_on(
+        host,
+        Agent::Claude,
+        "UserPromptSubmit",
+        r#"{"session_id":"live"}"#,
+    );
+    let ended = r#"{"session_id":"ended"}"#;
+    fixture.ingest_on(host, Agent::Claude, "UserPromptSubmit", ended);
+    fixture.ingest_on(host, Agent::Claude, "SessionEnd", ended);
+    std::fs::write(fixture.root.join("status/broken.json"), "{").unwrap();
+    let foreign = fixture.root.join("status/notes.txt");
+    std::fs::write(&foreign, "kept").unwrap();
+    assert_eq!(ledger_files(&fixture.root), 3);
+
+    let outcome = fixture.store.reset(&all_alive()).unwrap();
+
+    assert_eq!(outcome.removed, 3);
+    assert_eq!(outcome.problems, Vec::<String>::new());
+    assert_eq!(ledger_files(&fixture.root), 0);
+    assert_eq!(std::fs::read_to_string(foreign).unwrap(), "kept");
+}
+
+#[test]
+fn reset_keeps_consumer_registrations_and_the_health_log() {
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    let consumers = ConsumerStore::open(&root).unwrap();
+    consumers
+        .register(&consumer("juggler", &["status"], None))
+        .unwrap();
+    store
+        .record_health(HealthProblem::new(HealthKind::Other, "sink unreachable"))
+        .unwrap();
+    store.record(&status_event()).unwrap();
+
+    assert_eq!(store.reset(&all_alive()).unwrap().removed, 1);
+
+    let names: Vec<String> = consumers
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|consumer| consumer.name)
+        .collect();
+    assert_eq!(names, ["juggler"]);
+    let messages: Vec<String> = store
+        .health_problems()
+        .unwrap()
+        .into_iter()
+        .map(|problem| problem.message)
+        .collect();
+    assert_eq!(messages, ["sink unreachable"]);
+}
+
+#[test]
+fn ingest_after_reset_records_the_session_again_under_its_binding() {
+    let fixture = RenameFixture::new();
+    let host = "MacBookPro.fritz.box";
+    let input = r#"{"session_id":"again"}"#;
+    fixture.ingest_on(host, Agent::Claude, "UserPromptSubmit", input);
+    let binding = fixture.sessions()[0].binding_id.clone();
+
+    fixture.store.reset(&all_alive()).unwrap();
+    fixture.ingest_on(host, Agent::Claude, "PreToolUse", input);
+
+    let sessions = fixture.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].binding_id, binding);
+    assert_eq!(
+        fixture.delivered(),
+        [
+            (binding.clone(), "UserPromptSubmit".to_string(), true),
+            (binding, "PreToolUse".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn reset_announces_dead_sessions_and_sends_nothing_for_live_ones() {
+    let fixture = RenameFixture::new();
+    let live = status("live-session", 801, 81);
+    let dead = status("dead-session", 802, 82);
+    fixture.store.record(&live).unwrap();
+    fixture.store.record(&dead).unwrap();
+    let liveness = FakeProcessLookup::new();
+    liveness.set_alive(801, "81");
+
+    let outcome = ingest::reset_sessions(&ingest::IngestContext {
+        store: &fixture.store,
+        liveness: &liveness,
+        consumers: Some(&fixture.consumers),
+        http_client: &fixture.client,
+    })
+    .unwrap();
+
+    assert_eq!(outcome.removed, 2);
+    assert_eq!(outcome.problems, Vec::<String>::new());
+    assert_eq!(ledger_files(&fixture.root), 0);
+    assert_eq!(
+        fixture.delivered(),
+        [(dead.binding_id, "swept".to_string(), false)]
+    );
+}
+
+#[test]
+fn reset_records_an_unreachable_sink_in_the_health_log_and_still_succeeds() {
+    let fixture = RenameFixture::new();
+    fixture
+        .store
+        .record(&status("dead-session", 803, 83))
+        .unwrap();
+
+    let outcome = ingest::reset_sessions(&ingest::IngestContext {
+        store: &fixture.store,
+        liveness: &FakeProcessLookup::new(),
+        consumers: Some(&fixture.consumers),
+        http_client: &FailingHttpClient,
+    })
+    .unwrap();
+
+    assert_eq!(outcome.removed, 1);
+    assert_eq!(outcome.problems, Vec::<String>::new());
+    let messages: Vec<String> = fixture
+        .store
+        .health_problems()
+        .unwrap()
+        .into_iter()
+        .map(|problem| problem.message)
+        .collect();
+    assert_eq!(
+        messages,
+        ["sink juggler failed: connection refused".to_string()]
+    );
+}
+
+#[test]
+fn reset_waits_for_the_ledger_lock() {
+    let root = temp_home();
+    let store = StatusStore::open(&root).unwrap();
+    store.record(&status_event()).unwrap();
+    let held = hooklinesinker::persistence::LockGuard::acquire(&root.join("status.lock")).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        done_tx
+            .send(store.reset(&all_alive()).unwrap().removed)
+            .unwrap();
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err()
+    );
+    drop(held);
+    assert_eq!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        1
+    );
+    handle.join().unwrap();
+}

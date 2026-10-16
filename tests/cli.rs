@@ -78,7 +78,7 @@ fn command_help_describes_the_primary_actions() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     for text in [
         "Own agent status hooks and serve normalized session state",
-        "List currently running sessions",
+        "List running sessions, or delete every session record",
         "Register a consumer and activate this binary",
         "Install, inspect, or remove agent hooks",
     ] {
@@ -815,10 +815,7 @@ fn dead_ledger_record(session_id: &str) -> String {
 #[test]
 fn doctor_counts_a_dead_record_without_removing_it() {
     let temp = unique_temp_dir("doctor-dead-record");
-    let status_dir = private_state_dir(&temp).join("status");
-    std::fs::create_dir_all(&status_dir).unwrap();
-    let record_path = status_dir.join("dead.json");
-    std::fs::write(&record_path, dead_ledger_record("dead-session")).unwrap();
+    let record_path = status_dir_with_records(&temp, &["dead-session"]).join("dead-session.json");
 
     let output = hooklinesinker_isolated(&temp)
         .args(["doctor", "--json"])
@@ -840,10 +837,7 @@ fn doctor_counts_a_dead_record_without_removing_it() {
 #[test]
 fn sessions_json_omits_a_dead_record_without_removing_it() {
     let temp = unique_temp_dir("sessions-dead-record");
-    let status_dir = temp.join("hooklinesinker/status");
-    std::fs::create_dir_all(&status_dir).unwrap();
-    let record_path = status_dir.join("dead.json");
-    std::fs::write(&record_path, dead_ledger_record("dead-session")).unwrap();
+    let record_path = status_dir_with_records(&temp, &["dead-session"]).join("dead-session.json");
 
     let output = Command::cargo_bin("hooklinesinker")
         .unwrap()
@@ -1090,5 +1084,245 @@ fn oversized_ingest_stdin_exits_zero_and_records_health() {
             .as_str()
             .unwrap()
             .contains("stdin exceeded the 1048576-byte cap")
+    );
+}
+
+fn status_dir_with_records(temp: &std::path::Path, session_ids: &[&str]) -> PathBuf {
+    let status_dir = private_state_dir(temp).join("status");
+    std::fs::create_dir_all(&status_dir).unwrap();
+    for session_id in session_ids {
+        std::fs::write(
+            status_dir.join(format!("{session_id}.json")),
+            dead_ledger_record(session_id),
+        )
+        .unwrap();
+    }
+    status_dir
+}
+
+fn json_file_count(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+        .count()
+}
+
+#[test]
+fn sessions_reset_removes_ledger_records_and_reports_the_count() {
+    let temp = unique_temp_dir("sessions-reset");
+    let status_dir = status_dir_with_records(&temp, &["first", "second"]);
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "removed 2 session records\n"
+    );
+    assert_eq!(json_file_count(&status_dir), 0);
+}
+
+#[test]
+fn sessions_reset_json_reports_the_versioned_envelope() {
+    let temp = unique_temp_dir("sessions-reset-json");
+    status_dir_with_records(&temp, &["only"]);
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"protocol": 1, "removed": 1, "problems": []})
+    );
+}
+
+#[test]
+fn sessions_reset_keeps_consumer_registrations_and_the_active_binary() {
+    let temp = unique_temp_dir("sessions-reset-keeps");
+    install_isolated(&temp);
+    status_dir_with_records(&temp, &["kept-around"]);
+
+    let reset = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset"])
+        .output()
+        .unwrap();
+    assert!(reset.status.success());
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["consumers", "--json"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["consumers"][0]["name"], "test");
+    assert!(temp.join("data/hooklinesinker/bin/hooklinesinker").exists());
+}
+
+#[test]
+fn sessions_reset_on_a_fresh_state_dir_reports_zero() {
+    let temp = unique_temp_dir("sessions-reset-fresh");
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["removed"], 0);
+}
+
+#[test]
+fn sessions_reset_fails_when_a_record_cannot_be_removed() {
+    let temp = unique_temp_dir("sessions-reset-stuck");
+    let status_dir = status_dir_with_records(&temp, &["removable"]);
+    std::fs::create_dir(status_dir.join("stuck.json")).unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["removed"], 1);
+    assert!(
+        value["problems"][0]
+            .as_str()
+            .unwrap()
+            .contains("failed to remove status record")
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("problem: failed to remove status record"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sessions_reset_reports_a_single_record_in_the_singular() {
+    let temp = unique_temp_dir("sessions-reset-one");
+    status_dir_with_records(&temp, &["only"]);
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "removed 1 session record\n"
+    );
+}
+
+#[test]
+fn sessions_reset_fails_when_the_state_store_cannot_be_opened() {
+    let temp = unique_temp_dir("sessions-reset-unopenable");
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::write(temp.join("hooklinesinker"), "not a directory").unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["removed"], 0);
+    let expected = format!(
+        "failed to open state store {}:",
+        temp.join("hooklinesinker").display()
+    );
+    assert!(
+        value["problems"][0]
+            .as_str()
+            .unwrap()
+            .starts_with(&expected),
+        "{value}"
+    );
+}
+
+#[test]
+fn sessions_reset_prints_no_count_when_the_state_store_cannot_be_opened() {
+    let temp = unique_temp_dir("sessions-reset-unopenable-plain");
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::write(temp.join("hooklinesinker"), "not a directory").unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("problem: failed to open state store"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sessions_reset_plain_fails_when_a_record_cannot_be_removed() {
+    let temp = unique_temp_dir("sessions-reset-stuck-plain");
+    let status_dir = status_dir_with_records(&temp, &["removable"]);
+    std::fs::create_dir(status_dir.join("stuck.json")).unwrap();
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "reset"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "removed 1 session record\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("problem: failed to remove status record"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sessions_json_before_reset_emits_the_envelope() {
+    let temp = unique_temp_dir("sessions-json-reset");
+    let status_dir = status_dir_with_records(&temp, &["only"]);
+
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "--json", "reset"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"protocol": 1, "removed": 1, "problems": []})
+    );
+    assert_eq!(json_file_count(&status_dir), 0);
+}
+
+#[test]
+fn sessions_help_lists_the_reset_subcommand() {
+    let output = Command::cargo_bin("hooklinesinker")
+        .unwrap()
+        .args(["sessions", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("reset") && stdout.contains("delete every session record"),
+        "{stdout}"
     );
 }

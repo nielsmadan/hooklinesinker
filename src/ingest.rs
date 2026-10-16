@@ -7,7 +7,8 @@ use crate::processes::ProcessLookup;
 use crate::protocol::{Agent, StatusEvent};
 use crate::sinks::{HttpClient, SinkFanout};
 use crate::state::{
-    CurrentStatus, HealthKind, HealthProblem, IngestSessionOutcome, StatusStore, SweepOutcome,
+    CurrentStatus, HealthKind, HealthProblem, IngestSessionOutcome, ResetOutcome, StatusStore,
+    SweepOutcome,
 };
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
@@ -138,6 +139,21 @@ pub(crate) fn handle_ingest(
     }
 
     IngestOutcome { problem }
+}
+
+// A consumer whose sink is down must not turn a completed reset into a failed one.
+pub(crate) fn reset_sessions(ctx: &IngestContext) -> io::Result<ResetOutcome> {
+    let mut outcome = ctx.store.reset(ctx.liveness)?;
+    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
+    let delivery = fan_out_to_sinks(ctx, None, outcome.ended.clone(), deadline).problems;
+    if !delivery.is_empty()
+        && let Err(e) = ctx.store.record_health_many(delivery)
+    {
+        outcome
+            .problems
+            .push(format!("failed to record health problems: {e}"));
+    }
+    Ok(outcome)
 }
 
 fn record_session(

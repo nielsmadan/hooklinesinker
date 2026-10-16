@@ -58,6 +58,14 @@ pub struct ConsumersResponse {
     pub problems: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionsResetResponse {
+    pub protocol: u16,
+    pub removed: usize,
+    pub problems: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookState {
@@ -381,6 +389,17 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(consumers.consumers, [] as [crate::protocol::Consumer; 0]);
+
+        let reset: SessionsResetResponse = serde_json::from_value(serde_json::json!({
+            "protocol": 1,
+            "removed": 2,
+            "problems": ["stuck record"]
+        }))
+        .unwrap();
+        assert_eq!(
+            (reset.removed, reset.problems),
+            (2, vec!["stuck record".to_string()])
+        );
 
         let doctor: DoctorResponse = serde_json::from_value(serde_json::json!({
             "protocol": 1,

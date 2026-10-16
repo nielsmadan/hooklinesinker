@@ -61,10 +61,12 @@ optional fields are safe; anything else needs a protocol bump and both consumers
 - **Reconcile, never overwrite.** Installers rewrite only the group carrying this tool's
   generated marker, and preserve foreign entries and unknown shapes verbatim
   (`HookState::Unsupported` exists so an unfamiliar config is left alone rather than rewritten).
-- **Only `ingest` deletes from the ledger.** `running()`, `sessions --json` and `doctor`
+- **Only `ingest` sweeps the ledger.** `running()`, `sessions --json` and `doctor`
   filter dead bindings out of their results but leave the files alone; the sweep inside
   `ingest` removes them and fans out the `running:false` event push consumers depend on. A
   read that deleted would swallow that event, and Juggler has no re-hydration timer.
+  `sessions reset` is the one other deleter: an explicit user wipe that announces dead
+  bindings as the sweep does and deliberately sends nothing for live ones.
 - **An empty `session.id` is never recorded.** Such an event is normalized and fanned out to
   sinks (consumers key rows on terminal identity) but kept out of the ledger: its binding is
   hashed over an empty id and would outlive every real session in the same live process.
