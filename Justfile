@@ -45,7 +45,7 @@ build-release *TARGETS:
 
 [positional-arguments]
 release *args:
-    python3 scripts/release.py "$@"
+    @curtains "$@"
 
 # Build and drop a fresh binary straight onto the active install, bypassing version
 # promotion (which reuses an equal version and would ignore a rebuilt one). For local

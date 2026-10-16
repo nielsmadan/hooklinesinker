@@ -338,8 +338,9 @@ just release --dry-run
 just release
 ```
 
-Run from a clean, current `main` checkout. The helper proposes a version from Git tags, runs
-checks, and asks for confirmation before preparing and pushing the release commit and tag.
+Install [curtains](https://github.com/nielsmadan/curtaincall) first, then run from a clean,
+current `main` checkout. It proposes a version from Git tags, runs checks, and asks for
+confirmation before preparing and pushing the release commit and tag.
 It needs Git credentials; GitHub CLI authentication is used only inside Actions.
 
 The tag workflow builds and automatically publishes the release with macOS/Linux binaries

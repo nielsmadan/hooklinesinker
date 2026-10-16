@@ -62,12 +62,14 @@ Verify a staged/downloaded artifact against its `SHA256SUMS` before executing or
 
 ## Prepare and publish a release
 
-Run from clean `main` with complete Git history, an up-to-date origin history, matching
-latest local/origin version tags, and Git credentials able to push. Local commits ahead of
-origin are allowed and included in the push. Origin must match the configured repository
-and use one matching fetch/push destination. Policy lives in
-[`scripts/release.json`](../scripts/release.json); [`release.py`](../scripts/release.py)
-enforces it without requiring a local GitHub CLI or GitHub token.
+Releases use [`curtains`](https://github.com/nielsmadan/curtaincall); install it first, as
+its README describes. Run from clean `main` with complete Git history, Git 2.45+, and Git
+credentials able to push. The fetched `origin/main` must be an ancestor of `HEAD`; local
+commits ahead of origin are allowed and included in the push, but curtains never fetches.
+Every `vMAJOR.MINOR.PATCH` tag must exist both locally and on origin and point to the same
+commit. Origin must use one matching fetch/push destination. Policy lives in
+[`scripts/release.json`](../scripts/release.json); curtains enforces it without requiring a
+local GitHub CLI or GitHub token.
 
 ```sh
 just release
@@ -77,19 +79,18 @@ just release --dry-run
 just release patch --yes
 ```
 
-The helper derives its base from the latest numeric `vMAJOR.MINOR.PATCH` tag, not from
+Curtains derives its base from the latest numeric `vMAJOR.MINOR.PATCH` tag, not from
 `Cargo.toml`. Features propose minor, fixes propose patch, and breaking changes propose
 major (minor during `0.x`); maintenance-only changes need an explicit bump. The initial
 proposal is `1.0.0`. Editing the Cargo version alone does not advance the release baseline.
 
 The normal command runs `just check`, then shows the proposal for confirmation. Enter `y`
 to proceed, a version or `patch`/`minor`/`major` to revise it, or Enter to cancel.
-`--dry-run` still checks tools and reads local/origin state, but skips tests, edits and
-publication. `--yes` confirms unattended use; other nonterminal invocations fail.
+`--dry-run` reads local/origin state, but skips the tool check, tests, edits and publication. `--yes` confirms unattended use; other nonterminal invocations fail.
 
 After confirmation, it rechecks the checkout and remote state. Then
 [`prepare_release.py`](../scripts/prepare_release.py) updates `Cargo.toml` and uses offline
-Cargo metadata to update `Cargo.lock` with the existing resolution. The helper commits
+Cargo metadata to update `Cargo.lock` with the existing resolution. Curtains commits
 changed release files, creates an annotated tag and atomically pushes `main` and that tag.
 It prints a tag-filtered Actions URL and returns after the push.
 The [tag workflow](../.github/workflows/release.yml) first runs adapter, Python, formatting,
@@ -109,4 +110,4 @@ consumer bundles the newer helper first activates it for all of them.
 
 Failed preparation or push leaves local files, commits or tags available for inspection.
 A failed workflow leaves the remote tag in place. Inspect the Actions failure and fix or
-rerun the workflow; never replace a public tag. The local helper does not automatically resume.
+rerun the workflow; never replace a public tag. Curtains does not automatically resume.
