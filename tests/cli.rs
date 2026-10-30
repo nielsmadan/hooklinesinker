@@ -223,6 +223,55 @@ fn hooks_install_honors_qwen_home_override() {
 }
 
 #[test]
+fn hooks_accept_home_relative_configs_under_the_callers_home() {
+    let temp = unique_temp_dir("hooks-home-relative");
+    let home = temp.join("home");
+    let run = |args: &[&str]| {
+        let output = hooklinesinker_isolated(&temp)
+            .env_remove("XDG_DATA_HOME")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        output
+    };
+    run(&["install", "--consumer", "test"]);
+    run(&["hooks", "install", "--agent", "claude"]);
+
+    let binary = home.join(".local/share/hooklinesinker/bin/hooklinesinker");
+    let settings_path = home.join(".claude/settings.json");
+    let settings = std::fs::read_to_string(&settings_path).unwrap().replace(
+        binary.to_str().unwrap(),
+        "~/.local/share/hooklinesinker/bin/hooklinesinker",
+    );
+    std::fs::write(&settings_path, &settings).unwrap();
+
+    let template = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("adapters/opencode-hooklinesinker.ts"),
+    )
+    .unwrap();
+    let plugin = format!(
+        "// hooklinesinker-generated protocol=1\n{}",
+        template.replace(
+            "join(homedir(), \"__HOOKLINESINKER_BIN__\")",
+            "join(homedir(), \".local/share/hooklinesinker/bin/hooklinesinker\")"
+        )
+    );
+    let plugin_path = home.join(".config/opencode/plugins/hooklinesinker-opencode.ts");
+    std::fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+    std::fs::write(&plugin_path, &plugin).unwrap();
+
+    for agent in ["claude", "opencode"] {
+        let status = run(&["hooks", "status", "--agent", agent, "--json"]);
+        let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(value["state"], "installed", "{agent}");
+        run(&["hooks", "install", "--agent", agent]);
+    }
+    assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), settings);
+    assert_eq!(std::fs::read_to_string(&plugin_path).unwrap(), plugin);
+}
+
+#[test]
 fn hooks_install_writes_the_opencode_plugin_and_reports_it() {
     let temp = unique_temp_dir("hooks-install-opencode");
     install_isolated(&temp);

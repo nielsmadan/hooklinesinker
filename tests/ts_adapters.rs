@@ -215,8 +215,8 @@ fn adapters_carry_the_binary_placeholder() {
     for asset in [PI_ADAPTER, OPENCODE_ADAPTER] {
         let source = std::fs::read_to_string(repo_root().join(asset)).unwrap();
         assert!(
-            source.contains("__HOOKLINESINKER_BIN__"),
-            "{asset} lost the placeholder the installer rewrites"
+            source.contains("join(homedir(), \"__HOOKLINESINKER_BIN__\")"),
+            "{asset} lost the binary expression the installer rewrites"
         );
     }
 }
@@ -346,6 +346,22 @@ fn pi_session_start_accepts_hosts_without_a_reason() {
         run.stdin(0),
         &serde_json::json!({"session_id": "pi-parent"})
     );
+}
+
+#[test]
+fn home_relative_adapters_resolve_the_binary_through_home() {
+    for (scenario, events) in [
+        ("pi:start_without_reason:home-relative", ["session_start"]),
+        (
+            "opencode:load_posts_created:home-relative",
+            ["session.created"],
+        ),
+    ] {
+        let Some(run) = run(scenario) else {
+            return;
+        };
+        assert_eq!(run.events(), events, "{scenario}");
+    }
 }
 
 #[test]

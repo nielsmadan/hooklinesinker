@@ -12,7 +12,7 @@
 //                     subscribedChannels, elapsedMs } }
 
 import { mkdirSync, chmodSync, writeFileSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const [repoRoot, workdir] = process.argv.slice(2);
@@ -33,6 +33,8 @@ const OPENCODE_ADAPTER = join(repoRoot, "adapters/opencode-hooklinesinker.ts");
 // The shipped budget stays pinned by a Rust test; scenarios that are not timing the budget
 // only need it to be far larger than any spawn.
 const RELAXED_HOOK_TIMEOUT_MS = 60000;
+const BIN_EXPRESSION = 'join(homedir(), "__HOOKLINESINKER_BIN__")';
+const HOME_RELATIVE_SUFFIX = ":home-relative";
 
 // Keep every pi scenario's session_start scan off the developer's real pi-subagents temp root.
 const PI_EMPTY_ASYNC_ROOT = join(workdir, "pi-empty-async-root");
@@ -74,13 +76,19 @@ ${recorderTail(scenario)}
   writeFileSync(binPath, recorder);
   chmodSync(binPath, 0o755);
 
-  // The adapters carry a placeholder the installer rewrites; do the same substitution here so
-  // the shipped asset is exercised verbatim apart from the binary path.
+  // The adapters carry an expression the installer rewrites; do the same substitution here so
+  // the shipped asset is exercised verbatim apart from the binary expression. A home-relative
+  // scenario resolves the binary through `homedir()` with HOME pointed at the scenario dir.
   const source = readFileSync(assetPath, "utf8");
-  if (!source.includes("__HOOKLINESINKER_BIN__")) {
-    throw new Error(`${assetPath} has no __HOOKLINESINKER_BIN__ placeholder`);
+  if (!source.includes(BIN_EXPRESSION)) {
+    throw new Error(`${assetPath} has no ${BIN_EXPRESSION} expression`);
   }
-  let staged = source.replaceAll("__HOOKLINESINKER_BIN__", binPath);
+  const home = scenario.endsWith(HOME_RELATIVE_SUFFIX) ? dir : undefined;
+  const binExpression =
+    home === undefined
+      ? JSON.stringify(binPath)
+      : `join(homedir(), ${JSON.stringify(relative(home, binPath))})`;
+  let staged = source.replaceAll(BIN_EXPRESSION, binExpression);
 
   // Only scenarios that time out on purpose are about the hook budget. Everywhere else a loaded
   // machine could let the real 2s deadline kill a spawn mid-handshake and silently drop the
@@ -115,7 +123,7 @@ ${recorderTail(scenario)}
   };
   // A distinct path per scenario means a distinct module instance, so no adapter state leaks
   // between scenarios.
-  return { adapterPath, invocations, pids };
+  return { adapterPath, invocations, pids, home };
 }
 
 function runningPids(pids) {
@@ -205,6 +213,7 @@ async function runPi(scenario, adapterPath, invocations) {
       break;
 
     case "pi:start_without_reason":
+    case "pi:start_without_reason:home-relative":
       await lifecycle.get("session_start")({}, ctx);
       break;
 
@@ -618,6 +627,7 @@ async function runOpenCode(scenario, adapterPath) {
       break;
 
     case "opencode:load_posts_created":
+    case "opencode:load_posts_created:home-relative":
     case "opencode:hanging_binary:hang":
       break;
 
@@ -1121,6 +1131,7 @@ async function runOpenCode(scenario, adapterPath) {
 const SCENARIOS = [
   [PI_ADAPTER, "pi:session_switches"],
   [PI_ADAPTER, "pi:start_without_reason"],
+  [PI_ADAPTER, "pi:start_without_reason:home-relative"],
   [PI_ADAPTER, "pi:permission_lifecycle"],
   [PI_ADAPTER, "pi:permission_after_switch"],
   [PI_ADAPTER, "pi:malformed_permission_payloads"],
@@ -1150,6 +1161,7 @@ const SCENARIOS = [
   [PI_ADAPTER, "pi:queue_bound:slow"],
   [PI_ADAPTER, "pi:queue_bound"],
   [OPENCODE_ADAPTER, "opencode:load_posts_created"],
+  [OPENCODE_ADAPTER, "opencode:load_posts_created:home-relative"],
   [OPENCODE_ADAPTER, "opencode:selection_and_status_are_serialized"],
   [OPENCODE_ADAPTER, "opencode:instance_disposal_removes_known_sessions"],
   [OPENCODE_ADAPTER, "opencode:status_becomes_event_suffix"],
@@ -1194,11 +1206,14 @@ const SCENARIOS = [
 
 const report = {};
 for (const [assetPath, scenario] of SCENARIOS) {
-  const { adapterPath, invocations, pids } = stage(assetPath, scenario);
+  const { adapterPath, invocations, pids, home } = stage(assetPath, scenario);
   const started = Date.now();
+  const previousHome = process.env.HOME;
+  if (home !== undefined) process.env.HOME = home;
   const result = scenario.startsWith("pi:")
     ? await runPi(scenario, adapterPath, invocations)
     : await runOpenCode(scenario, adapterPath);
+  process.env.HOME = previousHome;
   const runningPids = await waitForPidsToExit(pids());
   report[scenario] = {
     invocations: invocations(),

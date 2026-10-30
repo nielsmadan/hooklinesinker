@@ -29,6 +29,15 @@ impl HookTarget {
             _ => timeout.as_secs(),
         }
     }
+
+    // True only for hosts known to run hook commands through a POSIX shell, which expands `~/`
+    // and `$HOME/`. Kimi keeps exact-match ownership; the TypeScript hosts have no commands.
+    pub(crate) const fn accepts_home_relative_commands(self) -> bool {
+        match self {
+            Self::ClaudeJson | Self::CodexJson | Self::DroidJson | Self::QwenJson => true,
+            Self::OpenCodeTypeScript | Self::PiTypeScript | Self::KimiToml => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

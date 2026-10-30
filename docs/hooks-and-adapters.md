@@ -14,14 +14,26 @@ handlers, and installation adds fresh owned groups. Foreign handlers inside mixe
 retain their group metadata, including prompt, agent and unknown handler shapes.
 Ownership uses a command handler's canonical command, including agent and event; JSON also
 recognizes a standalone hooklinesinker invocation at an old binary path as drift.
+A JSON command whose binary word starts with `~/` or `$HOME/` and expands to the active
+binary is installed, not drifted, so a config manager that renders home-relative commands
+and hooklinesinker agree. This holds only for hosts that run hook commands through a POSIX
+shell (`HookTarget::accepts_home_relative_commands`): Claude and Codex, observed recording
+status from `~/` commands; Qwen, whose Unix hook runner spawns `bash -c`; and Droid, whose
+hooks documentation describes hooks as shell commands and shows a user hook with a `~/`
+redirect. Installation writes the absolute path for groups it adds, and leaves an event's
+groups untouched when that event is already installed: its only owned handler is one group
+of the exact installed shape. [Decision 0005](decisions/0005-home-relative-ownership.md)
+records why.
 Drift and legacy matching require plain command words; shell wrappers, substitutions,
 redirections and compound commands are preserved as foreign. Status exposes only groups
 containing a single recognized command handler as owned.
 
 An unsupported hooks shape, including a non-array value under a managed event,
 produces `unsupported` without rewriting the file. Invalid JSON/TOML produces an
-error. Preservation of foreign JSON values does not promise original whitespace:
-successful reconciliation renders the document again and replaces it atomically.
+error. Install does not write a file whose status is installed, except to remove legacy
+Juggler handlers, which status does not count. A reconciliation that changes something
+renders the document again, keeping key order and the file's mode but not its original
+whitespace, and replaces it atomically.
 
 Kimi uses TOML `[[hooks]]` entries. Its installer uses `toml_edit`, writes only
 `event`, `command`, and `timeout`, and removes only exact canonical-command matches.
@@ -35,9 +47,12 @@ that file. `hooks status --agent codex --json` exposes each owned entry's event,
 group index, and command so the host can compute trust for the installed group.
 Installing a group does not approve it.
 
-Hook status validates the complete canonical shape of each owned JSON/TOML entry,
-including matcher, timeout, command, and duplicate ownership. Foreign entries remain
-outside that comparison. TypeScript status compares the complete generated content.
+Hook status validates the complete shape of each owned JSON/TOML entry, including matcher,
+timeout, command, and duplicate ownership; an owned handler inside a mixed group counts as a
+duplicate. JSON compares that shape with the command as written, so an accepted home-relative
+spelling stays installed; Kimi requires the canonical command. Status and install share one
+per-event predicate. Foreign entries remain outside that comparison. TypeScript status compares
+the complete file with the generated content or its home-relative variant.
 
 ## Runtime bounds and event semantics
 
@@ -76,9 +91,17 @@ named above, but a new agent cannot silently omit one of these cross-cutting cho
 
 [`opencode-hooklinesinker.ts`](../adapters/opencode-hooklinesinker.ts) and
 [`pi-hooklinesinker.ts`](../adapters/pi-hooklinesinker.ts) are source assets
-embedded with Rust `include_str!`. Installation substitutes
-`__HOOKLINESINKER_BIN__` and prepends a protocol ownership marker. Adapter edits
-reach installed files after rebuilding the binary and reinstalling the hook.
+embedded with Rust `include_str!`. Installation replaces the
+`join(homedir(), "__HOOKLINESINKER_BIN__")` expression with the binary's absolute path as a
+string literal, which unlike `homedir()` does not depend on the agent's `$HOME`, drops the
+imports only that expression uses, and prepends a protocol ownership marker. A marked file
+that keeps the expression, with the binary's path relative to `$HOME`, is also installed. Both
+comparisons are byte for byte against the current template, so an external renderer must
+reproduce the marker line and template exactly and follow template changes between releases.
+An installed file that is not group- or world-writable is not rewritten; any rewrite leaves it
+`0600`, because the agent loads it as code. Install refuses a group- or world-writable plugin
+directory even when the file is already installed. Adapter edits reach installed files after
+rebuilding the binary and reinstalling the hook.
 
 An unmarked file at the generated path is foreign and remains untouched.
 Marked content that differs from the current template is drifted and can be

@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
-const HOOKLINESINKER_BIN: string = "__HOOKLINESINKER_BIN__";
+const HOOKLINESINKER_BIN: string = join(homedir(), "__HOOKLINESINKER_BIN__");
 
 const TRACKED_EVENTS = new Set([
   "session.created",

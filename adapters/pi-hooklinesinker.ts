@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 
-const HOOKLINESINKER_BIN: string = "__HOOKLINESINKER_BIN__";
+const HOOKLINESINKER_BIN: string = join(homedir(), "__HOOKLINESINKER_BIN__");
 
 const HOOK_TIMEOUT_MS = 2000;
 const MAX_PENDING_HOOKS = 32;

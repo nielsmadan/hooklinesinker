@@ -250,9 +250,11 @@ Hooks are written into each agent's own configuration, and nowhere else:
 `$OPENCODE_CONFIG_DIR/plugins/hooklinesinker-opencode.ts`,
 `$PI_CODING_AGENT_DIR/extensions/hooklinesinker-pi.ts`, `~/.factory/hooks.json`,
 `$QWEN_HOME/settings.json`, and `$KIMI_CODE_HOME/config.toml`. Entries this tool wrote are
-identified by their exact canonical `command` (and the generated OpenCode/Pi plugin files
+identified by their `command` naming this binary (and the generated OpenCode/Pi plugin files
 also carry an ownership marker), so an install reconciles its own entries and leaves
-everyone else's alone.
+everyone else's alone. An entry or plugin that a config manager renders with a home-relative
+path to the active binary counts as installed and is left as written; see
+[hooks and adapters](docs/hooks-and-adapters.md#configuration-ownership).
 
 Kimi's hook events (`TurnStarted`, `SessionHeartbeat`, etc.) require Kimi Code CLI **0.32.0** or
 later; `hooks install --agent kimi` writes hooks regardless, but they only fire on a new-enough

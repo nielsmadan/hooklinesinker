@@ -3160,6 +3160,7 @@ fn hook_manager_at(base: &std::path::Path, binary_path: PathBuf) -> HookManager 
         qwen_config_dir: base.join("qwen"),
         kimi_code_dir: base.join("kimi-code"),
         binary_path,
+        home: base.join("home"),
     })
 }
 

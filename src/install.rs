@@ -417,6 +417,7 @@ mod tests {
             qwen_config_dir: base.join("qwen"),
             kimi_code_dir: base.join("kimi-code"),
             binary_path: install.binary_path(),
+            home: base.join("home"),
         })
     }
 
