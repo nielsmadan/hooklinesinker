@@ -180,20 +180,23 @@ mapped `permission` sets it `permission` (this includes Codex `PreToolUse` for
 `request_user_input`, which the ordinary event mapping marks `idle` but which counts as
 `permission` once it is a tracked child waiting on the user); anything else mapped `working` or
 `compacting` sets it `working`; everything else sets it `idle`. A child event never changes the
-session's own phase and never creates a ledger record for the child itself. The update is
-persisted when the session's aggregate phase, terminal, or tmux identity changed, or the child
-map itself did; it reaches sinks only when phase, terminal, or tmux changed — a child-map-only
-change is written but not forwarded. The forwarded event carries the session's own binding ID,
-session, and process, with `event` set to `child:` followed by the child's event name (so a
+session's own phase or `session` details and never creates a ledger record for the child
+itself; its tool does feed the session's `activity.tool` (see [session details](#session-details)).
+The update is persisted when anything in the session's forwarded status other than `event` and
+`observedAt` changed, or the child map or hold did; it reaches sinks only in the first case. That
+includes `activity.subagents`, so a child starting or stopping is forwarded even when the
+aggregate phase stays the same; a change to the child map or hold alone is written but not
+forwarded. The forwarded
+event carries the session's own binding ID, session, and process, with `event` set to `child:` followed by the child's event name (so a
 consumer never sees a bare `UserPromptSubmit` from a child) and `observedAt` from the child
 event. When the child event comes from the session's own process, its `terminal`, `tmux`,
 `git`, and `remote_host` are refreshed from the child event, which keeps a tmux attach/detach
-reported correctly; a git- or remote-host-only change does not by itself make the update
-persist or forward.
+reported correctly.
 
 Fan-out to sinks runs after the ledger lock is released, so two concurrent children can deliver
 out of order. After fan-out, hooklinesinker re-reads the session's stored record and, if its
-phase or `running` no longer matches what was just sent, sends it once more — reusing the first
+phase, `running`, `session` or `activity` no longer matches what was just sent, sends it once
+more — reusing the first
 fan-out's remaining time budget rather than opening a fresh one, and skipping the re-check
 entirely when the first fan-out had no consumers. If the record is gone because a Droid child's
 stray record was folded into its parent meanwhile, the parent's status is sent first and the
@@ -227,7 +230,7 @@ Each agent sources child tracking differently:
   Droid wakes an idle parent with a `UserPromptSubmit` once a background Task child finishes,
   so a child's own `Stop` that takes it from non-`idle` to `idle` and would otherwise settle the
   aggregate `idle` while the parent's own phase is `idle` or `unknown` instead sets `held`: the
-  aggregate stays `working` and nothing is forwarded. A child that goes idle any other way (its
+  aggregate stays `working`, and what is forwarded is only the lower `activity.subagents`. A child that goes idle any other way (its
   `SessionEnd` when a task is killed, an `idle_prompt` `Notification`) releases the parent as
   before, since no wake follows it. Any event of the parent's own (the wake,
   its `Stop`, `SessionStart`, `SessionEnd`) or its retirement clears `held`; other children's
@@ -240,6 +243,60 @@ Each agent sources child tracking differently:
   `children` map is kept, and Claude's `SubagentStop` stays outside the installed vocabulary.
 - **Pi** and **OpenCode** track children inside their adapters instead of this ledger — see
   [hooks and adapters](hooks-and-adapters.md).
+
+## Session details
+
+Each record carries optional session details: `session.title`, `session.model`,
+`session.effort`, `session.permissionMode`, and an `activity` object with `tool`, `problem`,
+`subagents`, `contextPercent` and `turns`. Normalization reads them from the hook input in a
+second, lenient pass over the JSON, so a missing or wrongly typed detail is skipped and never
+fails the event. For each value it records one of three outcomes: absent (keep the stored value),
+an explicit JSON `null` (clear it), or a value (set it). Text is trimmed, stripped of control and
+format characters (Unicode Cc and Cf, except the zero-width joiner that emoji sequences use),
+capped at 120 Unicode scalars, and, when the cap cut it, stripped of a trailing joiner or
+combining mark; text that ends up empty clears the value. A percentage is any JSON number,
+rounded and clamped to 0–100.
+
+[`ingest_session`](../src/state.rs) merges these with the binding's stored record under the
+ledger lock, using the merge rules in [`details.rs`](../src/details.rs), and every stored and forwarded record carries the merged values:
+
+- **`session.title`, `model`, `effort`, `permissionMode`** keep the stored value unless the
+  event sets or clears them. A model that replaces a different known model clears `effort`,
+  unless the same event also sets it. Events from a subagent (a Claude event carrying an
+  `agent_id`, and every child event) never change these four.
+- **A new binding** is merged against the stored record it supersedes, the previous foreground
+  conversation of the same agent and process (Claude's `/clear`), including one already
+  retired by its `SessionEnd`. It takes `model`, `effort` and `permissionMode` from it, never
+  `title` or anything in `activity`.
+- **`activity.tool`** is cleared when a turn starts, then the event's own value applies; it is
+  cleared when the session's own phase or its aggregate phase leaves `working` or `permission`,
+  and otherwise kept. A
+  child's tool feeds the session's tool, and is cleared when the aggregate phase leaves
+  `working` or `permission`.
+- **`activity.problem`** is set by a failed turn and kept, through idle, until the next turn
+  starts. It is a snake_case token: the agent's error value in snake_case, or `interrupted`.
+- **`activity.contextPercent`** keeps the stored value unless the event sets or clears it. A
+  compaction clears it: any event that maps to `compacting` (`PreCompact`, Pi's
+  `session_before_compact`) and a `SessionStart` whose `source` is `clear` or `compact`.
+- **`activity.subagents`** counts the tracked children that are not `idle` for Codex and Droid.
+  For Claude it is the number of live entries in `background_tasks[]` when the event carries
+  that array, and otherwise the stored count, reset to 0 when a turn starts. Other agents report
+  0.
+- **`activity.turns`** counts the binding's turn starts (`UserPromptSubmit`; Kimi `TurnStarted`;
+  Pi `agent_start`). It is stored with the record, survives every other event, and starts at 0 for
+  a new binding, including the one a `/clear` creates. A `Stop` held at `working`, Pi's held
+  settle, child events and annotations never count a turn, so the count stays right while a
+  session is held working across a turn boundary. Records from older binaries read as 0.
+
+Some events only annotate a session. They are recorded but not forwarded, so a model switch or similar refresh adds no delivery and cannot change a phase: the stored record
+takes their details and keeps its phase, hold, children and retirement state, and the values
+reach consumers with the session's next forwarded event. An annotation for a binding with no
+live record changes nothing and creates no record, and one without a session ID is ignored.
+
+Droid's `PostToolUse` is a refresh: it changes details the same way, clearing the tool, but is
+forwarded when that changes the stored record. It keeps the session's phase, and a linked
+child's refresh keeps that child's phase and is forwarded as `child:PostToolUse`. A refresh
+with nothing to change, or for a binding with no live record, sends nothing.
 
 ## Reset
 
@@ -311,6 +368,9 @@ persisted or forwarded; tool inputs, outputs, prompts, task names/results, and
 `background_tasks[]` descriptions or commands do not enter status records, and a child's raw
 session or agent ID is never stored, only its digest. JSON errors report position without the
 offending value. A transcript path is metadata; ingest does not open the transcript.
+[Session details](#session-details) are read from named fields in a separate lenient pass and
+pass a sanitizer before they are stored; prompt text, tool input and output, message bodies and
+tool error text are never read.
 
 Handled ingest failures exit zero and record health when the store is available; ingest
 also prints the joined problem to stderr, which agent hosts ignore. An event name outside

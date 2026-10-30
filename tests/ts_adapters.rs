@@ -287,10 +287,10 @@ fn both_adapters_share_one_run_hook_implementation() {
 
     let translated = opencode
         .replace("\"opencode\"", "\"pi\"")
-        .replace("  cwd,", "  reason,")
+        .replace("  cwd,", "  fields,")
         .replace(
             "if (cwd) native.cwd = cwd;",
-            "if (reason) native.reason = reason;",
+            "Object.assign(native, fields);",
         );
     assert_eq!(
         translated, pi,
@@ -325,10 +325,12 @@ fn pi_session_starts_forward_the_native_switch_reason() {
     );
     for (index, reason) in ["new", "resume", "fork", "reload"].iter().enumerate() {
         let id = format!("pi-{reason}");
-        assert_eq!(
-            run.stdin(index * 2 + 1),
-            &serde_json::json!({"session_id": id, "reason": reason})
-        );
+        let expected = if matches!(*reason, "new" | "fork") {
+            serde_json::json!({"session_id": id, "reason": reason, "session_title": null})
+        } else {
+            serde_json::json!({"session_id": id, "reason": reason})
+        };
+        assert_eq!(run.stdin(index * 2 + 1), &expected);
         assert_eq!(
             run.stdin(index * 2 + 2),
             &serde_json::json!({"session_id": id})
@@ -362,6 +364,145 @@ fn home_relative_adapters_resolve_the_binary_through_home() {
         };
         assert_eq!(run.events(), events, "{scenario}");
     }
+}
+
+#[test]
+fn pi_context_details_ride_along_with_handler_events() {
+    let Some(run) = run("pi:details_from_context") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "agent_start", "agent_settled"]
+    );
+    for index in 0..3 {
+        let stdin = run.stdin(index);
+        assert_eq!(stdin["model"], "claude-opus-4");
+        assert_eq!(stdin["effort"], "high");
+        assert_eq!(stdin["context_percent"], 42);
+        assert_eq!(stdin["session_title"], "Fix login");
+    }
+}
+
+#[test]
+fn pi_stale_context_getters_still_send_the_event() {
+    let Some(run) = run("pi:details_with_throwing_getters") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start"]);
+    assert_eq!(
+        run.stdin(0),
+        &serde_json::json!({"session_id": "pi-parent", "reason": "startup", "session_title": "Fix login"})
+    );
+}
+
+#[test]
+fn pi_throwing_session_name_still_sends_the_other_details() {
+    let Some(run) = run("pi:details_with_throwing_session_name") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start"]);
+    assert_eq!(
+        run.stdin(0),
+        &serde_json::json!({
+            "session_id": "pi-parent",
+            "reason": "startup",
+            "model": "claude-opus-4",
+            "effort": "high"
+        })
+    );
+}
+
+#[test]
+fn pi_held_settle_carries_details_and_the_interruption() {
+    let Some(run) = run("pi:held_settle_carries_details") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "agent_start", "session_compact_working"]
+    );
+    assert_eq!(
+        run.stdin(2),
+        &serde_json::json!({
+            "session_id": "pi-parent",
+            "model": "claude-opus-4",
+            "effort": "high",
+            "context_percent": 42,
+            "problem": "interrupted"
+        })
+    );
+}
+
+#[test]
+fn pi_unknown_context_percent_is_sent_as_null() {
+    let Some(run) = run("pi:null_context_percent") else {
+        return;
+    };
+    assert_eq!(run.stdin(0)["context_percent"], serde_json::Value::Null);
+}
+
+#[test]
+fn pi_session_info_changes_send_the_name_or_null() {
+    let Some(run) = run("pi:session_info_changed") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session_start",
+            "session_info_changed",
+            "session_info_changed"
+        ]
+    );
+    assert_eq!(
+        run.stdin(1),
+        &serde_json::json!({"session_id": "pi-parent", "session_title": "Renamed"})
+    );
+    assert_eq!(
+        run.stdin(2),
+        &serde_json::json!({"session_id": "pi-parent", "session_title": null})
+    );
+}
+
+#[test]
+fn pi_model_and_thinking_level_selections_are_their_own_events() {
+    let Some(run) = run("pi:model_and_effort_selected") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session_start", "model_select", "thinking_level_select"]
+    );
+    assert_eq!(
+        run.stdin(1),
+        &serde_json::json!({"session_id": "pi-parent", "model": "gpt-5"})
+    );
+    assert_eq!(
+        run.stdin(2),
+        &serde_json::json!({"session_id": "pi-parent", "effort": "low"})
+    );
+}
+
+#[test]
+fn pi_aborted_settle_reports_an_interruption() {
+    let Some(run) = run("pi:aborted_settle") else {
+        return;
+    };
+    assert_eq!(run.stdin(1)["problem"], "interrupted");
+    assert_eq!(run.stdin(2).get("problem"), None);
+}
+
+#[test]
+fn pi_shutdown_reads_no_context_details() {
+    let Some(run) = run("pi:shutdown_sends_no_details") else {
+        return;
+    };
+    assert_eq!(run.events(), ["session_start", "session_shutdown"]);
+    assert_eq!(
+        run.stdin(1),
+        &serde_json::json!({"session_id": "pi-parent"})
+    );
 }
 
 #[test]
@@ -539,7 +680,7 @@ fn pi_async_runs_hold_working_until_the_woken_parent_settles() {
         [
             "session_start",
             "agent_start",
-            "agent_start",
+            "session_compact_working",
             "agent_start",
             "agent_settled"
         ]
@@ -556,7 +697,7 @@ fn pi_async_run_completing_without_a_wake_settles() {
         [
             "session_start",
             "agent_start",
-            "agent_start",
+            "session_compact_working",
             "agent_settled"
         ]
     );
@@ -598,8 +739,8 @@ fn pi_async_runs_rebuilt_on_start() {
         run.events(),
         [
             "session_start",
-            "agent_start",
-            "agent_start",
+            "session_compact_working",
+            "session_compact_working",
             "agent_settled"
         ]
     );
@@ -641,8 +782,8 @@ fn pi_scan_skips_runs_owned_by_another_process() {
         run.events(),
         [
             "session_start",
-            "agent_start",
-            "agent_start",
+            "session_compact_working",
+            "session_compact_working",
             "agent_settled",
             "session_before_compact"
         ]
@@ -670,7 +811,7 @@ fn pi_one_of_two_runs_completing_keeps_the_hold() {
         [
             "session_start",
             "agent_start",
-            "agent_start",
+            "session_compact_working",
             "permission_prompt",
             "agent_settled",
             "session_before_compact"
@@ -688,7 +829,7 @@ fn pi_unknown_completion_keeps_the_hold() {
         [
             "session_start",
             "agent_start",
-            "agent_start",
+            "session_compact_working",
             "permission_prompt",
             "agent_start",
             "agent_settled"
@@ -703,7 +844,7 @@ fn pi_manual_compaction_with_live_runs_holds_working() {
     };
     assert_eq!(
         run.events(),
-        ["session_start", "agent_start", "agent_start"]
+        ["session_start", "agent_start", "session_compact_working"]
     );
 }
 

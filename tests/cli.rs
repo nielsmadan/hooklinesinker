@@ -178,7 +178,7 @@ fn hooks_install_writes_claude_settings_with_the_stable_binary_path() {
     assert!(status_output.status.success());
     let status: Value = serde_json::from_slice(&status_output.stdout).unwrap();
     assert_eq!(status["state"], "installed");
-    assert_eq!(status["entries"].as_array().unwrap().len(), 11);
+    assert_eq!(status["entries"].as_array().unwrap().len(), 12);
 }
 
 #[test]

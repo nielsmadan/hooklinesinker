@@ -1,0 +1,10 @@
+{
+  "session_id": "claude-details",
+  "cwd": "/Users/example/project",
+  "model": "claude-opus-4-7",
+  "effort": { "level": "high" },
+  "permission_mode": "acceptEdits",
+  "session_title": "Fix the build",
+  "tool_name": "Bash",
+  "error": "rate_limit"
+}

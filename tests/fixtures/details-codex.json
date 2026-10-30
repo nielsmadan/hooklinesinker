@@ -1,0 +1,7 @@
+{
+  "session_id": "codex-details",
+  "cwd": "/Users/example/project",
+  "model": "gpt-5.5-codex",
+  "permission_mode": "default",
+  "tool_name": "apply_patch"
+}

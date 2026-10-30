@@ -1,0 +1,9 @@
+{
+  "session_id": "qwen-details",
+  "cwd": "/Users/example/project",
+  "model": "qwen3-coder",
+  "permission_mode": "yolo",
+  "tool_name": "run_shell_command",
+  "error": "RateLimitError",
+  "context_usage": 0.414
+}

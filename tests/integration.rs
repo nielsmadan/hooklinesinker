@@ -7,8 +7,8 @@ use hooklinesinker::install::{Candidate, Installer, SemVer};
 use hooklinesinker::normalize::{HookEnvironment, Normalized, normalize};
 use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
 use hooklinesinker::protocol::{
-    Agent, Capability, Consumer, PROTOCOL_VERSION, Phase, ProcessIdentity, SessionIdentity,
-    StatusEvent,
+    Activity, Agent, Capability, Consumer, PROTOCOL_VERSION, Phase, ProcessIdentity,
+    SessionIdentity, StatusEvent,
 };
 use hooklinesinker::sinks::{HttpClient, SinkFanout};
 use hooklinesinker::state::{HealthKind, HealthProblem, StatusStore};
@@ -137,6 +137,10 @@ fn status(session_id: &str, pid: u32, started_at: u64) -> StatusEvent {
             id: session_id.into(),
             cwd: "/tmp".into(),
             transcript_path: None,
+            title: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
         },
         process: Some(ProcessIdentity {
             pid,
@@ -147,6 +151,7 @@ fn status(session_id: &str, pid: u32, started_at: u64) -> StatusEvent {
         tmux: None,
         git: None,
         remote_host: None,
+        activity: Activity::default(),
     }
 }
 
@@ -305,7 +310,7 @@ fn test_process() -> ProcessIdentity {
 
 fn normalize_for_test(agent: Agent, event: &str, native: &str) -> StatusEvent {
     match normalized_for_test(agent, event, native) {
-        Normalized::Recordable(event) | Normalized::ForwardOnly(event) => event,
+        Normalized::Recordable(event, ..) | Normalized::ForwardOnly(event) => event,
         Normalized::Ignored | Normalized::Unrecognized => {
             panic!("{agent:?} {event} should map to a status event")
         }
@@ -605,7 +610,7 @@ fn claude_stop_tolerates_malformed_background_tasks() {
     ];
     for native in cases {
         match normalized_for_test(Agent::Claude, "Stop", native) {
-            Normalized::Recordable(event) | Normalized::ForwardOnly(event) => {
+            Normalized::Recordable(event, ..) | Normalized::ForwardOnly(event) => {
                 assert_eq!(event.phase, Phase::Idle, "{native}");
             }
             other => panic!("{native} should normalize, got {other:?}"),
@@ -3725,4 +3730,313 @@ fn reset_waits_for_the_ledger_lock() {
         1
     );
     handle.join().unwrap();
+}
+
+fn forwarded_bodies(agent: Agent, steps: &[(&str, String)]) -> Vec<serde_json::Value> {
+    let store = store();
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let client = RecordingHttpClient::default();
+    let ctx = ingest::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    for (event, input) in steps {
+        ingest(&ctx, agent, event, input, 1);
+    }
+    client.bodies()
+}
+
+fn step(event: &'static str, input: &str) -> (&'static str, String) {
+    (event, input.to_string())
+}
+
+#[test]
+fn claude_details_reach_the_forwarded_event() {
+    let native = include_str!("fixtures/details-claude.json");
+    let bodies = forwarded_bodies(
+        Agent::Claude,
+        &[
+            step("SessionStart", native),
+            step("PreToolUse", native),
+            step("StopFailure", native),
+        ],
+    );
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[0]["session"]["model"], "claude-opus-4-7");
+    assert_eq!(bodies[0]["session"]["effort"], "high");
+    assert_eq!(bodies[0]["session"]["permissionMode"], "acceptEdits");
+    assert_eq!(bodies[0]["session"]["title"], "Fix the build");
+    assert_eq!(bodies[1]["activity"]["tool"], "Bash");
+    assert_eq!(bodies[2]["activity"]["problem"], "rate_limit");
+    assert!(bodies[2]["activity"].get("tool").is_none());
+}
+
+#[test]
+fn claude_effort_accepts_an_object_or_a_bare_string() {
+    let bodies = forwarded_bodies(
+        Agent::Claude,
+        &[
+            step(
+                "SessionStart",
+                r#"{"session_id":"s","effort":{"level":"xhigh"}}"#,
+            ),
+            step("UserPromptSubmit", r#"{"session_id":"s","effort":"low"}"#),
+        ],
+    );
+    assert_eq!(bodies[0]["session"]["effort"], "xhigh");
+    assert_eq!(bodies[1]["session"]["effort"], "low");
+}
+
+#[test]
+fn claude_tool_is_set_by_permission_requests_and_cleared_after_the_tool_ends() {
+    let bodies = forwarded_bodies(
+        Agent::Claude,
+        &[
+            step("PreToolUse", r#"{"session_id":"s","tool_name":"Read"}"#),
+            step("PostToolUse", r#"{"session_id":"s","tool_name":"Read"}"#),
+            step(
+                "PermissionRequest",
+                r#"{"session_id":"s","tool_name":"Bash"}"#,
+            ),
+        ],
+    );
+    assert_eq!(bodies[0]["activity"]["tool"], "Read");
+    assert!(bodies[1]["activity"].get("tool").is_none());
+    assert_eq!(bodies[2]["activity"]["tool"], "Bash");
+}
+
+#[test]
+fn claude_subagents_count_live_background_children_and_reset_on_a_new_prompt() {
+    let tasks = r#"{"session_id":"s","background_tasks":[
+        {"type":"subagent","status":"running"},
+        {"type":"workflow","status":"pending"},
+        {"type":"subagent","status":"completed"},
+        {"type":"shell","status":"running"}]}"#;
+    let bodies = forwarded_bodies(
+        Agent::Claude,
+        &[
+            step("PreToolUse", tasks),
+            step("UserPromptSubmit", r#"{"session_id":"s"}"#),
+        ],
+    );
+    assert_eq!(bodies[0]["activity"]["subagents"], 2);
+    assert_eq!(bodies[1]["activity"]["subagents"], 0);
+}
+
+#[test]
+fn claude_post_model_switch_updates_the_stored_model_without_being_forwarded() {
+    let bodies = forwarded_bodies(
+        Agent::Claude,
+        &[
+            step("SessionStart", r#"{"session_id":"s","model":"opus"}"#),
+            step(
+                "PostModelSwitch",
+                r#"{"session_id":"s","to_model":"sonnet"}"#,
+            ),
+            step("PreToolUse", r#"{"session_id":"s"}"#),
+        ],
+    );
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["session"]["model"], "opus");
+    assert_eq!(bodies[1]["event"], "PreToolUse");
+    assert_eq!(bodies[1]["session"]["model"], "sonnet");
+}
+
+#[test]
+fn claude_post_tool_use_failure_error_never_becomes_a_problem() {
+    let bodies = forwarded_bodies(
+        Agent::Claude,
+        &[
+            step("PreToolUse", r#"{"session_id":"s","tool_name":"Bash"}"#),
+            step(
+                "PostToolUseFailure",
+                r#"{"session_id":"s","tool_name":"Bash","error":"rm -rf failed"}"#,
+            ),
+        ],
+    );
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[1]["activity"].get("problem").is_none());
+}
+
+#[test]
+fn claude_subagent_events_keep_session_details_but_feed_the_tool() {
+    let bodies = forwarded_bodies(
+        Agent::Claude,
+        &[
+            step(
+                "SessionStart",
+                r#"{"session_id":"s","model":"opus","effort":"high"}"#,
+            ),
+            step(
+                "PreToolUse",
+                r#"{"session_id":"s","agent_id":"a1","tool_name":"Grep","effort":"low","permission_mode":"plan"}"#,
+            ),
+        ],
+    );
+    assert_eq!(bodies[1]["activity"]["tool"], "Grep");
+    assert_eq!(bodies[1]["session"]["effort"], "high");
+    assert!(bodies[1]["session"].get("permissionMode").is_none());
+}
+
+#[test]
+fn codex_details_reach_the_forwarded_event() {
+    let native = include_str!("fixtures/details-codex.json");
+    let bodies = forwarded_bodies(
+        Agent::Codex,
+        &[
+            step("UserPromptSubmit", native),
+            step("PreToolUse", native),
+            step("Interrupt", native),
+        ],
+    );
+    assert_eq!(bodies[0]["session"]["model"], "gpt-5.5-codex");
+    assert_eq!(bodies[0]["session"]["permissionMode"], "default");
+    assert_eq!(bodies[1]["activity"]["tool"], "apply_patch");
+    assert_eq!(bodies[2]["activity"]["problem"], "interrupted");
+}
+
+#[test]
+fn droid_details_reach_the_forwarded_event() {
+    let native = include_str!("fixtures/details-droid.json");
+    let bodies = forwarded_bodies(
+        Agent::Droid,
+        &[step("UserPromptSubmit", native), step("PreToolUse", native)],
+    );
+    assert_eq!(bodies[0]["session"]["permissionMode"], "auto-high");
+    assert_eq!(bodies[1]["activity"]["tool"], "Execute");
+}
+
+#[test]
+fn qwen_details_reach_the_forwarded_event() {
+    let native = include_str!("fixtures/details-qwen.json");
+    let bodies = forwarded_bodies(
+        Agent::Qwen,
+        &[
+            step("PreToolUse", native),
+            step("StopFailure", native),
+            step("Stop", native),
+        ],
+    );
+    assert_eq!(bodies[0]["session"]["model"], "qwen3-coder");
+    assert_eq!(bodies[0]["session"]["permissionMode"], "yolo");
+    assert_eq!(bodies[0]["activity"]["tool"], "run_shell_command");
+    assert_eq!(bodies[1]["activity"]["problem"], "rate_limit_error");
+    assert_eq!(bodies[2]["activity"]["contextPercent"], 41);
+}
+
+#[test]
+fn qwen_context_usage_is_a_clamped_percentage() {
+    let bodies = forwarded_bodies(
+        Agent::Qwen,
+        &[
+            step("PreToolUse", r#"{"session_id":"s"}"#),
+            step("Stop", r#"{"session_id":"s","context_usage":1.7}"#),
+        ],
+    );
+    assert_eq!(bodies[1]["activity"]["contextPercent"], 100);
+}
+
+#[test]
+fn kimi_details_reach_the_forwarded_event() {
+    let native = include_str!("fixtures/details-kimi.json");
+    let bodies = forwarded_bodies(
+        Agent::Kimi,
+        &[
+            step("TurnStarted", native),
+            step("PreToolUse", native),
+            step("StopFailure", native),
+            step("TurnStarted", native),
+            step("Interrupt", native),
+        ],
+    );
+    assert_eq!(bodies[0]["session"]["model"], "kimi-k2");
+    assert_eq!(bodies[0]["session"]["title"], "Refactor parser");
+    assert_eq!(bodies[1]["activity"]["tool"], "Shell");
+    assert_eq!(bodies[2]["activity"]["problem"], "rate_limit_error");
+    assert!(bodies[3]["activity"].get("problem").is_none());
+    assert_eq!(bodies[4]["activity"]["problem"], "interrupted");
+}
+
+#[test]
+fn kimi_post_tool_use_failure_with_an_object_error_records_working_without_a_problem() {
+    let bodies = forwarded_bodies(
+        Agent::Kimi,
+        &[
+            step("PreToolUse", r#"{"session_id":"s","tool_name":"Shell"}"#),
+            step(
+                "PostToolUseFailure",
+                r#"{"session_id":"s","error":{"code":7,"message":"nope"}}"#,
+            ),
+        ],
+    );
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[1]["phase"], "working");
+    assert!(bodies[1]["activity"].get("problem").is_none());
+}
+
+#[test]
+fn pi_details_reach_the_forwarded_event_and_annotations_are_stored_silently() {
+    let native = include_str!("fixtures/details-pi.json");
+    let bodies = forwarded_bodies(
+        Agent::Pi,
+        &[
+            step("agent_start", native),
+            step("agent_settled", native),
+            step(
+                "session_info_changed",
+                r#"{"session_id":"pi-details","session_title":"Renamed"}"#,
+            ),
+            step(
+                "model_select",
+                r#"{"session_id":"pi-details","model":"other-model"}"#,
+            ),
+            step(
+                "thinking_level_select",
+                r#"{"session_id":"pi-details","effort":"high"}"#,
+            ),
+            step("agent_start", r#"{"session_id":"pi-details"}"#),
+        ],
+    );
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[0]["session"]["model"], "claude-sonnet-5");
+    assert_eq!(bodies[0]["session"]["effort"], "medium");
+    assert_eq!(bodies[0]["session"]["title"], "Port the adapter");
+    assert_eq!(bodies[0]["activity"]["contextPercent"], 42);
+    assert_eq!(bodies[1]["activity"]["problem"], "interrupted");
+    assert_eq!(bodies[2]["session"]["title"], "Renamed");
+    assert_eq!(bodies[2]["session"]["model"], "other-model");
+    assert_eq!(bodies[2]["session"]["effort"], "high");
+    assert!(bodies[2]["activity"].get("problem").is_none());
+}
+
+#[test]
+fn pi_null_clears_every_detail_but_the_problem() {
+    let bodies = forwarded_bodies(
+        Agent::Pi,
+        &[
+            step("agent_settled", include_str!("fixtures/details-pi.json")),
+            step(
+                "agent_settled",
+                r#"{"session_id":"pi-details","model":null,"effort":null,"session_title":null,"context_percent":null,"problem":null}"#,
+            ),
+        ],
+    );
+    let cleared = &bodies[1];
+    assert!(cleared["session"].get("model").is_none());
+    assert!(cleared["session"].get("effort").is_none());
+    assert!(cleared["session"].get("title").is_none());
+    assert!(cleared["activity"].get("contextPercent").is_none());
+    assert_eq!(cleared["activity"]["problem"], "interrupted");
 }

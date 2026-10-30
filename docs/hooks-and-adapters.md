@@ -82,6 +82,37 @@ task, or cloud session; Claude's `SubagentStop` is ignored so a child finishing 
 mark its still-working parent idle on its own. Qwen's `SessionDelete` is ignored because it
 names a different conversation.
 
+### Session details
+
+`normalize.rs` reads session details in a lenient second pass over the native JSON: a missing or
+wrong-typed field is skipped and never fails the event, and strings pass one sanitizer in
+[`details.rs`](../src/details.rs) (trim, drop control and format characters, cap at 120 scalars). Only these native fields are read;
+prompt text, tool input and output, and message bodies never are, and `error` fields are read
+only on `StopFailure`.
+
+| Agent | Fields |
+|---|---|
+| Claude | `model` (`SessionStart`), `to_model` (`PostModelSwitch`), `effort` (`{level}` object or bare string), `permission_mode`, `session_title`, `StopFailure.error` as the problem, `tool_name`, live children in `background_tasks[]`, a non-empty `agent_id` as subagent origin |
+| Codex | `model`, `permission_mode`, `tool_name`, `Interrupt` as problem `interrupted` |
+| Droid | `permission_mode`, `tool_name` |
+| Qwen | `model`, `permission_mode`, `tool_name`, `StopFailure.error`, `Stop.context_usage` (a fraction, scaled to a percentage) |
+| Kimi | `model`, `session_title`, `tool_name`, `StopFailure.error_type`, `Interrupt` as problem `interrupted` |
+| Pi | the adapter's `model`, `effort`, `session_title`, `context_percent` and `problem` keys; a JSON `null` clears every one but `problem` |
+| OpenCode | none; the V1 adapter does not load on OpenCode 2.x, and `session.status.busy` repeats on retry and after a permission, so it is no turn start. `activity.turns` stays 0 until the V2 adapter port maps a real prompt event to a turn start |
+
+The tool is set by `PreToolUse` and `PermissionRequest` and cleared by `PostToolUse` and
+`PostToolUseFailure`. Each agent's [event table](../src/events.rs) declares these roles beside
+the phase. Droid's `PostToolUse` has no phase of its own: it refreshes the tool without changing
+the phase. A turn starts on `UserPromptSubmit` (Kimi: `TurnStarted`, Pi: `agent_start`) and
+increments `activity.turns`.
+Problems are snake_case tokens, so `RateLimitError` becomes `rate_limit_error`.
+
+Claude's `PostModelSwitch` (no matcher, five seconds) and Pi's `session_info_changed`,
+`model_select` and `thinking_level_select` annotate the ledger without changing phase and are not
+forwarded; the new value rides the next forwarded event. Claude Code ignores unknown hook names
+since 2.1.101, so older installs keep working, but `PostModelSwitch` only fires on 2.1.251 and
+later. `hooks status` reports an install without it as drifted.
+
 [`agents.rs`](../src/agents.rs) is the inventory for adding an agent. Each profile ties the
 wire agent to its event source, hook backend, status-event table, executable names, shared-host
 markers, lifecycle flags, and timeout unit. Backend-specific parsing still lives in the modules
@@ -143,23 +174,31 @@ working and its next idle settles it. A child's permission still surfaces on a h
 re-resolves and re-emits its root's phase (a deletion is not a completion, so it releases an
 unheld root to idle); deleting a root forgets every descendant and emits one `session.deleted`.
 
-Pi queues hooks serially and suppresses sessions whose `hasUI` is false.
-Session starts forward their native `reason` so resumes can reactivate retired bindings;
-new and fork starts replace the previous foreground binding. `agent_settled` marks idle;
-manual compaction returns to idle, other compaction to working. Permission decisions clear
-only the pending prompt with the same request ID;
-settlement clears pending prompts. Only a shutdown with reason `quit` emits
-removal. Every shutdown drains hooks and clears pending prompts; permission listeners remain
-registered so new, resumed, forked and reloaded sessions continue reporting permission state.
+Pi queues hooks serially and suppresses sessions whose `hasUI` is false. Session starts
+forward their native `reason` so resumes can reactivate retired bindings; new and fork
+starts replace the previous foreground binding. `agent_settled` marks idle; manual
+compaction returns to idle, other compaction to working. Permission decisions clear only the
+pending prompt with the same request ID; settlement clears pending prompts. Handlers with a
+context read `model`, `effort`, `context_percent` (rounded; `null` when Pi reports it
+unknown) and the session name each in its own `try`, so a stale context drops only that
+field; `session_shutdown` and channel-driven sends read none. An aborted `agent_settled`
+sends `problem: "interrupted"`. `session_info_changed` (name or `null`), `model_select` and
+`thinking_level_select` are sent as their own events. Only a shutdown with reason `quit`
+emits removal. Every shutdown drains hooks and clears pending prompts; permission listeners
+remain registered so new, resumed, forked and reloaded sessions continue reporting
+permission state.
 
 Pi also tracks this session's live `pi-subagents` async runs (run ID → PID) from
 `subagent:async-started`/`subagent:async-complete`, independent of the permission listeners.
 When `agent_settled` or a manual compaction would otherwise report idle, it first drops any run
-whose PID is no longer alive; if a run remains, it reports `working` instead. A run completing
+whose PID is no longer alive; if a run remains, it reports `working` instead, as
+`session_compact_working`. That event is not a turn start, so the hold keeps the tool, the
+problem and the turn count; an aborted settle still sends `problem: "interrupted"` with it. A run completing
 while held only releases that hold when its payload says `triggerTurn === false` — Pi normally
 wakes the parent to consume the result right away, so releasing on every completion would flash
 idle before that wake arrives. On `session_start`, live runs are rebuilt from `status.json`
-files on disk without blocking startup: a session epoch, and a short-lived set of runs that
+files on disk without blocking startup, and a rebuilt run holds the session with the same
+`session_compact_working`. A session epoch, and a short-lived set of runs that
 complete during the scan, keep that race from resurrecting a run that already finished. A run
 whose `completionOwnerId` names another Pi process (for example one started before a quit and
 `pi --resume`) is not rebuilt: pi-subagents announces its completion only in that process.

@@ -6,17 +6,27 @@ import { join, resolve as resolvePath } from "node:path";
 const HOOKLINESINKER_BIN: string = join(homedir(), "__HOOKLINESINKER_BIN__");
 
 const HOOK_TIMEOUT_MS = 2000;
+// Reports working without starting a turn, so a held session keeps its tool, problem and turn count.
+const HELD_WORKING_EVENT = "session_compact_working";
 const MAX_PENDING_HOOKS = 32;
 
-interface NativeEvent {
-  session_id?: string;
+interface PiHookFields {
   reason?: string;
+  model?: string;
+  effort?: string;
+  context_percent?: number | null;
+  session_title?: string | null;
+  problem?: "interrupted";
+}
+
+interface NativeEvent extends PiHookFields {
+  session_id?: string;
 }
 
 interface HookRequest {
   event: string;
   sessionId?: string;
-  reason?: string;
+  fields?: PiHookFields;
 }
 
 interface HookOptions extends HookRequest {
@@ -25,6 +35,9 @@ interface HookOptions extends HookRequest {
 
 interface PiContext {
   hasUI?: boolean;
+  model?: { id?: string };
+  thinkingLevel?: string;
+  getContextUsage?: () => { percent: number | null } | undefined;
   sessionManager?: {
     getSessionId?: () => string | undefined;
     getSessionFile?: () => string | undefined;
@@ -34,9 +47,12 @@ interface PiContext {
 interface PiEvents {
   session_start: { reason?: "startup" | "reload" | "new" | "resume" | "fork" };
   agent_start: unknown;
-  agent_settled: unknown;
+  agent_settled: { aborted?: boolean };
   session_before_compact: unknown;
   session_compact: { reason?: "manual" | "threshold" | "overflow" };
+  session_info_changed: { name?: string };
+  model_select: { model?: { id?: string } };
+  thinking_level_select: { level?: string };
   session_shutdown: { reason?: "quit" | "reload" | "new" | "resume" | "fork" };
 }
 
@@ -45,6 +61,7 @@ interface PiHost {
     event: Event,
     handler: (event: PiEvents[Event], ctx: PiContext) => Promise<void>,
   ): void;
+  getSessionName?: () => string | undefined;
   events: {
     on(channel: string, handler: (event: unknown) => void): () => void;
   };
@@ -73,6 +90,32 @@ function runOwnerFromContext(ctx: PiContext): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function attempt<T>(read: () => T): T | undefined {
+  try {
+    return read();
+  } catch {
+    return undefined;
+  }
+}
+
+function contextPercent(ctx: PiContext): number | null | undefined {
+  const percent = attempt(() => ctx.getContextUsage?.())?.percent;
+  if (percent === null) return null;
+  return typeof percent === "number" && Number.isFinite(percent) ? Math.round(percent) : undefined;
+}
+
+function contextFields(ctx: PiContext, sessionName: string | undefined): PiHookFields {
+  const model = attempt(() => ctx.model?.id);
+  const effort = attempt(() => ctx.thinkingLevel);
+  const percent = contextPercent(ctx);
+  return {
+    ...(typeof model === "string" ? { model } : {}),
+    ...(typeof effort === "string" ? { effort } : {}),
+    ...(percent !== undefined ? { context_percent: percent } : {}),
+    ...(typeof sessionName === "string" ? { session_title: sessionName } : {}),
+  };
 }
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
@@ -147,7 +190,7 @@ async function liveAsyncRuns(runOwner: string): Promise<Map<string, number>> {
 function runHook({
   event,
   sessionId,
-  reason,
+  fields,
   timeoutMs = HOOK_TIMEOUT_MS,
 }: HookOptions): Promise<void> {
   return new Promise((resolve) => {
@@ -199,7 +242,7 @@ function runHook({
 
       const native: NativeEvent = {};
       if (sessionId) native.session_id = sessionId;
-      if (reason) native.reason = reason;
+      Object.assign(native, fields);
       child.stdin.end(JSON.stringify(native));
     } catch {
       finish();
@@ -238,21 +281,32 @@ export default function (pi: PiHost) {
     }
     if (liveRuns.size > 0 && !midTurn) {
       heldWorking = true;
-      await queueHook({ event: "agent_start", sessionId: session.ui ? session.id : undefined });
+      await queueHook({
+        event: HELD_WORKING_EVENT,
+        sessionId: session.ui ? session.id : undefined,
+      });
     }
   }
 
-  async function settleOrHold(sessionId: string | undefined, idleEvent: string): Promise<void> {
+  async function settleOrHold({ event, sessionId, fields }: HookRequest): Promise<void> {
     pruneDeadRuns();
     if (liveRuns.size > 0) {
       heldWorking = true;
       midTurn = true;
-      await queueHook({ event: "agent_start", sessionId });
+      await queueHook({ event: HELD_WORKING_EVENT, sessionId, fields });
       return;
     }
     heldWorking = false;
     midTurn = false;
-    await queueHook({ event: idleEvent, sessionId });
+    await queueHook({ event, sessionId, fields });
+  }
+
+  function detailsFrom(ctx: PiContext): PiHookFields {
+    return contextFields(ctx, attempt(() => pi.getSessionName?.()));
+  }
+
+  function annotate(event: string, ctx: PiContext, fields: PiHookFields | undefined): Promise<void> {
+    return queueHook({ event, sessionId: rememberSessionId(ctx), fields });
   }
 
   function queueHook(request: HookRequest): Promise<void> {
@@ -360,7 +414,15 @@ export default function (pi: PiHost) {
     const completed = new Set<string>();
     if (runOwner !== undefined) completedDuringScan = completed;
     const reason = typeof event?.reason === "string" ? event.reason : undefined;
-    await queueHook({ event: "session_start", sessionId: id, reason });
+    await queueHook({
+      event: "session_start",
+      sessionId: id,
+      fields: {
+        ...(reason === "new" || reason === "fork" ? { session_title: null } : {}),
+        ...detailsFrom(ctx),
+        ...(reason ? { reason } : {}),
+      },
+    });
     if (runOwner !== undefined) {
       void scanAsyncRuns(runOwner, scanEpoch, completed);
     }
@@ -370,28 +432,60 @@ export default function (pi: PiHost) {
     if (!session.ui) return;
     heldWorking = false;
     midTurn = true;
-    await queueHook({ event: "agent_start", sessionId: rememberSessionId(ctx) });
+    await queueHook({
+      event: "agent_start",
+      sessionId: rememberSessionId(ctx),
+      fields: detailsFrom(ctx),
+    });
   });
   // agent_settled fires after automatic retries and compaction complete.
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
     if (!session.ui) return;
     pendingPermissionRequestIds.clear();
-    await settleOrHold(rememberSessionId(ctx), "agent_settled");
+    await settleOrHold({
+      event: "agent_settled",
+      sessionId: rememberSessionId(ctx),
+      fields: {
+        ...detailsFrom(ctx),
+        ...(event?.aborted === true ? { problem: "interrupted" } : {}),
+      },
+    });
   });
 
   // Automatic compaction resumes the current turn; manual compaction leaves it idle.
   pi.on("session_before_compact", async (_event, ctx) => {
     if (!session.ui) return;
-    await queueHook({ event: "session_before_compact", sessionId: rememberSessionId(ctx) });
+    await queueHook({
+      event: "session_before_compact",
+      sessionId: rememberSessionId(ctx),
+      fields: detailsFrom(ctx),
+    });
   });
   pi.on("session_compact", async (event, ctx) => {
     if (!session.ui) return;
     const sessionId = rememberSessionId(ctx);
+    const fields = detailsFrom(ctx);
     if (event?.reason === "manual") {
-      await settleOrHold(sessionId, "session_compact_idle");
+      await settleOrHold({ event: "session_compact_idle", sessionId, fields });
       return;
     }
-    await queueHook({ event: "session_compact_working", sessionId });
+    await queueHook({ event: "session_compact_working", sessionId, fields });
+  });
+
+  pi.on("session_info_changed", async (event, ctx) => {
+    if (!session.ui) return;
+    const name = event?.name;
+    await annotate("session_info_changed", ctx, { session_title: typeof name === "string" ? name : null });
+  });
+  pi.on("model_select", async (event, ctx) => {
+    if (!session.ui) return;
+    const model = event?.model?.id;
+    await annotate("model_select", ctx, typeof model === "string" ? { model } : undefined);
+  });
+  pi.on("thinking_level_select", async (event, ctx) => {
+    if (!session.ui) return;
+    const effort = event?.level;
+    await annotate("thinking_level_select", ctx, typeof effort === "string" ? { effort } : undefined);
   });
 
   // Session switches are reconciled by the next session_start.

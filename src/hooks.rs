@@ -1186,11 +1186,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_install_on_a_missing_file_creates_all_eleven_events() {
+    fn claude_install_on_a_missing_file_creates_all_twelve_events() {
         let (manager, base) = manager();
         let status = manager.install(Agent::Claude).unwrap();
         assert_eq!(status.state, HookState::Installed);
-        assert_eq!(status.entries.len(), 11);
+        assert_eq!(status.entries.len(), 12);
 
         let path = base.join("claude").join("settings.json");
         let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
@@ -1205,6 +1205,28 @@ mod tests {
         assert!(session_start.get("matcher").is_none());
         let pre_tool_use = &value["hooks"]["PreToolUse"][0];
         assert_eq!(pre_tool_use["matcher"], "*");
+        let model_switch = &value["hooks"]["PostModelSwitch"][0];
+        assert!(model_switch.get("matcher").is_none());
+        assert_eq!(model_switch["hooks"][0]["timeout"], 5);
+    }
+
+    #[test]
+    fn claude_install_without_post_model_switch_is_drifted() {
+        let (manager, base) = manager();
+        manager.install(Agent::Claude).unwrap();
+        let path = base.join("claude").join("settings.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PostModelSwitch");
+        fs::write(&path, value.to_string()).unwrap();
+        let status = manager.status(Agent::Claude).unwrap();
+        assert_eq!(status.state, HookState::Drifted);
+        assert_eq!(status.entries.len(), 11);
+        let repaired = manager.install(Agent::Claude).unwrap();
+        assert_eq!(repaired.state, HookState::Installed);
+        assert_eq!(repaired.entries.len(), 12);
     }
 
     #[test]

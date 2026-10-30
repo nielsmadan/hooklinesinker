@@ -1,7 +1,8 @@
 use crate as hooklinesinker;
 use hooklinesinker::consumers::ConsumerStore;
-use hooklinesinker::ingest::{IngestContext, handle_ingest};
-use hooklinesinker::normalize::{HookEnvironment, normalize};
+use hooklinesinker::details::{DetailKind, Details, EventTraits, Field};
+use hooklinesinker::ingest::{IngestContext, handle_ingest, handle_normalized};
+use hooklinesinker::normalize::{HookEnvironment, Normalized, normalize};
 use hooklinesinker::processes::{ProcessLiveness, ProcessLookup};
 use hooklinesinker::protocol::{
     Agent, Capability, Consumer, Phase, ProcessIdentity, StatusEvent, TerminalIdentity,
@@ -117,6 +118,60 @@ impl Fixture {
             &payload.to_string(),
             env,
             100,
+        );
+        assert!(
+            outcome.problem.is_none(),
+            "{agent:?} {event}: {:?}",
+            outcome.problem
+        );
+    }
+
+    fn send_details(&self, agent: Agent, event: &str, payload: &Value, details: Details) {
+        self.send_read(agent, event, payload, details, None);
+    }
+
+    fn send_annotation(&self, agent: Agent, event: &str, payload: &Value, details: Details) {
+        self.send_read(agent, event, payload, details, Some(DetailKind::Annotation));
+    }
+
+    fn send_read(
+        &self,
+        agent: Agent,
+        event: &str,
+        payload: &Value,
+        details: Details,
+        kind: Option<DetailKind>,
+    ) {
+        let input = payload.to_string();
+        let normalized = normalize(
+            agent,
+            event,
+            &input,
+            &HookEnvironment::default(),
+            Some(self.owner.identity.clone()),
+        )
+        .map(|normalized| match normalized {
+            Normalized::Recordable(status, _, traits) => Normalized::Recordable(
+                status,
+                details,
+                EventTraits {
+                    kind: kind.unwrap_or(traits.kind),
+                    ..traits
+                },
+            ),
+            other => other,
+        });
+        let outcome = handle_normalized(
+            &IngestContext {
+                store: &self.store,
+                consumers: Some(&self.consumers),
+                liveness: &self.owner,
+                http_client: &self.sink,
+            },
+            agent,
+            event,
+            &input,
+            normalized,
         );
         assert!(
             outcome.problem.is_none(),
@@ -544,6 +599,7 @@ fn lifecycle_metadata_stays_out_of_the_wire_protocol() {
     assert_eq!(
         keys,
         [
+            "activity",
             "agent",
             "bindingId",
             "event",
@@ -562,7 +618,8 @@ fn lifecycle_metadata_stays_out_of_the_wire_protocol() {
     let _: StatusEvent = serde_json::from_value(wire).unwrap();
 }
 
-const WIRE_KEYS: [&str; 13] = [
+const WIRE_KEYS: [&str; 14] = [
+    "activity",
     "agent",
     "bindingId",
     "event",
@@ -707,6 +764,33 @@ fn codex_child_awaiting_user_surfaces_as_permission() {
     let last = last_body(&fixture);
     assert_eq!(last["phase"], "permission");
     assert_eq!(last["event"], "child:PreToolUse");
+}
+
+#[test]
+fn codex_root_interrupt_clears_a_childs_tool() {
+    let fixture = Fixture::new();
+    codex_started(&fixture);
+    codex(&fixture, "UserPromptSubmit", &json!({"session_id": "a"}));
+    codex(
+        &fixture,
+        "SubagentStart",
+        &json!({"session_id": "a", "agent_id": "w"}),
+    );
+    codex(&fixture, "Stop", &json!({"session_id": "a"}));
+    fixture.send_details(
+        Agent::Codex,
+        "PreToolUse",
+        &json!({"session_id": "a", "agent_id": "w"}),
+        Details {
+            tool: text("Bash"),
+            ..Details::default()
+        },
+    );
+    assert_eq!(last_body(&fixture)["activity"]["tool"], "Bash");
+    codex(&fixture, "Interrupt", &json!({"session_id": "a"}));
+    let last = last_body(&fixture);
+    assert_eq!(last["phase"], "idle");
+    assert!(last["activity"].get("tool").is_none_or(Value::is_null));
 }
 
 #[test]
@@ -1156,18 +1240,24 @@ fn droid_task_children_report_through_the_parent() {
 
     let before = fixture.bodies().len();
     droid(&fixture, "Stop", &json!({"session_id": "C2"}));
-    assert_eq!(fixture.bodies().len(), before);
+    assert_eq!(fixture.bodies().len(), before + 1);
     let both_stopped = fixture.record("P");
     assert_eq!(both_stopped["event"], "child:Stop");
     assert_eq!(both_stopped["phase"], "working");
     assert_eq!(both_stopped["held"], true);
+    let released = last_body(&fixture);
+    assert_eq!(released["phase"], "working");
+    assert_eq!(released["activity"]["subagents"], 0);
 
     droid(
         &fixture,
         "PreToolUse",
         &json!({"session_id": "C1", "tool_name": "x"}),
     );
-    assert_eq!(fixture.bodies().len(), before);
+    let reopened = last_body(&fixture);
+    assert_eq!(fixture.bodies().len(), before + 2);
+    assert_eq!(reopened["phase"], "working");
+    assert_eq!(reopened["activity"]["subagents"], 1);
     assert_eq!(
         fixture.record("P")["children"][crate::children::child_key("C1")],
         json!("working")
@@ -1230,7 +1320,8 @@ fn droid_background_completion_holds_the_parent_until_its_wake() {
 
     let before = fixture.bodies().len();
     droid(&fixture, "Stop", &json!({"session_id": "C2"}));
-    assert_eq!(fixture.bodies().len(), before);
+    assert_eq!(fixture.bodies().len(), before + 1);
+    assert_eq!(last_body(&fixture)["phase"], "working");
     let held = fixture.record("P");
     assert_eq!(held["held"], true);
     assert_eq!(held["ownPhase"], "idle");
@@ -1591,4 +1682,449 @@ fn convergence_reclaims_the_row_for_the_parent_that_adopted_a_stray() {
     assert_eq!(bodies[2]["session"]["id"], "C");
     assert_eq!(bodies[2]["event"], "swept");
     assert_eq!(bodies[2]["running"], false);
+}
+
+fn text(value: &str) -> Field<String> {
+    Field::Set(value.into())
+}
+
+#[test]
+fn session_details_ride_every_later_event() {
+    let fixture = Fixture::new();
+    fixture.send_details(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "a", "startup"),
+        Details {
+            model: text("claude-opus"),
+            permission_mode: text("plan"),
+            ..Details::default()
+        },
+    );
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+    );
+
+    let last = last_body(&fixture);
+    assert_eq!(last["session"]["model"], "claude-opus");
+    assert_eq!(last["session"]["permissionMode"], "plan");
+    assert_eq!(fixture.record("a")["session"]["model"], "claude-opus");
+}
+
+#[test]
+fn a_cleared_conversation_keeps_the_model_settings_but_not_the_title() {
+    for ended_first in [false, true] {
+        let fixture = Fixture::new();
+        fixture.send_details(
+            Agent::Claude,
+            "SessionStart",
+            &start(Agent::Claude, "A", "startup"),
+            Details {
+                title: text("Old task"),
+                model: text("claude-opus"),
+                effort: text("high"),
+                permission_mode: text("acceptEdits"),
+                ..Details::default()
+            },
+        );
+        if ended_first {
+            fixture.send(
+                Agent::Claude,
+                "SessionEnd",
+                &json!({"session_id": "A", "reason": "clear"}),
+            );
+        }
+        fixture.send(
+            Agent::Claude,
+            "SessionStart",
+            &start(Agent::Claude, "B", "clear"),
+        );
+
+        let started = fixture
+            .bodies()
+            .into_iter()
+            .rfind(|body| body["session"]["id"] == "B")
+            .unwrap();
+        assert_eq!(
+            started["session"],
+            json!({
+                "id": "B",
+                "cwd": "",
+                "transcriptPath": null,
+                "model": "claude-opus",
+                "effort": "high",
+                "permissionMode": "acceptEdits"
+            }),
+            "ended first: {ended_first}"
+        );
+    }
+}
+
+#[test]
+fn a_compaction_clears_the_context_percent() {
+    let fixture = Fixture::new();
+    fixture.send(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "a", "startup"),
+    );
+    fixture.send_details(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+        Details {
+            context_percent: Field::Set(41),
+            ..Details::default()
+        },
+    );
+    assert_eq!(last_body(&fixture)["activity"]["contextPercent"], 41);
+
+    fixture.send(Agent::Claude, "PreCompact", &json!({"session_id": "a"}));
+    assert_eq!(
+        last_body(&fixture)["activity"],
+        json!({"subagents": 0, "turns": 1})
+    );
+}
+
+#[test]
+fn an_annotation_without_a_record_stores_and_sends_nothing() {
+    let fixture = Fixture::new();
+    fixture.send_annotation(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+        Details {
+            model: text("claude-opus"),
+            ..Details::default()
+        },
+    );
+    assert_eq!(fixture.bodies(), [] as [Value; 0]);
+    assert_eq!(fixture.records().len(), 0);
+}
+
+#[test]
+fn an_annotation_updates_the_record_without_sending_or_changing_its_phase() {
+    let fixture = Fixture::new();
+    fixture.send(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "a", "startup"),
+    );
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+    );
+    let before = fixture.bodies();
+
+    fixture.send_annotation(
+        Agent::Claude,
+        "Stop",
+        &json!({"session_id": "a"}),
+        Details {
+            model: text("claude-sonnet"),
+            ..Details::default()
+        },
+    );
+
+    assert_eq!(fixture.bodies(), before);
+    let record = fixture.record("a");
+    assert_eq!(record["phase"], "working");
+    assert_eq!(record["event"], "UserPromptSubmit");
+    assert_eq!(record["session"]["model"], "claude-sonnet");
+
+    fixture.send(Agent::Claude, "PreToolUse", &json!({"session_id": "a"}));
+    assert_eq!(last_body(&fixture)["session"]["model"], "claude-sonnet");
+}
+
+#[test]
+fn an_annotation_keeps_a_held_parent_working() {
+    let fixture = Fixture::new();
+    hold_droid_parent(&fixture);
+    let before = fixture.bodies();
+
+    fixture.send_annotation(
+        Agent::Droid,
+        "UserPromptSubmit",
+        &json!({"session_id": "P"}),
+        Details {
+            permission_mode: text("auto-high"),
+            ..Details::default()
+        },
+    );
+
+    assert_eq!(fixture.bodies(), before);
+    let record = fixture.record("P");
+    assert_eq!(record["held"], true);
+    assert_eq!(record["ownPhase"], "idle");
+    assert_eq!(record["phase"], "working");
+    assert_eq!(record["session"]["permissionMode"], "auto-high");
+}
+
+#[test]
+fn a_subagent_start_on_a_working_codex_root_sends_the_new_count() {
+    let fixture = Fixture::new();
+    codex_started(&fixture);
+    codex(&fixture, "UserPromptSubmit", &json!({"session_id": "a"}));
+    let before = fixture.bodies().len();
+
+    codex(
+        &fixture,
+        "SubagentStart",
+        &json!({"session_id": "a", "agent_id": "w"}),
+    );
+
+    assert_eq!(fixture.bodies().len(), before + 1);
+    let started = last_body(&fixture);
+    assert_eq!(started["event"], "child:SubagentStart");
+    assert_eq!(started["phase"], "working");
+    assert_eq!(started["activity"]["subagents"], 1);
+}
+
+#[test]
+fn a_subagent_event_keeps_the_root_settings_but_reports_its_tool() {
+    let fixture = Fixture::new();
+    fixture.send_details(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "a", "startup"),
+        Details {
+            effort: text("high"),
+            permission_mode: text("default"),
+            ..Details::default()
+        },
+    );
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+    );
+    fixture.send_details(
+        Agent::Claude,
+        "PreToolUse",
+        &json!({"session_id": "a", "agent_id": "helper"}),
+        Details {
+            effort: text("low"),
+            permission_mode: text("bypassPermissions"),
+            tool: text("Grep"),
+            ..Details::default()
+        },
+    );
+
+    let last = last_body(&fixture);
+    assert_eq!(last["session"]["effort"], "high");
+    assert_eq!(last["session"]["permissionMode"], "default");
+    assert_eq!(last["activity"]["tool"], "Grep");
+}
+
+fn turns(body: &Value) -> &Value {
+    &body["activity"]["turns"]
+}
+
+#[test]
+fn each_agents_turn_start_counts_one_turn() {
+    for (agent, turn_start) in [
+        (Agent::Claude, "UserPromptSubmit"),
+        (Agent::Kimi, "TurnStarted"),
+        (Agent::Pi, "agent_start"),
+    ] {
+        let fixture = Fixture::new();
+        let starting = events(agent).0;
+        fixture.send(agent, starting, &start(agent, "a", "startup"));
+        assert_eq!(turns(&last_body(&fixture)), 0, "{agent:?}");
+
+        fixture.send(agent, turn_start, &json!({"session_id": "a"}));
+        assert_eq!(turns(&last_body(&fixture)), 1, "{agent:?}");
+        fixture.send(agent, turn_start, &json!({"session_id": "a"}));
+        assert_eq!(turns(&last_body(&fixture)), 2, "{agent:?}");
+        assert_eq!(turns(&fixture.record("a")), 2, "{agent:?}");
+    }
+}
+
+#[test]
+fn turns_survive_every_other_event_of_the_session() {
+    let fixture = Fixture::new();
+    fixture.send(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "a", "startup"),
+    );
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+    );
+    for event in ["PreToolUse", "PostToolUse", "PreCompact", "Stop"] {
+        fixture.send(Agent::Claude, event, &json!({"session_id": "a"}));
+        assert_eq!(turns(&last_body(&fixture)), 1, "{event}");
+    }
+    fixture.send_annotation(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+        Details {
+            model: text("claude-sonnet"),
+            ..Details::default()
+        },
+    );
+    assert_eq!(turns(&fixture.record("a")), 1);
+
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+    );
+    assert_eq!(turns(&last_body(&fixture)), 2);
+}
+
+#[test]
+fn a_held_working_settle_is_not_a_turn() {
+    let fixture = Fixture::new();
+    fixture.send(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "a", "startup"),
+    );
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+    );
+    fixture.send(
+        Agent::Claude,
+        "Stop",
+        &json!({"session_id": "a", "background_tasks": [{"type": "subagent", "status": "running"}]}),
+    );
+    let held = last_body(&fixture);
+    assert_eq!(held["phase"], "working");
+    assert_eq!(turns(&held), 1);
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "a"}),
+    );
+    assert_eq!(turns(&last_body(&fixture)), 2);
+
+    let pi = Fixture::new();
+    pi.send(
+        Agent::Pi,
+        "session_start",
+        &start(Agent::Pi, "p", "startup"),
+    );
+    pi.send(Agent::Pi, "agent_start", &json!({"session_id": "p"}));
+    pi.send(
+        Agent::Pi,
+        "session_compact_working",
+        &json!({"session_id": "p", "problem": "interrupted"}),
+    );
+    let settled = last_body(&pi);
+    assert_eq!(settled["phase"], "working");
+    assert_eq!(turns(&settled), 1);
+    assert_eq!(settled["activity"]["problem"], "interrupted");
+}
+
+#[test]
+fn a_cleared_conversation_starts_counting_turns_again() {
+    let fixture = Fixture::new();
+    fixture.send(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "A", "startup"),
+    );
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "A"}),
+    );
+    fixture.send(
+        Agent::Claude,
+        "SessionStart",
+        &start(Agent::Claude, "B", "clear"),
+    );
+    let started = fixture
+        .bodies()
+        .into_iter()
+        .rfind(|body| body["session"]["id"] == "B")
+        .unwrap();
+    assert_eq!(turns(&started), 0);
+}
+
+#[test]
+fn a_droid_tool_end_clears_the_tool_without_changing_the_phase() {
+    let fixture = Fixture::new();
+    droid(
+        &fixture,
+        "SessionStart",
+        &start(Agent::Droid, "P", "startup"),
+    );
+    droid(&fixture, "UserPromptSubmit", &json!({"session_id": "P"}));
+    droid(
+        &fixture,
+        "PreToolUse",
+        &json!({"session_id": "P", "tool_name": "Execute"}),
+    );
+    assert_eq!(last_body(&fixture)["activity"]["tool"], "Execute");
+
+    droid(
+        &fixture,
+        "PostToolUse",
+        &json!({"session_id": "P", "tool_name": "Execute"}),
+    );
+    let ended = last_body(&fixture);
+    assert_eq!(ended["event"], "PostToolUse");
+    assert_eq!(ended["phase"], "working");
+    assert_eq!(ended["activity"], json!({"subagents": 0, "turns": 1}));
+    assert_eq!(fixture.record("P")["ownPhase"], "working");
+
+    let before = fixture.bodies().len();
+    droid(
+        &fixture,
+        "PostToolUse",
+        &json!({"session_id": "P", "tool_name": "Execute"}),
+    );
+    assert_eq!(fixture.bodies().len(), before);
+}
+
+#[test]
+fn a_droid_child_tool_end_clears_the_parents_tool() {
+    let fixture = Fixture::new();
+    droid(
+        &fixture,
+        "SessionStart",
+        &start(Agent::Droid, "P", "startup"),
+    );
+    droid(&fixture, "UserPromptSubmit", &json!({"session_id": "P"}));
+    droid(&fixture, "SessionStart", &droid_spawn("C", "P", "startup"));
+    droid(
+        &fixture,
+        "PreToolUse",
+        &json!({"session_id": "C", "tool_name": "Read"}),
+    );
+    assert_eq!(last_body(&fixture)["activity"]["tool"], "Read");
+
+    droid(
+        &fixture,
+        "PostToolUse",
+        &json!({"session_id": "C", "tool_name": "Read"}),
+    );
+    let ended = last_body(&fixture);
+    assert_eq!(ended["event"], "child:PostToolUse");
+    assert_eq!(ended["session"]["id"], "P");
+    assert_eq!(ended["phase"], "working");
+    assert_eq!(ended["activity"]["subagents"], 1);
+    assert_eq!(ended["activity"].get("tool"), None);
+    assert_eq!(
+        fixture.record("P")["children"][crate::children::child_key("C")],
+        json!("working")
+    );
+}
+
+#[test]
+fn a_droid_tool_end_without_a_record_stores_and_sends_nothing() {
+    let fixture = Fixture::new();
+    droid(&fixture, "PostToolUse", &json!({"session_id": "P"}));
+    assert_eq!(fixture.bodies(), [] as [Value; 0]);
+    assert_eq!(fixture.records().len(), 0);
 }

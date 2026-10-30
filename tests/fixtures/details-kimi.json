@@ -1,0 +1,8 @@
+{
+  "session_id": "kimi-details",
+  "cwd": "/Users/example/project",
+  "model": "kimi-k2",
+  "session_title": "Refactor parser",
+  "tool_name": "Shell",
+  "error_type": "RateLimitError"
+}

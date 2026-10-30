@@ -118,6 +118,10 @@ means the agent has no dedicated resolution event for that interaction.
 | OpenCode | `session.status.busy` | No equivalent used | No equivalent used | `permission.asked` | `session.status.busy` | `session.status.idle`, `session.idle`, or `session.error` |
 | Pi | `agent_start` | No equivalent used | No equivalent used | `permission_prompt` | `permission_resolved` | `agent_settled` |
 
+Claude Code's `PostModelSwitch` (`to_model`) reports a mid-session model change and has no phase
+of its own; hooklinesinker registers it as an annotation. Claude Code ignores hook names it does
+not know since 2.1.101, and `PostModelSwitch` needs 2.1.251 or later to fire.
+
 Factory Droid's `Notification` needs its `notification_type` to establish the
 meaning. `permission_prompt` and `elicitation_dialog` mean Droid is waiting for
 the user. `idle_prompt` means it is waiting for ordinary input. Other

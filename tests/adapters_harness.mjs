@@ -20,13 +20,6 @@ if (!repoRoot || !workdir) {
   throw new Error("usage: adapters_harness.mjs <repo-root> <workdir>");
 }
 
-// An adapter whose hook never resolves would otherwise hang the caller forever; fail loudly
-// instead. The explicit process.exit(0) below wins in every passing run.
-setTimeout(() => {
-  process.stderr.write("harness watchdog fired\n");
-  process.exit(3);
-}, 60_000);
-
 const PI_ADAPTER = join(repoRoot, "adapters/pi-hooklinesinker.ts");
 const OPENCODE_ADAPTER = join(repoRoot, "adapters/opencode-hooklinesinker.ts");
 
@@ -164,6 +157,10 @@ function makePi() {
     on(event, handler) {
       lifecycle.set(event, handler);
     },
+    sessionName: undefined,
+    getSessionName() {
+      return this.sessionName;
+    },
   };
   return { pi, lifecycle, events, registeredChannels };
 }
@@ -216,6 +213,90 @@ async function runPi(scenario, adapterPath, invocations) {
     case "pi:start_without_reason:home-relative":
       await lifecycle.get("session_start")({}, ctx);
       break;
+
+    case "pi:details_from_context": {
+      pi.sessionName = "Fix login";
+      const detailed = {
+        ...ctx,
+        model: { id: "claude-opus-4" },
+        thinkingLevel: "high",
+        getContextUsage: () => ({ tokens: 417, contextWindow: 1000, percent: 41.7 }),
+      };
+      await start(detailed);
+      await lifecycle.get("agent_start")({}, detailed);
+      await settle(detailed);
+      break;
+    }
+
+    case "pi:details_with_throwing_getters": {
+      pi.sessionName = "Fix login";
+      const stale = { ...ctx };
+      for (const key of ["model", "thinkingLevel"]) {
+        Object.defineProperty(stale, key, {
+          get() {
+            throw new Error("stale");
+          },
+        });
+      }
+      stale.getContextUsage = () => {
+        throw new Error("stale");
+      };
+      await start(stale);
+      break;
+    }
+
+    case "pi:details_with_throwing_session_name": {
+      pi.getSessionName = () => {
+        throw new Error("stale");
+      };
+      await start({ ...ctx, model: { id: "claude-opus-4" }, thinkingLevel: "high" });
+      break;
+    }
+
+    case "pi:held_settle_carries_details": {
+      const detailed = {
+        ...ctx,
+        model: { id: "claude-opus-4" },
+        thinkingLevel: "high",
+        getContextUsage: () => ({ tokens: 417, contextWindow: 1000, percent: 41.7 }),
+      };
+      await start(detailed);
+      await lifecycle.get("agent_start")({}, detailed);
+      asyncStarted({ id: "run-1", sessionId: "/sessions/pi-parent.jsonl", pid: process.pid });
+      await lifecycle.get("agent_settled")({ aborted: true }, detailed);
+      break;
+    }
+
+    case "pi:null_context_percent": {
+      const unknown = { ...ctx, getContextUsage: () => ({ tokens: null, contextWindow: 1000, percent: null }) };
+      await start(unknown);
+      break;
+    }
+
+    case "pi:session_info_changed":
+      await start();
+      await lifecycle.get("session_info_changed")({ name: "Renamed" }, ctx);
+      await lifecycle.get("session_info_changed")({ name: undefined }, ctx);
+      break;
+
+    case "pi:model_and_effort_selected":
+      await start();
+      await lifecycle.get("model_select")({ model: { id: "gpt-5" } }, ctx);
+      await lifecycle.get("thinking_level_select")({ level: "low" }, ctx);
+      break;
+
+    case "pi:aborted_settle":
+      await start();
+      await lifecycle.get("agent_settled")({ aborted: true }, ctx);
+      await lifecycle.get("agent_settled")({ aborted: false }, ctx);
+      break;
+
+    case "pi:shutdown_sends_no_details": {
+      const detailed = { ...ctx, model: { id: "m" }, thinkingLevel: "high" };
+      await start(detailed);
+      await shutdown("quit", detailed);
+      break;
+    }
 
     case "pi:permission_lifecycle":
       await start();
@@ -357,7 +438,7 @@ async function runPi(scenario, adapterPath, invocations) {
       process.env.PI_SUBAGENTS_TEMP_ROOT = asyncRoot;
       try {
         await start();
-        // The scan isn't awaited by session_start, so wait for the "agent_start" it queues.
+        // The scan isn't awaited by session_start, so wait for the held-working event it queues.
         await waitForInvocationCount(2);
         await settle();
         asyncComplete({ runId: "r1", triggerTurn: false });
@@ -1132,6 +1213,15 @@ const SCENARIOS = [
   [PI_ADAPTER, "pi:session_switches"],
   [PI_ADAPTER, "pi:start_without_reason"],
   [PI_ADAPTER, "pi:start_without_reason:home-relative"],
+  [PI_ADAPTER, "pi:details_from_context"],
+  [PI_ADAPTER, "pi:details_with_throwing_getters"],
+  [PI_ADAPTER, "pi:details_with_throwing_session_name"],
+  [PI_ADAPTER, "pi:held_settle_carries_details"],
+  [PI_ADAPTER, "pi:null_context_percent"],
+  [PI_ADAPTER, "pi:session_info_changed"],
+  [PI_ADAPTER, "pi:model_and_effort_selected"],
+  [PI_ADAPTER, "pi:aborted_settle"],
+  [PI_ADAPTER, "pi:shutdown_sends_no_details"],
   [PI_ADAPTER, "pi:permission_lifecycle"],
   [PI_ADAPTER, "pi:permission_after_switch"],
   [PI_ADAPTER, "pi:malformed_permission_payloads"],
@@ -1206,6 +1296,10 @@ const SCENARIOS = [
 
 const report = {};
 for (const [assetPath, scenario] of SCENARIOS) {
+  const watchdog = setTimeout(() => {
+    process.stderr.write(`harness watchdog fired: ${scenario}\n`);
+    process.exit(3);
+  }, 60_000);
   const { adapterPath, invocations, pids, home } = stage(assetPath, scenario);
   const started = Date.now();
   const previousHome = process.env.HOME;
@@ -1221,8 +1315,8 @@ for (const [assetPath, scenario] of SCENARIOS) {
     elapsedMs: Date.now() - started,
     ...result,
   };
+  clearTimeout(watchdog);
 }
 
-process.stdout.write(JSON.stringify(report));
 // A hung fake binary leaves its pipes open; the recorded results are already complete.
-process.exit(0);
+process.stdout.write(JSON.stringify(report), () => process.exit(0));

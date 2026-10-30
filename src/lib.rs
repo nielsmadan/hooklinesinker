@@ -2,6 +2,7 @@ pub(crate) mod agents;
 pub(crate) mod app;
 pub(crate) mod children;
 pub(crate) mod consumers;
+pub(crate) mod details;
 pub(crate) mod environment;
 pub(crate) mod events;
 pub(crate) mod hooks;

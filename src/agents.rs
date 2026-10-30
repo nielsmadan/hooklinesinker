@@ -82,6 +82,13 @@ impl ChildTracking {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubagentSource {
+    Unreported,
+    BackgroundTasks,
+    TrackedChildren,
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "a declarative per-agent table, not an argument list"
@@ -98,6 +105,7 @@ pub(crate) struct AgentProfile {
     pub attributed_sessions_share_process: bool,
     pub ambiguous_sessions_share_process: bool,
     pub child_tracking: ChildTracking,
+    pub subagent_source: SubagentSource,
 }
 
 // An agent whose phase depends on a payload field rather than the event name also needs an
@@ -115,6 +123,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
         child_tracking: ChildTracking::Untracked,
+        subagent_source: SubagentSource::BackgroundTasks,
     },
     AgentProfile {
         agent: Agent::Codex,
@@ -132,6 +141,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
             child_stop: "SubagentStop",
             root_interrupt: "Interrupt",
         },
+        subagent_source: SubagentSource::TrackedChildren,
     },
     AgentProfile {
         agent: Agent::Opencode,
@@ -145,6 +155,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
         child_tracking: ChildTracking::Untracked,
+        subagent_source: SubagentSource::Unreported,
     },
     AgentProfile {
         agent: Agent::Pi,
@@ -158,6 +169,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
         child_tracking: ChildTracking::Untracked,
+        subagent_source: SubagentSource::Unreported,
     },
     AgentProfile {
         agent: Agent::Droid,
@@ -174,6 +186,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
             child_stop: "Stop",
             completion_wakes_root: true,
         },
+        subagent_source: SubagentSource::TrackedChildren,
     },
     AgentProfile {
         agent: Agent::Qwen,
@@ -187,6 +200,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         attributed_sessions_share_process: true,
         ambiguous_sessions_share_process: false,
         child_tracking: ChildTracking::Untracked,
+        subagent_source: SubagentSource::Unreported,
     },
     AgentProfile {
         agent: Agent::Kimi,
@@ -200,6 +214,7 @@ pub(crate) const PROFILES: [AgentProfile; 7] = [
         attributed_sessions_share_process: false,
         ambiguous_sessions_share_process: false,
         child_tracking: ChildTracking::Untracked,
+        subagent_source: SubagentSource::Unreported,
     },
 ];
 
@@ -230,6 +245,18 @@ mod tests {
                 Agent::ALL.contains(agent),
                 "{} is missing from Agent::ALL",
                 agent.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn only_tracked_agents_count_their_children() {
+        for profile in &PROFILES {
+            assert_eq!(
+                profile.subagent_source == SubagentSource::TrackedChildren,
+                profile.child_tracking != ChildTracking::Untracked,
+                "{}",
+                profile.agent.as_str()
             );
         }
     }

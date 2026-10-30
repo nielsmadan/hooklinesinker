@@ -3,10 +3,14 @@ use crate::children::{
     ChildEvent, Children, aggregate_phase, all_idle, child_key, child_phase, completion_holds_root,
     with_child,
 };
+use crate::details::{
+    DetailKind, Details, EventTraits, Transition, child_activity, kept_session, merged_activity,
+    merged_session, running_children, subagent_count,
+};
 use crate::lifecycle::{ChildClaim, SessionContext};
 use crate::persistence::{LockGuard, json_record_paths, read_json_records, write_private_atomic};
 use crate::processes::{ProcessLiveness, Timestamp};
-use crate::protocol::{Agent, Phase, ProcessIdentity, StatusEvent};
+use crate::protocol::{Activity, Agent, Phase, ProcessIdentity, SessionIdentity, StatusEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -158,6 +162,15 @@ pub(crate) enum CurrentStatus {
     Gone,
 }
 
+pub(crate) struct IngestSignals<'a> {
+    pub context: SessionContext,
+    pub claim: ChildClaim,
+    pub child: ChildEvent<'a>,
+    pub clears_children: bool,
+    pub details: &'a Details,
+    pub traits: EventTraits,
+}
+
 pub(crate) struct IngestSessionOutcome {
     pub forward: bool,
     pub retired: SweepOutcome,
@@ -238,10 +251,7 @@ impl StatusStore {
     pub(crate) fn ingest_session(
         &self,
         event: &mut StatusEvent,
-        context: SessionContext,
-        claim: &ChildClaim,
-        child: ChildEvent<'_>,
-        clears_children: bool,
+        signals: &IngestSignals<'_>,
         liveness: &(impl ProcessLiveness + ?Sized),
     ) -> io::Result<IngestSessionOutcome> {
         let _guard = self.lock()?;
@@ -253,37 +263,76 @@ impl StatusStore {
         let previous = snapshot.records.iter().find_map(|(_, stored)| {
             (stored.status.binding_id == event.binding_id).then_some(stored)
         });
-        if let ChildClaim::Agent { child_key, starts } = claim
+        match signals.traits.kind {
+            DetailKind::Annotation => {
+                let current = previous.filter(|stored| !stored.retired).cloned();
+                return self.ingest_annotation(current, signals, snapshot, liveness);
+            }
+            DetailKind::Refresh => {
+                let (target, update) =
+                    refreshed_target(&snapshot.records, event, previous, signals);
+                return self.store_update(event, target.as_ref(), update, snapshot, liveness);
+            }
+            DetailKind::Status => {}
+        }
+        if let ChildClaim::Agent { child_key, starts } = &signals.claim
             && let Some(root) = previous
         {
             let root = root.clone();
-            return self.ingest_child(event, &root, child_key, *starts, child, snapshot, liveness);
+            let update = (!root.retired)
+                .then(|| child_update(&root, event, child_key, *starts, signals))
+                .flatten();
+            return self.store_update(event, Some(&root), update, snapshot, liveness);
         }
         if let ChildClaim::Spawned {
             child_key,
             parent_session_id,
-        } = claim
+        } = &signals.claim
             && let Some(root) = find_spawn_root(&snapshot.records, event, parent_session_id)
         {
             let root = root.clone();
             let stray = previous.cloned();
+            let update = attach_child(
+                &root,
+                event,
+                child_key,
+                Phase::Working,
+                true,
+                signals.details,
+            );
             return self.ingest_spawned_child(
                 event,
                 &root,
-                child_key,
+                update,
                 stray.as_ref(),
                 snapshot,
                 liveness,
             );
         }
-        if let ChildClaim::MaybeLinked { child_key } = claim
+        if let ChildClaim::MaybeLinked { child_key } = &signals.claim
             && previous.is_none_or(|stored| stored.retired)
             && let Some(root) = find_linked_root(&snapshot.records, event, child_key)
         {
             let root = root.clone();
-            return self.ingest_child(event, &root, child_key, false, child, snapshot, liveness);
+            let update = (!root.retired)
+                .then(|| child_update(&root, event, child_key, false, signals))
+                .flatten();
+            return self.store_update(event, Some(&root), update, snapshot, liveness);
         }
-        let SessionDisposition::Store(mode) = session_disposition(event, previous, context) else {
+        let previous = previous.cloned();
+        self.ingest_root(event, previous.as_ref(), signals, snapshot, liveness)
+    }
+
+    fn ingest_root(
+        &self,
+        event: &mut StatusEvent,
+        previous: Option<&StoredStatus>,
+        signals: &IngestSignals<'_>,
+        snapshot: StatusSnapshot,
+        liveness: &(impl ProcessLiveness + ?Sized),
+    ) -> io::Result<IngestSessionOutcome> {
+        let SessionDisposition::Store(mode) = session_disposition(event, previous, signals.context)
+        else {
             // Ingest is the only sweeper, so a hook for a retired binding still owes the
             // ledger its pass or dead bindings for other agents go unannounced.
             return Ok(IngestSessionOutcome {
@@ -297,11 +346,13 @@ impl StatusStore {
                 ),
             });
         };
-        let (own_phase, children) = if let Some(rootless) = rootless_child(event, claim, child) {
+        let rootless = rootless_child(event, &signals.claim, signals.child);
+        let from_child = rootless.is_some();
+        let (own_phase, children) = if let Some(rootless) = rootless {
             rootless
         } else {
             let own_phase = if matches!(
-                context,
+                signals.context,
                 SessionContext::Selected | SessionContext::SelectedParallel
             ) && crate::agents::profile(event.agent).retains_phase_on_selection
                 && let Some(previous) = previous
@@ -310,9 +361,22 @@ impl StatusStore {
             } else {
                 event.phase
             };
-            (own_phase, root_children(event, previous, clears_children))
+            (
+                own_phase,
+                root_children(event, previous, signals.clears_children),
+            )
         };
         event.phase = aggregate_phase(own_phase, &children, false);
+        let earlier = earlier_session(event, previous, &snapshot.records, mode.is_parallel());
+        (event.session, event.activity) = recorded_details(
+            event,
+            previous,
+            earlier.as_ref(),
+            own_phase,
+            &children,
+            from_child,
+            signals,
+        );
         self.persist_session(event, own_phase, children, mode.is_parallel())?;
         let retired = Self::reconcile_existing_records(
             Some(event),
@@ -327,25 +391,39 @@ impl StatusStore {
         })
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the ingest seam plus the snapshot it already read under the lock"
-    )]
-    fn ingest_child(
+    fn ingest_annotation(
         &self,
-        event: &mut StatusEvent,
-        root: &StoredStatus,
-        child_key: &str,
-        starts: bool,
-        child: ChildEvent<'_>,
+        current: Option<StoredStatus>,
+        signals: &IngestSignals<'_>,
         snapshot: StatusSnapshot,
         liveness: &(impl ProcessLiveness + ?Sized),
     ) -> io::Result<IngestSessionOutcome> {
-        let update = (!root.retired)
-            .then(|| child_update(root, event, child_key, starts, child))
-            .flatten();
+        let annotated = current.map(|stored| annotated(&stored, signals.details, &signals.traits));
+        if let Some(stored) = &annotated {
+            stored.write(&self.binding_path(&stored.status.binding_id)?)?;
+        }
+        Ok(IngestSessionOutcome {
+            forward: false,
+            retired: Self::reconcile_existing_records(
+                annotated.as_ref().map(|stored| &stored.status),
+                snapshot.records,
+                snapshot.problems,
+                false,
+                liveness,
+            ),
+        })
+    }
+
+    fn store_update(
+        &self,
+        event: &mut StatusEvent,
+        root: Option<&StoredStatus>,
+        update: Option<ChildUpdate>,
+        snapshot: StatusSnapshot,
+        liveness: &(impl ProcessLiveness + ?Sized),
+    ) -> io::Result<IngestSessionOutcome> {
         let Some(ChildUpdate { stored, visible }) = update else {
-            let current = (!root.retired).then_some(&root.status);
+            let current = root.filter(|root| !root.retired).map(|root| &root.status);
             return Ok(IngestSessionOutcome {
                 forward: false,
                 retired: Self::reconcile_existing_records(
@@ -377,7 +455,7 @@ impl StatusStore {
         &self,
         event: &mut StatusEvent,
         root: &StoredStatus,
-        child_key: &str,
+        update: Option<ChildUpdate>,
         stray: Option<&StoredStatus>,
         mut snapshot: StatusSnapshot,
         liveness: &(impl ProcessLiveness + ?Sized),
@@ -388,9 +466,7 @@ impl StatusStore {
                 .records
                 .retain(|(_, stored)| stored.status.binding_id != stray.status.binding_id);
         }
-        let Some(ChildUpdate { stored, visible }) =
-            attach_child(root, event, child_key, Phase::Working, true)
-        else {
+        let Some(ChildUpdate { stored, visible }) = update else {
             let mut retired = Self::reconcile_existing_records(
                 Some(&root.status),
                 snapshot.records,
@@ -762,16 +838,61 @@ fn child_update(
     event: &StatusEvent,
     child_key: &str,
     starts: bool,
-    child: ChildEvent<'_>,
+    signals: &IngestSignals<'_>,
 ) -> Option<ChildUpdate> {
     let child_stop = profile(event.agent).child_tracking.child_stop()?;
     attach_child(
         root,
         event,
         child_key,
-        child_phase(child_stop, child),
+        child_phase(child_stop, signals.child),
         starts,
+        signals.details,
     )
+}
+
+// A refresh only changes details: a linked child's refresh keeps that child's phase.
+fn refreshed_target(
+    records: &[(PathBuf, StoredStatus)],
+    event: &StatusEvent,
+    previous: Option<&StoredStatus>,
+    signals: &IngestSignals<'_>,
+) -> (Option<StoredStatus>, Option<ChildUpdate>) {
+    let linked = match &signals.claim {
+        ChildClaim::MaybeLinked { child_key } if previous.is_none_or(|stored| stored.retired) => {
+            find_linked_root(records, event, child_key).map(|root| (root, child_key))
+        }
+        _ => None,
+    };
+    let update = match linked {
+        Some((root, child_key)) if !root.retired => root
+            .children
+            .get(child_key)
+            .and_then(|&phase| attach_child(root, event, child_key, phase, false, signals.details)),
+        Some(_) => None,
+        None => previous
+            .filter(|stored| !stored.retired)
+            .and_then(|stored| refreshed(stored, event, signals)),
+    };
+    let target = linked.map(|(root, _)| root).or(previous).cloned();
+    (target, update)
+}
+
+fn refreshed(
+    stored: &StoredStatus,
+    event: &StatusEvent,
+    signals: &IngestSignals<'_>,
+) -> Option<ChildUpdate> {
+    let mut next = annotated(stored, signals.details, &signals.traits);
+    if next.status == stored.status {
+        return None;
+    }
+    next.status.event.clone_from(&event.event);
+    next.status.observed_at.clone_from(&event.observed_at);
+    Some(ChildUpdate {
+        stored: next,
+        visible: true,
+    })
 }
 
 fn stray_removal(stray: &StoredStatus) -> StatusEvent {
@@ -794,6 +915,7 @@ fn attach_child(
     child_key: &str,
     phase: Phase,
     create: bool,
+    details: &Details,
 ) -> Option<ChildUpdate> {
     let children = with_child(&root.children, child_key, phase, create);
     let tracking = profile(event.agent).child_tracking;
@@ -808,15 +930,22 @@ fn attach_child(
             );
     let mut status = root.status.clone();
     status.phase = aggregate_phase(root.own_phase, &children, held);
+    status.activity = child_activity(
+        &root.status.activity,
+        details,
+        Transition {
+            before: Some(root.status.phase),
+            after: status.phase,
+        },
+        running_children(&children),
+    );
     if same_process(event.process.as_ref(), root.status.process.as_ref()) {
         status.terminal.clone_from(&event.terminal);
         status.tmux.clone_from(&event.tmux);
         status.git.clone_from(&event.git);
         status.remote_host.clone_from(&event.remote_host);
     }
-    let visible = status.phase != root.status.phase
-        || status.terminal != root.status.terminal
-        || status.tmux != root.status.tmux;
+    let visible = status != root.status;
     if !visible && children == root.children && held == root.held {
         return None;
     }
@@ -831,6 +960,118 @@ fn attach_child(
         },
         visible,
     })
+}
+
+fn annotated(stored: &StoredStatus, details: &Details, traits: &EventTraits) -> StoredStatus {
+    let traits = EventTraits {
+        turn_start: false,
+        ..*traits
+    };
+    let mut status = stored.status.clone();
+    status.session = merged_session(
+        &status.session,
+        Some(&stored.status.session),
+        details,
+        &traits,
+    );
+    status.activity = merged_activity(
+        Some(&stored.status.activity),
+        details,
+        &traits,
+        Transition::steady(stored.own_phase),
+        Transition::steady(stored.status.phase),
+        subagent_count(
+            profile(status.agent).subagent_source,
+            &stored.children,
+            Some(&stored.status.activity),
+            &traits,
+        ),
+    );
+    StoredStatus {
+        status,
+        ..stored.clone()
+    }
+}
+
+fn recorded_details(
+    event: &StatusEvent,
+    previous: Option<&StoredStatus>,
+    earlier_session: Option<&SessionIdentity>,
+    own_phase: Phase,
+    children: &Children,
+    from_child: bool,
+    signals: &IngestSignals<'_>,
+) -> (SessionIdentity, Activity) {
+    let earlier_activity = previous.map(|stored| &stored.status.activity);
+    let subagents = subagent_count(
+        profile(event.agent).subagent_source,
+        children,
+        earlier_activity,
+        &signals.traits,
+    );
+    let aggregate = Transition {
+        before: previous.map(|stored| stored.status.phase),
+        after: event.phase,
+    };
+    if from_child {
+        return (
+            kept_session(&event.session, earlier_session),
+            child_activity(
+                &earlier_activity.cloned().unwrap_or_default(),
+                signals.details,
+                aggregate,
+                subagents,
+            ),
+        );
+    }
+    (
+        merged_session(
+            &event.session,
+            earlier_session,
+            signals.details,
+            &signals.traits,
+        ),
+        merged_activity(
+            earlier_activity,
+            signals.details,
+            &signals.traits,
+            Transition {
+                before: previous.map(|stored| stored.own_phase),
+                after: own_phase,
+            },
+            aggregate,
+            subagents,
+        ),
+    )
+}
+
+fn earlier_session(
+    event: &StatusEvent,
+    previous: Option<&StoredStatus>,
+    records: &[(PathBuf, StoredStatus)],
+    parallel: bool,
+) -> Option<SessionIdentity> {
+    match previous {
+        Some(stored) => Some(stored.status.session.clone()),
+        None if parallel => None,
+        None => superseded_session(event, records),
+    }
+}
+
+// After `/clear` the new conversation runs on the same model and settings, under a new title.
+fn superseded_session(
+    event: &StatusEvent,
+    records: &[(PathBuf, StoredStatus)],
+) -> Option<SessionIdentity> {
+    records
+        .iter()
+        .map(|(_, stored)| stored)
+        .filter(|stored| !stored.parallel && is_superseded_record(event, &stored.status))
+        .max_by_key(|stored| Timestamp::parse(&stored.status.observed_at))
+        .map(|stored| SessionIdentity {
+            title: None,
+            ..stored.status.session.clone()
+        })
 }
 
 // Same-process candidate wins; otherwise the most recently observed one does.
@@ -1048,6 +1289,7 @@ fn is_sweepable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::details::Field;
     use serde_json::{Value, json};
 
     fn legacy_record() -> Value {
@@ -1176,7 +1418,15 @@ mod tests {
         });
         let event: StatusEvent = serde_json::from_value(event_value).unwrap();
 
-        let update = attach_child(&root, &event, "k", Phase::Working, true).unwrap();
+        let update = attach_child(
+            &root,
+            &event,
+            "k",
+            Phase::Working,
+            true,
+            &Details::default(),
+        )
+        .unwrap();
         let terminal = update.stored.status.terminal.unwrap();
         assert_eq!(terminal.session_id.as_deref(), Some("w1t0p0:moved"));
     }
@@ -1219,11 +1469,72 @@ mod tests {
         });
         let event: StatusEvent = serde_json::from_value(event_value).unwrap();
 
-        let update = attach_child(&root, &event, "k", Phase::Permission, true).unwrap();
+        let update = attach_child(
+            &root,
+            &event,
+            "k",
+            Phase::Permission,
+            true,
+            &Details::default(),
+        )
+        .unwrap();
         assert_eq!(
             update.stored.status.terminal.unwrap().session_id.as_deref(),
             Some("w1t0p0:root")
         );
         assert_eq!(update.stored.status.phase, Phase::Permission);
+    }
+
+    #[test]
+    fn an_annotation_keeps_the_hold_children_and_phase() {
+        let mut stored = candidate_root(2, "2026-10-08T00:00:00Z");
+        stored.own_phase = Phase::Idle;
+        stored.held = true;
+        stored.children = Children::from([("k".to_string(), Phase::Idle)]);
+        stored.status.phase = Phase::Working;
+        stored.status.activity.tool = Some("Bash".into());
+
+        let annotated = annotated(
+            &stored,
+            &Details {
+                model: Field::Set("opus".into()),
+                ..Details::default()
+            },
+            &EventTraits {
+                kind: DetailKind::Annotation,
+                turn_start: true,
+                ..EventTraits::default()
+            },
+        );
+        assert!(annotated.held);
+        assert_eq!(annotated.own_phase, Phase::Idle);
+        assert_eq!(annotated.children, stored.children);
+        assert_eq!(annotated.status.phase, Phase::Working);
+        assert_eq!(annotated.status.event, stored.status.event);
+        assert_eq!(annotated.status.session.model.as_deref(), Some("opus"));
+        assert_eq!(annotated.status.activity.tool.as_deref(), Some("Bash"));
+        assert_eq!(
+            annotated.status.activity.turns,
+            stored.status.activity.turns
+        );
+    }
+
+    #[test]
+    fn records_without_details_load_with_empty_details() {
+        let stored = StoredStatus::from(
+            serde_json::from_value::<StoredStatusWire>(legacy_record()).unwrap(),
+        );
+        assert_eq!(stored.status.activity, Activity::default());
+        assert_eq!(stored.status.session.model, None);
+    }
+
+    #[test]
+    fn records_from_before_turns_load_with_zero_turns() {
+        let mut record = legacy_record();
+        record["activity"] = json!({"tool": "Bash", "subagents": 1});
+        let stored =
+            StoredStatus::from(serde_json::from_value::<StoredStatusWire>(record).unwrap());
+        assert_eq!(stored.status.activity.turns, 0);
+        assert_eq!(stored.status.activity.subagents, 1);
     }
 }

@@ -1,14 +1,15 @@
 use crate::agents::{ChildTracking, profile};
 use crate::children::ChildEvent;
 use crate::consumers::ConsumerStore;
+use crate::details::{Details, EventTraits};
 use crate::lifecycle::{ChildClaim, SessionContext, awaits_user, clears_children};
 use crate::normalize::{HookEnvironment, Normalized, normalize};
 use crate::processes::ProcessLookup;
 use crate::protocol::{Agent, StatusEvent};
 use crate::sinks::{HttpClient, SinkFanout};
 use crate::state::{
-    CurrentStatus, HealthKind, HealthProblem, IngestSessionOutcome, ResetOutcome, StatusStore,
-    SweepOutcome,
+    CurrentStatus, HealthKind, HealthProblem, IngestSessionOutcome, IngestSignals, ResetOutcome,
+    StatusStore, SweepOutcome,
 };
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
@@ -48,42 +49,65 @@ pub(crate) fn handle_ingest(
     env: &HookEnvironment,
     hook_pid: u32,
 ) -> IngestOutcome {
-    let store = ctx.store;
     let process = ctx.liveness.owner_of(hook_pid, agent);
+    handle_normalized(
+        ctx,
+        agent,
+        event,
+        input,
+        normalize(agent, event, input, env, process),
+    )
+}
+
+pub(crate) fn handle_normalized(
+    ctx: &IngestContext,
+    agent: Agent,
+    event: &str,
+    input: &str,
+    normalized: io::Result<Normalized>,
+) -> IngestOutcome {
+    let store = ctx.store;
     let mut forwarded: Option<StatusEvent> = None;
     let mut stored = false;
     let mut problems: Vec<HealthProblem> = Vec::new();
     let mut retired = SweepOutcome::default();
     let mut swept_with_ingest = false;
 
-    let outcome =
-        normalize(agent, event, input, env, process).and_then(|normalized| match normalized {
-            Normalized::Ignored => Ok(()),
-            Normalized::Unrecognized => {
-                problems.push(HealthProblem::new(
-                    HealthKind::Ingest,
-                    format!(
-                        "unrecognized {} event \"{event}\"; no status was recorded",
-                        agent.as_str()
-                    ),
-                ));
-                Ok(())
-            }
-            Normalized::ForwardOnly(status_event) => {
+    let outcome = normalized.and_then(|normalized| match normalized {
+        Normalized::Ignored => Ok(()),
+        Normalized::Unrecognized => {
+            problems.push(HealthProblem::new(
+                HealthKind::Ingest,
+                format!(
+                    "unrecognized {} event \"{event}\"; no status was recorded",
+                    agent.as_str()
+                ),
+            ));
+            Ok(())
+        }
+        Normalized::ForwardOnly(status_event) => {
+            forwarded = Some(status_event);
+            Ok(())
+        }
+        Normalized::Recordable(mut status_event, details, traits) => {
+            let session_outcome = record_session(
+                ctx,
+                agent,
+                event,
+                input,
+                &mut status_event,
+                &details,
+                traits,
+            )?;
+            if session_outcome.forward {
                 forwarded = Some(status_event);
-                Ok(())
+                stored = true;
             }
-            Normalized::Recordable(mut status_event) => {
-                let session_outcome = record_session(ctx, agent, event, input, &mut status_event)?;
-                if session_outcome.forward {
-                    forwarded = Some(status_event);
-                    stored = true;
-                }
-                retired = session_outcome.retired;
-                swept_with_ingest = true;
-                Ok(())
-            }
-        });
+            retired = session_outcome.retired;
+            swept_with_ingest = true;
+            Ok(())
+        }
+    });
 
     let ingest_failed = outcome.is_err();
     if let Err(e) = outcome {
@@ -162,6 +186,8 @@ fn record_session(
     event: &str,
     input: &str,
     status_event: &mut StatusEvent,
+    details: &Details,
+    traits: EventTraits,
 ) -> io::Result<IngestSessionOutcome> {
     let mut context = SessionContext::parse(agent, event, input)?;
     if status_event
@@ -171,21 +197,21 @@ fn record_session(
     {
         context = context.in_shared_process();
     }
-    let claim = ChildClaim::parse(agent, event, input, &status_event.session.id)?;
-    let child = ChildEvent {
-        event,
-        mapped: status_event.phase,
-        running: status_event.running,
-        awaiting_user: awaits_user(agent, event, input),
-    };
-    ctx.store.ingest_session(
-        status_event,
+    let signals = IngestSignals {
         context,
-        &claim,
-        child,
-        clears_children(event, input),
-        ctx.liveness,
-    )
+        claim: ChildClaim::parse(agent, event, input, &status_event.session.id)?,
+        child: ChildEvent {
+            event,
+            mapped: status_event.phase,
+            running: status_event.running,
+            awaiting_user: awaits_user(agent, event, input),
+        },
+        clears_children: clears_children(event, input),
+        details,
+        traits,
+    };
+    ctx.store
+        .ingest_session(status_event, &signals, ctx.liveness)
 }
 
 const fn needs_convergence(
@@ -203,6 +229,13 @@ fn resend_labelled(status: &StatusEvent) -> StatusEvent {
     }
 }
 
+fn diverged(current: &StatusEvent, sent: &StatusEvent) -> bool {
+    current.phase != sent.phase
+        || current.running != sent.running
+        || current.session != sent.session
+        || current.activity != sent.activity
+}
+
 // Fan-out runs unlocked, so a concurrent ingest can deliver an older aggregate after ours.
 fn converge_on_stored_status(
     ctx: &IngestContext,
@@ -210,9 +243,7 @@ fn converge_on_stored_status(
     deadline: Instant,
 ) -> Vec<HealthProblem> {
     match ctx.store.current_status(sent) {
-        Ok(CurrentStatus::Stored(current))
-            if current.phase != sent.phase || current.running != sent.running =>
-        {
+        Ok(CurrentStatus::Stored(current)) if diverged(&current, sent) => {
             fan_out_to_sinks(ctx, Some(&resend_labelled(&current)), Vec::new(), deadline).problems
         }
         Ok(CurrentStatus::Adopted(root)) if sent.running => {
@@ -365,5 +396,34 @@ mod tests {
                 "{child_tracking:?} stored={stored} had_consumers={had_consumers}"
             );
         }
+    }
+
+    #[test]
+    fn convergence_resends_when_only_the_details_moved_on() {
+        let sent: StatusEvent = serde_json::from_value(serde_json::json!({
+            "protocol": 1,
+            "bindingId": "b",
+            "agent": "codex",
+            "event": "PreToolUse",
+            "phase": "working",
+            "running": true,
+            "observedAt": "2026-10-30T00:00:00Z",
+            "session": {"id": "a", "cwd": "/tmp", "transcriptPath": null},
+            "process": null,
+            "terminal": null,
+            "tmux": null,
+            "git": null,
+            "remoteHost": null
+        }))
+        .unwrap();
+        assert!(!diverged(&sent, &sent));
+
+        let mut counted = sent.clone();
+        counted.activity.subagents = 2;
+        assert!(diverged(&counted, &sent));
+
+        let mut switched = sent.clone();
+        switched.session.model = Some("gpt-5.5-codex".into());
+        assert!(diverged(&switched, &sent));
     }
 }

@@ -137,7 +137,7 @@ impl HttpClient for UreqHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Agent, PROTOCOL_VERSION, Phase, SessionIdentity};
+    use crate::protocol::{Activity, Agent, PROTOCOL_VERSION, Phase, SessionIdentity};
     use std::cell::RefCell;
     use std::thread;
 
@@ -154,12 +154,17 @@ mod tests {
                 id: "s".into(),
                 cwd: "/tmp".into(),
                 transcript_path: None,
+                title: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
             },
             process: None,
             terminal: None,
             tmux: None,
             git: None,
             remote_host: None,
+            activity: Activity::default(),
         }
     }
 

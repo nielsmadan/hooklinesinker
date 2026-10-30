@@ -79,11 +79,19 @@ envelope whose `protocol` is not one they speak, and skip individual records who
       "protocol": 1,
       "bindingId": "…",
       "agent": "claude",
-      "event": "UserPromptSubmit",
+      "event": "PreToolUse",
       "phase": "working",
       "running": true,
       "observedAt": "2026-09-04T00:00:00Z",
-      "session": { "id": "…", "cwd": "/path", "transcriptPath": null },
+      "session": {
+        "id": "…",
+        "cwd": "/path",
+        "transcriptPath": null,
+        "model": "claude-opus-4-1",
+        "effort": "high",
+        "permissionMode": "default"
+      },
+      "activity": { "tool": "Bash", "subagents": 1, "turns": 3 },
       "process": { "pid": 42, "startedAt": "…", "host": "…" },
       "terminal": { "sessionId": "…", "terminalType": "iterm", "kittyListenOn": null, "kittyPid": null },
       "tmux": { "pane": "%1", "sessionName": "main", "socket": "/private/tmp/tmux-501/default" },
@@ -105,7 +113,9 @@ agents (`SessionStart`), snake_case for Pi (`session_start`), dot-case for OpenC
 (`session.created`), plus the synthetic `swept`. A corrective re-send after fan-out carries the
 stored event prefixed `resend:` (for example `resend:UserPromptSubmit`) instead of repeating it
 verbatim. Branch on `phase` and `running`, which are normalized; treat `event` as a diagnostic
-label rather than a dispatch key.
+label rather than a dispatch key. A session can be forwarded again without a phase change, for
+example when a child starts a tool while the parent waits on a permission prompt, so act on a
+change of `phase` rather than on every record that carries it.
 
 `phase` aggregates a session with any child agents it is tracking (Codex subagents, Droid Task
 children) — a child's own activity can hold an idle parent `working` or surface its permission
@@ -115,6 +125,21 @@ tell it apart from the parent's own events. Claude's background tasks are tracke
 from that mechanism: a live one just holds `Stop` at `working` instead of settling `idle`, with
 no `child:` prefix and no permission surfacing. See
 [status lifecycle](docs/status-lifecycle.md#child-agents) for the aggregation rule.
+
+**Session details** are optional additions to protocol 1. `session` may carry `title`, `model`,
+`effort` and `permissionMode`, which describe the conversation; `activity` carries `tool` (the
+tool running now), `problem` (a snake_case token such as `rate_limit_error` or `interrupted`
+from the last failed turn), `subagents` (always present, 0 when none run or the agent cannot
+report them), `contextPercent` (0–100) and `turns` (always present: the turns started since
+the session began, 0 for a new conversation). A key is absent when nothing is known, and records
+written by older binaries have no `activity`; decode every detail leniently. Values are sticky:
+each record carries the latest known value until an event sets or clears it, so a consumer
+displays what it receives rather than merging events itself. Some events only update details
+(a model switch, for example); they change the stored record but are not sent, and their values
+arrive with the session's next event. Droid's `PostToolUse` is the exception: it clears the tool
+and is sent when that changes the record, without changing `phase`. Text is sanitized (control and format characters removed,
+at most 120 characters); prompts, tool input and output, and message bodies are never read. See
+[session details](docs/status-lifecycle.md#session-details) for the merge rules.
 
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which also separates two terminals driving the same native session.

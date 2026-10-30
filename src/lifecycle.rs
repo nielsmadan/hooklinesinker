@@ -31,6 +31,13 @@ impl Hints {
     }
 }
 
+pub(crate) fn subagent_id(input: &serde_json::Value) -> Option<&str> {
+    input
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
 fn invalid_metadata(e: &serde_json::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -69,13 +76,12 @@ impl ChildClaim {
             ChildTracking::Untracked => Ok(Self::Root),
             ChildTracking::SharedSession { child_start, .. } => {
                 let hints = Hints::parse(input).map_err(|e| invalid_metadata(&e))?;
-                Ok(match hints.text("agent_id") {
-                    Some(agent_id) if !agent_id.is_empty() => Self::Agent {
+                Ok(
+                    subagent_id(&hints.0).map_or(Self::Root, |agent_id| Self::Agent {
                         child_key: child_key(agent_id),
                         starts: event == child_start,
-                    },
-                    _ => Self::Root,
-                })
+                    }),
+                )
             }
             ChildTracking::LinkedSessions { .. } => {
                 if event != "SessionStart" {
@@ -145,7 +151,7 @@ impl SessionContext {
             }),
             EventSource::Native => {
                 let hints = Hints::parse(input).map_err(invalid)?;
-                let role = if hints.present("agent_id") {
+                let role = if subagent_id(&hints.0).is_some() {
                     Self::Background
                 } else if event == "SessionStart" && hints.text("source") == Some("resume") {
                     Self::Selected

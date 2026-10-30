@@ -1,0 +1,9 @@
+{
+  "session_id": "pi-details",
+  "cwd": "/Users/example/project",
+  "model": "claude-sonnet-5",
+  "effort": "medium",
+  "session_title": "Port the adapter",
+  "context_percent": 41.7,
+  "problem": "interrupted"
+}
