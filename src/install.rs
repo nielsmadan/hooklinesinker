@@ -412,10 +412,13 @@ mod tests {
             claude_dir: base.join("claude"),
             codex_dir: base.join("codex"),
             opencode_config_dir: base.join("opencode"),
+            kilo_config_dir: base.join("kilo"),
             pi_agent_dir: base.join("pi"),
             factory_dir: base.join("factory"),
             qwen_config_dir: base.join("qwen"),
             kimi_code_dir: base.join("kimi-code"),
+            goose_root: base.join("goose"),
+            copilot_home: base.join("copilot"),
             binary_path: install.binary_path(),
             home: base.join("home"),
         })

@@ -1,4 +1,4 @@
-use crate::agents::{ChildTracking, profile};
+use crate::agents::{ChildTracking, EventSource, profile};
 use crate::children::{
     ChildEvent, Children, aggregate_phase, all_idle, child_key, child_phase, completion_holds_root,
     with_child,
@@ -10,7 +10,7 @@ use crate::details::{
 use crate::lifecycle::{ChildClaim, SessionContext};
 use crate::persistence::{LockGuard, json_record_paths, read_json_records, write_private_atomic};
 use crate::processes::{ProcessLiveness, Timestamp};
-use crate::protocol::{Activity, Agent, Phase, ProcessIdentity, SessionIdentity, StatusEvent};
+use crate::protocol::{Activity, Phase, ProcessIdentity, SessionIdentity, StatusEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -116,7 +116,7 @@ impl From<StoredStatusWire> for StoredStatus {
     fn from(wire: StoredStatusWire) -> Self {
         let parallel = wire
             .parallel
-            .unwrap_or(wire.status.agent == Agent::Opencode);
+            .unwrap_or_else(|| profile(wire.status.agent).event_source == EventSource::OpenCode);
         Self {
             own_phase: wire.own_phase.unwrap_or(wire.status.phase),
             children: wire.children,
@@ -351,7 +351,12 @@ impl StatusStore {
         let (own_phase, children) = if let Some(rootless) = rootless {
             rootless
         } else {
-            let own_phase = if matches!(
+            let own_phase = if signals.traits.preserve_permission
+                && event.running
+                && previous.is_some_and(|stored| stored.own_phase == Phase::Permission)
+            {
+                Phase::Permission
+            } else if matches!(
                 signals.context,
                 SessionContext::Selected | SessionContext::SelectedParallel
             ) && crate::agents::profile(event.agent).retains_phase_on_selection
@@ -1318,6 +1323,21 @@ mod tests {
         let value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         fs::remove_file(&path).unwrap();
         value
+    }
+
+    #[test]
+    fn kilo_legacy_records_and_roundtrips_keep_parallel_roots() {
+        let mut record = legacy_record();
+        record["agent"] = json!("kilo");
+        record.as_object_mut().unwrap().remove("parallel");
+        let stored =
+            StoredStatus::from(serde_json::from_value::<StoredStatusWire>(record).unwrap());
+        assert!(stored.parallel);
+        let reread = StoredStatus::from(
+            serde_json::from_value::<StoredStatusWire>(written(&stored, "kilo")).unwrap(),
+        );
+        assert!(reread.parallel);
+        assert_eq!(reread.own_phase, Phase::Working);
     }
 
     #[test]

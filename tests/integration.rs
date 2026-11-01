@@ -3160,10 +3160,13 @@ fn hook_manager_at(base: &std::path::Path, binary_path: PathBuf) -> HookManager 
         claude_dir: base.join("claude"),
         codex_dir: base.join("codex"),
         opencode_config_dir: base.join("opencode"),
+        kilo_config_dir: base.join("kilo"),
         pi_agent_dir: base.join("pi"),
         factory_dir: base.join("factory"),
         qwen_config_dir: base.join("qwen"),
         kimi_code_dir: base.join("kimi-code"),
+        goose_root: base.join("goose"),
+        copilot_home: base.join("copilot"),
         binary_path,
         home: base.join("home"),
     })
@@ -4039,4 +4042,164 @@ fn pi_null_clears_every_detail_but_the_problem() {
     assert!(cleared["session"].get("title").is_none());
     assert!(cleared["activity"].get("contextPercent").is_none());
     assert_eq!(cleared["activity"]["problem"], "interrupted");
+}
+
+#[test]
+fn devin_fixture_uses_project_directory_for_git_and_session_identity() {
+    let native = include_str!("fixtures/devin-pretool.json");
+    let canonical =
+        crate::normalize::canonical_native_input(Agent::Devin, "PreToolUse", native).unwrap();
+    let cwd = crate::normalize::effective_hook_cwd(
+        Agent::Devin,
+        &canonical,
+        "/hook-launch".into(),
+        Some("/work/project"),
+    );
+    let source = FakeEnvSource::new()
+        .with_command(
+            "git",
+            &["-C", "/work/project", "rev-parse", "--show-toplevel"],
+            "/work/project",
+        )
+        .with_command(
+            "git",
+            &["-C", "/work/project", "rev-parse", "--abbrev-ref", "HEAD"],
+            "feature",
+        );
+    let environment = environment::gather_environment(&source, cwd);
+    let event = normalize(
+        Agent::Devin,
+        "PreToolUse",
+        &canonical,
+        &environment,
+        Some(test_process()),
+    )
+    .unwrap()
+    .into_event()
+    .unwrap();
+    assert_eq!(event.session.cwd, "/work/project");
+    assert_eq!(
+        event.git.unwrap(),
+        crate::protocol::GitIdentity {
+            branch: Some("feature".into()),
+            repo: Some("project".into())
+        }
+    );
+    assert_eq!(event.session.id, "devin-session");
+    assert_eq!(event.phase, Phase::Working);
+}
+
+#[test]
+fn goose_native_lifecycle_preserves_privacy_and_sweeps_dead_owner() {
+    let store = store();
+    let owner = test_process();
+    let liveness = FakeProcessLookup::with_owner(owner.clone());
+    liveness.set_alive(owner.pid, &owner.started_at);
+    let client = RecordingHttpClient::default();
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "goose-test",
+            &["status"],
+            Some("http://127.0.0.1:1234"),
+        ))
+        .unwrap();
+    let ctx = ingest::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    let input = include_str!("fixtures/goose-tool.json");
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUseFailure",
+    ] {
+        assert!(
+            ingest(&ctx, Agent::Goose, event, input, 99)
+                .problem
+                .is_none()
+        );
+    }
+    let records = store.running(&liveness).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].phase, Phase::Working);
+    assert_eq!(records[0].session.cwd, "/work/goose-project");
+    assert_eq!(records[0].process, Some(owner.clone()));
+    assert_eq!(records[0].activity.turns, 1);
+    for body in client.bodies() {
+        assert_eq!(body["agent"], "goose");
+        assert_eq!(body["session"]["cwd"], "/work/goose-project");
+        assert!(body.get("tool_input").is_none());
+        assert!(body.get("message").is_none());
+    }
+    liveness.set_dead(owner.pid);
+    assert_eq!(store.running(&liveness).unwrap(), []);
+    ingest(
+        &ctx,
+        Agent::Goose,
+        "Stop",
+        r#"{"session_id":"new-session"}"#,
+        99,
+    );
+    assert!(client.bodies().iter().any(|body| body["event"] == "swept"
+        && body["session"]["id"] == "goose-session"
+        && body["running"] == false));
+}
+
+#[test]
+fn goose_foreign_host_is_ignored_but_manual_fixture_is_retained() {
+    struct ForeignGoose(bool);
+    impl ProcessLiveness for ForeignGoose {
+        fn process_is_alive(&self, _: &ProcessIdentity) -> bool {
+            true
+        }
+    }
+    impl ProcessLookup for ForeignGoose {
+        fn owner_of(&self, _: u32, _: Agent) -> Option<ProcessIdentity> {
+            None
+        }
+        fn goose_non_cli_host(&self, _: u32) -> bool {
+            self.0
+        }
+    }
+    for foreign in [true, false] {
+        let root = temp_home();
+        let store = StatusStore::open(&root).unwrap();
+        let lookup = ForeignGoose(foreign);
+        let ctx = ingest::IngestContext {
+            store: &store,
+            liveness: &lookup,
+            consumers: None,
+            http_client: &FailingHttpClient,
+        };
+        assert!(
+            ingest(
+                &ctx,
+                Agent::Goose,
+                "PreToolUse",
+                include_str!("fixtures/goose-tool.json"),
+                99
+            )
+            .problem
+            .is_none()
+        );
+        assert_eq!(ledger_files(&root), usize::from(!foreign));
+    }
+}
+
+#[test]
+fn kilo_adapter_statuses_normalize_with_native_directory() {
+    let native = include_str!("fixtures/kilo-offline.json");
+    for (name, phase) in [
+        ("session.status.offline", Phase::Working),
+        ("session.status.scheduled", Phase::Idle),
+    ] {
+        let event = normalize_for_test(Agent::Kilo, name, native);
+        assert_eq!(event.phase, phase);
+        assert_eq!(event.session.id, "kilo-session");
+        assert_eq!(event.session.cwd, "/tmp/kilo-project");
+    }
 }

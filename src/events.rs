@@ -85,6 +85,60 @@ pub(crate) const CODEX: &[EventSpec] = &[
     event!("SessionEnd", None, 3, Remove),
 ];
 
+pub(crate) const ANTIGRAVITY: &[EventSpec] = &[
+    event!("SessionStart", None, 5, Update(Phase::Idle)),
+    event!("PreInvocation", None, 5, Update(Phase::Working)),
+    event!("PostToolUse", Some(".*"), 5, Refresh).role(ToolEnd),
+    event!("Stop", None, 5, Update(Phase::Idle)),
+];
+
+pub(crate) fn native_hook_response(agent: Agent, event: &str) -> Option<&'static str> {
+    match (agent, event) {
+        (Agent::Antigravity, "Stop") => Some(r#"{"decision":"allow"}"#),
+        (Agent::Antigravity, "SessionStart" | "PreInvocation" | "PostToolUse") => Some("{}"),
+        _ => None,
+    }
+}
+
+pub(crate) const COPILOT: &[EventSpec] = &[
+    event!("SessionStart", None, 5, Update(Phase::Idle)),
+    event!("SessionEnd", None, 5, Remove),
+    event!("UserPromptSubmit", None, 5, Update(Phase::Working)).role(TurnStart),
+    event!("PreToolUse", None, 5, Update(Phase::Working)).role(ToolStart),
+    event!("PostToolUse", None, 5, Refresh).role(ToolEnd),
+    event!("PostToolUseFailure", None, 5, Refresh).role(ToolEnd),
+    event!("Stop", None, 5, Update(Phase::Idle)),
+    event!("PreCompact", None, 5, Update(Phase::Compacting)),
+    EventSpec {
+        name: "notification",
+        matcher: None,
+        timeout: Duration::from_secs(5),
+        action: None,
+        role: DetailRole::Plain,
+    },
+];
+
+pub(crate) const GOOSE: &[EventSpec] = &[
+    event!("SessionStart", None, 5, Update(Phase::Idle)),
+    event!("SessionEnd", None, 5, Remove),
+    event!("UserPromptSubmit", None, 5, Update(Phase::Working)).role(TurnStart),
+    event!("Stop", None, 5, Update(Phase::Idle)),
+    event!("PreToolUse", Some(".*"), 5, Update(Phase::Working)).role(ToolStart),
+    event!("PostToolUse", Some(".*"), 5, Refresh).role(ToolEnd),
+    event!("PostToolUseFailure", Some(".*"), 5, Refresh).role(ToolEnd),
+];
+
+pub(crate) const DEVIN: &[EventSpec] = &[
+    event!("SessionStart", None, 5, Update(Phase::Idle)),
+    event!("UserPromptSubmit", None, 5, Update(Phase::Working)).role(TurnStart),
+    event!("PreToolUse", None, 5, Update(Phase::Working)).role(ToolStart),
+    event!("PostToolUse", None, 5, Refresh).role(ToolEnd),
+    event!("PermissionRequest", None, 5, Update(Phase::Permission)).role(ToolStart),
+    event!("Stop", None, 5, Update(Phase::Idle)),
+    event!("SessionEnd", None, 5, Remove),
+    event!("PostCompaction", None, 5, Annotate),
+];
+
 pub(crate) const DROID: &[EventSpec] = &[
     event!("SessionStart", None, 5, Update(Phase::Idle)),
     event!("UserPromptSubmit", None, 5, Update(Phase::Working)).role(TurnStart),
@@ -178,6 +232,15 @@ pub(crate) fn native_event_lookup(
         (Agent::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
             return Mapped(Update(Phase::Idle));
         }
+        (Agent::Copilot, "notification") => {
+            return match notification_type {
+                Some("permission_prompt" | "elicitation_dialog") => {
+                    Mapped(Update(Phase::Permission))
+                }
+                _ => Unmapped,
+            };
+        }
+        (Agent::Copilot, "PermissionRequest") => return Unmapped,
         (Agent::Droid, "Notification") => {
             return match notification_type {
                 Some("permission_prompt" | "elicitation_dialog") => {

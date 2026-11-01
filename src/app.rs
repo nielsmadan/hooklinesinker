@@ -74,11 +74,18 @@ fn print_version(json: bool) {
 }
 
 fn run_ingest(agent: Agent, event: &str) {
+    ingest_telemetry(agent, event);
+    if let Some(response) = crate::events::native_hook_response(agent, event) {
+        stdoutln!("{response}");
+    }
+}
+
+fn ingest_telemetry(agent: Agent, event: &str) {
     let Ok(state_root) = paths::state_root() else {
-        std::process::exit(0);
+        return;
     };
     let Ok(store) = StatusStore::open(&state_root) else {
-        std::process::exit(0);
+        return;
     };
 
     let input = match ingest::read_capped(&mut io::stdin(), 1_048_576) {
@@ -88,7 +95,7 @@ fn run_ingest(agent: Agent, event: &str) {
                 HealthKind::Ingest,
                 format!("stdin read failed: {e}"),
             ));
-            std::process::exit(0);
+            return;
         }
     };
 
@@ -107,6 +114,12 @@ fn run_ingest(agent: Agent, event: &str) {
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_default();
+    let cwd = crate::normalize::effective_hook_cwd(
+        agent,
+        &input,
+        cwd,
+        std::env::var("DEVIN_PROJECT_DIR").ok().as_deref(),
+    );
     let env = environment::gather_environment(&SystemEnv, cwd);
     let liveness = SystemProcessLookup::new();
     let http_client = UreqHttpClient::new();
@@ -123,7 +136,6 @@ fn run_ingest(agent: Agent, event: &str) {
     if let Some(problem) = outcome.problem {
         eprintln!("ingest problem: {problem}");
     }
-    std::process::exit(0);
 }
 
 pub(crate) fn sessions_response(

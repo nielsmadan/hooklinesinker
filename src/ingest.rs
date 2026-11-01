@@ -3,7 +3,7 @@ use crate::children::ChildEvent;
 use crate::consumers::ConsumerStore;
 use crate::details::{Details, EventTraits};
 use crate::lifecycle::{ChildClaim, SessionContext, awaits_user, clears_children};
-use crate::normalize::{HookEnvironment, Normalized, normalize};
+use crate::normalize::{HookEnvironment, Normalized, canonical_native_input, normalize};
 use crate::processes::ProcessLookup;
 use crate::protocol::{Agent, StatusEvent};
 use crate::sinks::{HttpClient, SinkFanout};
@@ -41,6 +41,36 @@ pub(crate) struct IngestContext<'a> {
     pub http_client: &'a dyn HttpClient,
 }
 
+fn antigravity_cli_transcript(input: &str) -> bool {
+    let Ok(native) = serde_json::from_str::<serde_json::Value>(input) else {
+        return false;
+    };
+    let Some(id) = native
+        .get("conversationId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(transcript) = native
+        .get("transcriptPath")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let path = std::path::Path::new(transcript);
+    !id.is_empty()
+        && !id.contains(['/', '\\'])
+        && path.is_absolute()
+        && !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        && path.ends_with(
+            std::path::Path::new(".gemini/antigravity-cli/brain")
+                .join(id)
+                .join(".system_generated/logs/transcript.jsonl"),
+        )
+}
+
 pub(crate) fn handle_ingest(
     ctx: &IngestContext,
     agent: Agent,
@@ -49,14 +79,40 @@ pub(crate) fn handle_ingest(
     env: &HookEnvironment,
     hook_pid: u32,
 ) -> IngestOutcome {
+    if agent == Agent::Goose && ctx.liveness.goose_non_cli_host(hook_pid) {
+        return IngestOutcome { problem: None };
+    }
+    if agent == Agent::Claude
+        && ctx
+            .liveness
+            .nearest_agent(hook_pid)
+            .is_some_and(|(host, _)| matches!(host, Agent::Devin | Agent::Copilot))
+    {
+        return IngestOutcome { problem: None };
+    }
+    if agent == Agent::Antigravity
+        && (!ctx
+            .liveness
+            .nearest_agent(hook_pid)
+            .is_some_and(|(host, _)| host == agent)
+            || !antigravity_cli_transcript(input))
+    {
+        return IngestOutcome { problem: None };
+    }
     let process = ctx.liveness.owner_of(hook_pid, agent);
-    handle_normalized(
-        ctx,
-        agent,
-        event,
-        input,
-        normalize(agent, event, input, env, process),
-    )
+    if agent == Agent::Antigravity && process.is_none() {
+        return IngestOutcome { problem: None };
+    }
+    match canonical_native_input(agent, event, input) {
+        Ok(input) => handle_normalized(
+            ctx,
+            agent,
+            event,
+            &input,
+            normalize(agent, event, &input, env, process),
+        ),
+        Err(error) => handle_normalized(ctx, agent, event, input, Err(error)),
+    }
 }
 
 pub(crate) fn handle_normalized(

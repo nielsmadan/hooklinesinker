@@ -7,7 +7,7 @@ for activation, paths, and consumer lifetime.
 
 ## Configuration ownership
 
-Claude, Codex, and Qwen store event groups under a JSON `hooks` key. Droid's JSON
+Claude, Codex, Qwen, and Devin store event groups under a JSON `hooks` key. Droid's JSON
 root is the event map. Their installers preserve foreign groups and unrelated
 values. Reconciliation removes recognized command handlers, including legacy Juggler notify
 handlers, and installation adds fresh owned groups. Foreign handlers inside mixed groups
@@ -118,6 +118,47 @@ wire agent to its event source, hook backend, status-event table, executable nam
 markers, lifecycle flags, and timeout unit. Backend-specific parsing still lives in the modules
 named above, but a new agent cannot silently omit one of these cross-cutting choices.
 
+## Devin CLI
+
+`hooks install --agent devin` manages the `hooks` key in `~/.config/devin/config.json`.
+It writes eight grouped command hooks with omitted matchers and five-second timeouts,
+preserving other configuration and foreign handlers. The documented user path is fixed;
+`XDG_CONFIG_HOME` does not redirect this installer. Devin describes command hooks as shell
+commands, so home-relative binary spellings are accepted as well as the generated quoted
+absolute path. The command returns silent success and never emits a permission decision.
+
+`SessionStart` reports idle; `UserPromptSubmit` reports working and increments turns;
+`PreToolUse` reports working and sets the tool; `PostToolUse` clears the tool while preserving
+phase. `Stop` reports idle and `SessionEnd` removes only that session. `PostCompaction`
+annotates without starting a compacting phase. The [lifecycle reference](https://docs.devin.ai/cli/extensibility/hooks/lifecycle-hooks)
+says it fires “after context compaction completes successfully.” It describes
+`PermissionRequest` as “Fires when the agent needs a permission decision.” Hooklinesinker
+reports that event as permission, conservatively retaining it across tool activity until a
+root prompt, stop, or session-start boundary. A policy may resolve the decision immediately;
+there is no documented resolution hook or tool-call correlation ID, so this is not proof
+that a human dialog remains open. `prompt_id` identifies a turn, not an individual tool.
+
+A nonempty native `session_id` is required. The project root comes from `DEVIN_PROJECT_DIR`
+when the payload omits `cwd`; Git context is gathered from that effective directory.
+Prompts, tool arguments/results, compaction summaries, and raw payloads are never persisted.
+No child count, compaction-in-progress, or hosted Devin state is inferred. Same-process
+sessions are retained independently because the public contract does not establish exclusive
+ownership across every CLI mode.
+
+Devin imports Claude hook configuration by default. A declared Claude callback is suppressed
+when its nearest recognized ancestor is Devin; the native Devin callback supplies the record.
+A real Claude process nested under Devin remains Claude, and unknown ancestry keeps explicit
+manual ingestion working. Script-runtime detection uses the launcher position rather than
+matching arbitrary arguments. The [hook overview](https://docs.devin.ai/cli/extensibility/hooks/overview)
+documents the inherited configuration and global path.
+
+The fixture contract was checked against the official documentation on 2026-11-01 and the
+verified Devin CLI 3000.11.234 bundle (`92c83011d113`). Automated checks cover installation,
+normalization, permission precedence, process provenance, and generated command execution.
+An isolated `auth status` reported “Not logged in”; a minimal non-interactive prompt exited
+with “Login canceled.” Live hook delivery and inheritance suppression remain unverified.
+No minimum host version is promised.
+
 ## Embedded TypeScript
 
 [`opencode-hooklinesinker.ts`](../adapters/opencode-hooklinesinker.ts) and
@@ -220,3 +261,142 @@ runtime validation before property access.
 ingest binary, covering routing, malformed payloads, permission state, and hangs.
 Without Node 22.6+, these behavior tests print `SKIP` and pass. Development needs
 Node 22.12+; see [development and releases](development-and-releases.md) for checks.
+
+## Goose CLI
+
+Goose v1.57.0 source establishes user plugin discovery from `.agents/plugins`, grouped
+`hooks/hooks.json` without a manifest, regex matchers, seconds for `timeout`, and `sh -c`
+command execution. Both absolute and home-relative hook commands are supported.
+Registered events are `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`,
+`PreToolUse`, `PostToolUse`, and `PostToolUseFailure`. The native `working_dir` becomes
+`cwd` before lifecycle recording; environment/git discovery also uses that directory.
+No prompt, message, tool input/output, or transcript content is stored.
+
+Scope is foreground Goose CLI (`goose session` / `goose run`). Known `goose serve` and
+legacy `goosed` callbacks are ignored because they also serve Desktop; a standalone shared
+backend cannot identify its CLI consumer. Unknown process provenance retains explicit replay
+support. ACP/gateway owners are conservatively shared, preserving separate session IDs;
+Desktop/serve support and complete subagent aggregation are unavailable.
+
+Validation: source pinned to v1.57.0 (`30bba95105e59bc3e7df624cf6b4d433690cfe12`);
+installer, generated shell commands, lifecycle, and filtering have fixture coverage.
+The isolated 1.57.0 live prompt stopped with “No provider configured” before model execution;
+real turn/tool/session-end delivery is not live-verified.
+
+
+## GitHub Copilot CLI
+
+`hooks install --agent copilot` writes `$COPILOT_HOME/hooks/hooklinesinker.json`, defaulting
+to `~/.copilot/hooks/hooklinesinker.json`. Its version 1 envelope contains direct command
+handlers with `timeoutSec: 5` and no matcher. The shell `command` field is the cross-platform
+fallback, so absolute and home-relative commands are recognized. Windows command execution
+is outside this macOS/Linux validation. Foreign handlers and other top-level keys survive.
+Installed status requires the exact envelope version and handler shape, with one owned entry
+per event. A matching command carrying `bash`, `powershell`, `exec`, `args`, `cwd`, or `env`
+overrides is unsupported and remains untouched. No-op installation preserves bytes; changed
+files use the existing conditional atomic writer and preserve file mode.
+
+The subscribed events are `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure`, `Stop`, `PreCompact`, and lowercase `notification`.
+The [official reference](https://docs.github.com/en/copilot/reference/hooks-reference)
+states: “Empty output uses default behavior.” Ingest produces no permission decisions and
+returns zero on controlled telemetry failures. Copilot pretool hooks fail closed on crashes
+or other nonzero exits; timeouts fail open. This means a killed/crashed helper can deny a
+tool even though its normal error handling is nonblocking.
+
+Copilot's session sandbox also applies to user command hooks. The active binary, state/data
+roots, and configured sinks must be reachable under the user's policy. Hook installation
+never widens sandbox access or disables sandboxing. Configuration status does not prove that
+the host loaded the file or granted access.
+
+Only native identity, cwd, and tool metadata enter status. Prompts, notification messages,
+and tool arguments/results are not persisted. Known child callbacks are ignored; child counts
+and complete child lifecycle coverage are unavailable. Copilot reads repository Claude hooks,
+so the nearest-producer guard suppresses inherited Claude callbacks without suppressing a real
+Claude process nested inside Copilot. Unknown ancestry preserves explicit replay.
+
+Validation uses official documentation and Copilot CLI 1.0.105. Automated coverage includes
+schema/ownership, generated commands, canonicalization, waits, child isolation, provenance,
+and independent sessions. The isolated live prompt failed token validation on a network request before model execution;
+live hook delivery and sandbox access remain unverified. No minimum host version is promised.
+
+## Antigravity CLI — provisional, support blocked
+
+The `antigravity` profile is preparatory integration, **not verified CLI support**. It is
+included in all-agent configuration management; `hooks status` and installation output mark
+its configuration as provisional even when the four definitions are installed correctly.
+Do not interpret `installed` as proof of a usable lifecycle.
+
+The named definition `hooklinesinker` in `~/.gemini/config/hooks.json` subscribes
+`SessionStart`, `PreInvocation`, `PostToolUse`, and `Stop`. Tool events use matcher groups;
+the other events contain direct handlers. Each command has a five-second timeout. Foreign
+names and handlers are preserved. A reserved-name collision without recognized commands, an
+unsupported shape, or a disabled definition containing foreign handlers is left unchanged.
+A disabled wholly owned definition is drifted and can be enabled. Home-relative shell commands
+are recognized; idempotent installation preserves bytes and updates preserve the file mode.
+
+The [hook reference](https://antigravity.google/docs/hooks) describes `command` as “The shell
+command to execute.” Its Stop contract says “Any other value allows the stop.” Stop responses
+are `{"decision":"allow"}`; the other subscribed hooks return `{}`. Controlled stdin, path,
+state, normalization, and sink errors still reach that response. Crashes, termination,
+broken stdout, and host timeouts cannot guarantee a response. Existing storage locks can wait
+ten seconds, exceeding this host's five-second hook timeout; real timeout behavior remains
+unverified. No permission hook is subscribed and no approval is emitted.
+
+Callbacks require both a positively identified `agy`/`antigravity` CLI ancestor and a matching
+absolute `.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
+path. App/IDE paths, traversal paths, unknown owners, and detached backends produce no rows or
+terminal attribution. No transcript contents are read. `conversationId`, `transcriptPath`,
+`modelName`, and `toolCall.name` supply identity/details. The current directory wins when it is
+inside a listed absolute workspace; otherwise the first valid workspace wins. Git discovery
+uses that effective directory. `PreInvocation` reports working without counting a user turn;
+`PostToolUse` refreshes details. Stop requires boolean `fullyIdle`: true reports idle, false
+reports working; missing or invalid values record health and leave existing state unchanged.
+
+Validation used official documentation and isolated binaries `agy` 1.1.11 and `antigravity`
+1.4.12. The initial minimal prompts failed authentication. A subsequent isolated 1.4.12 run
+loaded the generated named hook definition, then failed silent authentication and attempted
+OAuth; it was terminated at the 35-second probe deadline without interaction. Automated fixtures cover the schema,
+responses and conservative lifecycle, but **actual hook ancestry, closing a CLI while its
+backend survives, eventual authoritative settlement after Stop(false), and host timeout/crash
+semantics remain blocked**. The public fullyIdle field definition does not establish a later
+Stop(true) notification. Multiple conversations remain independent and a verified CLI owner
+would drive dead-process sweeping; a live backend is never substituted for that owner. No
+permission, compaction, session-end or complete child state is inferred. These gates must be
+resolved before advertising support.
+
+
+## Kilo CLI
+
+Kilo uses the same standalone TypeScript source as OpenCode. The installer renders a closed
+host configuration into `HOST_CONFIG`: agent name, native status mapping, background flag and
+default, compaction policy, and disposal callback policy. Neither installed plugin imports its
+sibling or an SDK at runtime. There is one exported plugin function.
+
+The installed path is `$KILO_CONFIG_DIR/plugins/hooklinesinker-kilo.ts`, otherwise
+`$XDG_CONFIG_HOME/kilo/plugins/hooklinesinker-kilo.ts`, otherwise
+`~/.config/kilo/plugins/hooklinesinker-kilo.ts`. Kilo also discovers project/home `.kilo` and
+`.kilocode` directories; these are not installation targets. It does not discover OpenCode's
+configuration roots. Kilo reconciliation has no legacy filename and cannot remove OpenCode's
+legacy adapter. `KILO_PURE=true` or `--pure` disables external plugins, including this adapter.
+
+Kilo's background-child hold defaults to enabled. `KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false`
+disables it independently of `KILO_EXPERIMENTAL` and OpenCode flags. `offline` maps to working;
+`scheduled` maps to idle, subject to live-child and permission precedence. Permission requests
+remain keyed by native ask ID and replies by `requestID`. Completed compaction emits `session.compaction.completed` and annotates the
+current phase; it does not start a compacting phase. Kilo's awaited `dispose` callback attempts
+known-root deletions; instance-disposal events use the same cleanup. Disposal closes event
+admission, drains the existing queue within its elapsed two-second budget, then runs up to eight
+deletion helpers concurrently within one additional two-second budget (each stage allows 100 ms
+for forced termination). Budget exhaustion warns with the number of unattempted deletions.
+Concurrent or repeated disposal shares that cleanup, including when the ordinary queue is full.
+Cleanup is best effort: helper failures or budget exhaustion can leave stale records while the
+backend remains alive. Process death retains the usual PID/start-time sweep. Child activity is aggregated by the plugin, with no invented child
+count at the Rust boundary.
+
+The v7.8.25 source contract is pinned in the [event reference](reference/agent-hook-events.md#kilo-cli-source-contract).
+Automated tests execute installed absolute and accepted home-relative artifacts, including paths
+with spaces and apostrophes. Shared fixtures cover queue bounds/deadlines, root-child concurrency,
+permission replies, unknown statuses and disposal. The isolated live turn completed with `openrouter/openai/gpt-4.1-mini`; native plugin discovery,
+Kilo process attribution and disposal removal were observed. The default model first failed with
+an endpoint/tool-compatibility error. Live background-child settlement remains unverified.

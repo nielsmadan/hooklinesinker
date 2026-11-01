@@ -12,6 +12,7 @@
 //                     subscribedChannels, elapsedMs } }
 
 import { mkdirSync, chmodSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -34,11 +35,13 @@ const PI_EMPTY_ASYNC_ROOT = join(workdir, "pi-empty-async-root");
 mkdirSync(PI_EMPTY_ASYNC_ROOT, { recursive: true });
 process.env.PI_SUBAGENTS_TEMP_ROOT = PI_EMPTY_ASYNC_ROOT;
 
-function timesOutOnPurpose(scenario) {
-  return scenario.endsWith(":hang") || scenario.endsWith(":slow") || scenario.endsWith(":stubborn");
+function usesProductionBudget(scenario) {
+  return scenario.endsWith(":hang") || scenario.endsWith(":slow") || scenario.endsWith(":stubborn") || scenario.endsWith(":dispose-slow") || scenario.endsWith(":deletion-slow") || scenario.endsWith(":dispose_many_roots") || scenario.endsWith(":dispose_full_queue");
 }
 
 function recorderTail(scenario) {
+  if (scenario.endsWith(":deletion-slow")) return 'if [[ "$*" == *session.deleted* ]]; then trap "" TERM; sleep 3600; fi';
+  if (scenario.endsWith(":dispose-slow")) return 'if [[ "$*" == *session.status.busy* ]]; then trap "" TERM; sleep 3600; fi';
   if (scenario.endsWith(":hang")) return "sleep 3600";
   if (scenario.endsWith(":slow")) return "sleep 0.05";
   if (scenario.endsWith(":stubborn")) return "trap '' TERM; sleep 3600";
@@ -50,7 +53,7 @@ function recorderTail(scenario) {
 /// so the adapter's own timeout and kill are what have to end the call; ":stubborn" also ignores
 /// SIGTERM, so only the follow-up SIGKILL ends it and the hook outlives its deadline.
 function stage(assetPath, scenario) {
-  const dir = join(workdir, scenario.replaceAll(":", "-"));
+  const dir = join(workdir, scenario.replaceAll(":", "-") + " quoted path's");
   mkdirSync(dir, { recursive: true });
   const recordLog = join(dir, "invocations.jsonl");
   const pidLog = join(dir, "pids.txt");
@@ -72,8 +75,30 @@ ${recorderTail(scenario)}
   // The adapters carry an expression the installer rewrites; do the same substitution here so
   // the shipped asset is exercised verbatim apart from the binary expression. A home-relative
   // scenario resolves the binary through `homedir()` with HOME pointed at the scenario dir.
-  const source = readFileSync(assetPath, "utf8");
-  if (!source.includes(BIN_EXPRESSION)) {
+  let source = readFileSync(assetPath, "utf8");
+  if (assetPath === OPENCODE_ADAPTER) {
+    const agent = scenario.startsWith("kilo:") ? "kilo" : "opencode";
+    const env = { ...process.env, HOME: dir, XDG_CONFIG_HOME: join(dir, "config"),
+      XDG_DATA_HOME: join(dir, "data"), XDG_STATE_HOME: join(dir, "state"),
+      OPENCODE_CONFIG_DIR: join(dir, "config", "opencode"), KILO_CONFIG_DIR: join(dir, "config", "kilo") };
+    for (const key of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "QWEN_HOME", "KIMI_CODE_HOME", "GOOSE_PATH_ROOT", "COPILOT_HOME"]) delete env[key];
+    const installed = spawnSync(process.env.HLS_TEST_BINARY, ["install", "--consumer", "adapter-test"], { env, encoding: "utf8" });
+    if (installed.status !== 0) throw new Error(installed.stderr);
+    const hooks = spawnSync(process.env.HLS_TEST_BINARY, ["hooks", "install", "--agent", agent], { env, encoding: "utf8" });
+    if (hooks.status !== 0) throw new Error(hooks.stderr);
+    const installedPath = join(dir, "config", agent, "plugins", `hooklinesinker-${agent}.ts`);
+    source = readFileSync(installedPath, "utf8");
+    const installedBinary = JSON.parse(source.match(/^const HOOKLINESINKER_BIN: string = (.+);$/m)[1]);
+    if (scenario.endsWith(HOME_RELATIVE_SUFFIX)) {
+      source = source.replace(JSON.stringify(installedBinary), `join(homedir(), ${JSON.stringify(relative(dir, installedBinary))})`);
+      source = source.replace('import { spawn } from "node:child_process";', 'import { spawn } from "node:child_process";\nimport { homedir } from "node:os";\nimport { join } from "node:path";');
+      writeFileSync(installedPath, source);
+      const status = spawnSync(process.env.HLS_TEST_BINARY, ["hooks", "status", "--agent", agent, "--json"], { env, encoding: "utf8" });
+      if (status.status !== 0 || JSON.parse(status.stdout).state !== "installed") throw new Error(`home-relative status: ${status.stdout} ${status.stderr}`);
+    }
+    writeFileSync(installedBinary, recorder);
+    chmodSync(installedBinary, 0o755);
+  } else if (!source.includes(BIN_EXPRESSION)) {
     throw new Error(`${assetPath} has no ${BIN_EXPRESSION} expression`);
   }
   const home = scenario.endsWith(HOME_RELATIVE_SUFFIX) ? dir : undefined;
@@ -83,10 +108,8 @@ ${recorderTail(scenario)}
       : `join(homedir(), ${JSON.stringify(relative(home, binPath))})`;
   let staged = source.replaceAll(BIN_EXPRESSION, binExpression);
 
-  // Only scenarios that time out on purpose are about the hook budget. Everywhere else a loaded
-  // machine could let the real 2s deadline kill a spawn mid-handshake and silently drop the
-  // invocation the assertion is waiting for, so give those runs room they will never use.
-  if (!timesOutOnPurpose(scenario)) {
+  // Other lifecycle fixtures relax deadlines to avoid load-dependent dropped spawns.
+  if (!usesProductionBudget(scenario)) {
     const relaxed = staged.replace(
       /^const HOOK_TIMEOUT_MS = \d+;$/m,
       `const HOOK_TIMEOUT_MS = ${RELAXED_HOOK_TIMEOUT_MS};`,
@@ -666,13 +689,24 @@ const holdTheRoot = [
 ];
 
 async function runOpenCode(scenario, adapterPath) {
+  const kilo = scenario.startsWith("kilo:");
+  const nativeDefaults = scenario.endsWith(":defaults");
+  if (nativeDefaults) scenario = scenario.slice(0, -":defaults".length);
+  if (kilo) scenario = scenario.replace(/^kilo:/, "opencode:");
   const module = await import(pathToFileURL(adapterPath).href);
   const background = scenario.endsWith(BACKGROUND_SUFFIX);
   const experimental = scenario.endsWith(EXPERIMENTAL_SUFFIX);
   delete process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS;
   delete process.env.OPENCODE_EXPERIMENTAL;
-  if (background) process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "1";
-  if (experimental) process.env.OPENCODE_EXPERIMENTAL = "true";
+  delete process.env.KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS;
+  delete process.env.KILO_EXPERIMENTAL;
+  if (!nativeDefaults) {
+    if (kilo) process.env.KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS = background || experimental ? "true" : "false";
+    else {
+      if (background) process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "1";
+      if (experimental) process.env.OPENCODE_EXPERIMENTAL = "true";
+    }
+  }
   const plugin = await module.HooklinesinkerPlugin({
     project: {},
     client: {},
@@ -682,9 +716,51 @@ async function runOpenCode(scenario, adapterPath) {
   });
   delete process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS;
   delete process.env.OPENCODE_EXPERIMENTAL;
+  delete process.env.KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS;
+  delete process.env.KILO_EXPERIMENTAL;
 
   const suffix = background ? BACKGROUND_SUFFIX : experimental ? EXPERIMENTAL_SUFFIX : "";
   switch (scenario.slice(0, scenario.length - suffix.length)) {
+    case "opencode:dispose_full_queue":
+    case "opencode:dispose_many_roots":
+    case "opencode:dispose_many_roots:deletion-slow":
+    case "opencode:dispose_pending:dispose-slow": {
+      const roots = scenario.includes("many_roots") ? 40 : 1;
+      for (let i = 0; i < roots; i++) {
+        await plugin.event({ event: { type: "session.created", properties: { info: { id: `R${i}` } } } });
+      }
+      const callbacks = Array.from({ length: scenario.includes("full_queue") ? 32 : 1 }, () =>
+        plugin.event({ event: { type: "session.status", properties: { sessionID: "R0", status: { type: "busy" } } } }));
+      const first = plugin.dispose();
+      const concurrent = plugin.dispose();
+      callbacks.push(plugin.event({ event: { type: "session.created", properties: { info: { id: "AFTER" } } } }));
+      callbacks.push(plugin.event({ event: { type: "server.instance.disposed" } }));
+      await Promise.all([first, concurrent, ...callbacks]);
+      await plugin.dispose();
+      break;
+    }
+    case "opencode:dispose_callback":
+      await plugin.event({ event: { type: "session.created", properties: { info: { id: "R" } } } });
+      await plugin.event({ event: { type: "session.created", properties: { info: { id: "C", parentID: "R" } } } });
+      await plugin.dispose();
+      await plugin.dispose();
+      break;
+    case "opencode:kilo_status_precedence":
+      for (const event of [
+        { type: "session.created", properties: { info: { id: "R" } } },
+        { type: "session.status", properties: { sessionID: "R", status: { type: "offline" } } },
+        { type: "session.compacted", properties: { sessionID: "R" } },
+        { type: "session.status", properties: { sessionID: "R", status: { type: "scheduled" } } },
+        { type: "session.created", properties: { info: { id: "C", parentID: "R" } } },
+        { type: "session.status", properties: { sessionID: "C", status: { type: "busy" } } },
+        { type: "session.status", properties: { sessionID: "R", status: { type: "scheduled" } } },
+        { type: "permission.asked", properties: { sessionID: "C", id: "ask" } },
+        { type: "session.status", properties: { sessionID: "R", status: { type: "scheduled" } } },
+        { type: "session.status", properties: { sessionID: "R", status: { type: "offline" } } },
+        { type: "permission.replied", properties: { sessionID: "C", requestID: "ask" } },
+        { type: "session.status", properties: { sessionID: "R", status: { type: "future" } } },
+      ]) await plugin.event({ event });
+      break;
     case "opencode:selection_and_status_are_serialized":
       await Promise.all([
         plugin.event({ event: { type: "tui.session.select", properties: { sessionID: "a" } } }),
@@ -1294,6 +1370,15 @@ const SCENARIOS = [
   [OPENCODE_ADAPTER, "opencode:queue_bound"],
 ];
 
+const sharedScenarios = SCENARIOS.filter(([asset]) => asset === OPENCODE_ADAPTER);
+SCENARIOS.push(...sharedScenarios.map(([asset, scenario]) => [asset, scenario.replace(/^opencode:/, "kilo:")]));
+SCENARIOS.push([OPENCODE_ADAPTER, "kilo:kilo_status_precedence:defaults"]);
+SCENARIOS.push([OPENCODE_ADAPTER, "kilo:dispose_callback"]);
+for (const scenario of ["dispose_full_queue", "dispose_many_roots", "dispose_pending:dispose-slow", "dispose_many_roots:deletion-slow"]) {
+  SCENARIOS.push([OPENCODE_ADAPTER, `kilo:${scenario}`]);
+}
+SCENARIOS.push([OPENCODE_ADAPTER, "kilo:background_child_completion_holds_the_root_until_its_wake:background:defaults"]);
+
 const report = {};
 for (const [assetPath, scenario] of SCENARIOS) {
   const watchdog = setTimeout(() => {
@@ -1303,15 +1388,20 @@ for (const [assetPath, scenario] of SCENARIOS) {
   const { adapterPath, invocations, pids, home } = stage(assetPath, scenario);
   const started = Date.now();
   const previousHome = process.env.HOME;
+  const warnings = [];
+  const previousWarn = console.warn;
+  console.warn = (message) => warnings.push(message);
   if (home !== undefined) process.env.HOME = home;
   const result = scenario.startsWith("pi:")
     ? await runPi(scenario, adapterPath, invocations)
     : await runOpenCode(scenario, adapterPath);
   process.env.HOME = previousHome;
+  console.warn = previousWarn;
   const runningPids = await waitForPidsToExit(pids());
   report[scenario] = {
     invocations: invocations(),
     runningPids,
+    warnings,
     elapsedMs: Date.now() - started,
     ...result,
   };

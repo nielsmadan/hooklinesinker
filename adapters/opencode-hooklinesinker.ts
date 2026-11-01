@@ -18,10 +18,21 @@ const TRACKED_EVENTS = new Set([
   "tui.session.select",
 ]);
 
-const OPENCODE_STATUSES = ["idle", "busy", "retry"] as const;
+interface HostConfig {
+  agent: "opencode" | "kilo";
+  statuses: Record<string, "idle" | "working">;
+  backgroundEnv: string;
+  backgroundFallbackEnv: string | null;
+  backgroundDefault: boolean;
+  compaction: "active" | "complete";
+  disposal: "event" | "callback";
+}
+
+const HOST_CONFIG: HostConfig = JSON.parse("__HOOKLINESINKER_HOST_CONFIG__");
 
 const HOOK_TIMEOUT_MS = 2000;
 const MAX_PENDING_HOOKS = 32;
+const MAX_TERMINAL_HOOKS = 8;
 
 interface NativeEvent {
   session_id?: string;
@@ -51,7 +62,7 @@ interface PhaseRecord {
   phase: TreePhase;
 }
 
-const OPENCODE_TRUE_VALUES = new Set(["true", "yes", "on", "1", "y"]);
+const TRUE_VALUES = new Set(["true", "yes", "on", "1", "y"]);
 
 const PHASE_EVENT: Record<TreePhase, string> = {
   idle: "session.status.idle",
@@ -63,8 +74,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isOpenCodeStatus(value: unknown): value is (typeof OPENCODE_STATUSES)[number] {
-  return typeof value === "string" && OPENCODE_STATUSES.some((known) => known === value);
+function isHostStatus(value: unknown): value is string {
+  return typeof value === "string" && Object.hasOwn(HOST_CONFIG.statuses, value);
 }
 
 function rootOf(tree: SessionTree, sessionId: string): string {
@@ -123,7 +134,7 @@ function runHook({
     try {
       const child = spawn(
         HOOKLINESINKER_BIN,
-        ["ingest", "--agent", "opencode", "--event", event],
+        ["ingest", "--agent", HOST_CONFIG.agent, "--event", event],
         { detached: process.platform !== "win32", stdio: ["pipe", "ignore", "ignore"] }
       );
 
@@ -175,9 +186,11 @@ export const HooklinesinkerPlugin = async ({
   const lastSent = new Map<string, TreePhase>();
   const lastQueued = new Map<string, PhaseRecord>();
   const heldRoots = new Set<string>();
-  const backgroundSubagents = OPENCODE_TRUE_VALUES.has(
-    process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS ?? process.env.OPENCODE_EXPERIMENTAL ?? "",
-  );
+  const backgroundValue = process.env[HOST_CONFIG.backgroundEnv] ??
+    (HOST_CONFIG.backgroundFallbackEnv ? process.env[HOST_CONFIG.backgroundFallbackEnv] : undefined);
+  const backgroundSubagents = backgroundValue === undefined
+    ? HOST_CONFIG.backgroundDefault
+    : TRUE_VALUES.has(backgroundValue);
   let hookQueue: Promise<void> = Promise.resolve();
   let pendingHooks = 0;
   function queueHook(request: HookRequest, record?: PhaseRecord): Promise<void> {
@@ -239,6 +252,12 @@ export const HooklinesinkerPlugin = async ({
     if (event.type === "server.instance.disposed") {
       for (const id of knownSessionIds) send({ event: "session.deleted", sessionId: id });
       knownSessionIds.clear();
+      tree.parentOf.clear();
+      tree.busy.clear();
+      tree.pendingAsks.clear();
+      lastQueued.clear();
+      lastSent.clear();
+      heldRoots.clear();
       return;
     }
 
@@ -247,7 +266,7 @@ export const HooklinesinkerPlugin = async ({
       let eventName = event.type;
       if (event.type === "session.status") {
         const status = isRecord(properties?.status) ? properties.status.type : undefined;
-        if (!isOpenCodeStatus(status)) return;
+        if (!isHostStatus(status)) return;
         eventName = `session.status.${status}`;
       }
       send({ event: eventName });
@@ -309,6 +328,11 @@ export const HooklinesinkerPlugin = async ({
       return;
     }
 
+    if (event.type === "session.compacted" && HOST_CONFIG.compaction === "complete") {
+      send({ event: "session.compaction.completed", sessionId: root });
+      return;
+    }
+
     if (event.type === "tui.session.select" || event.type === "session.compacted") {
       send({ event: event.type, sessionId: root });
       return;
@@ -329,17 +353,23 @@ export const HooklinesinkerPlugin = async ({
     }
 
     let nativeEventName: string;
+    let incomingPhase: TreePhase;
     if (event.type === "session.status") {
       const status = isRecord(properties?.status) ? properties.status.type : undefined;
-      if (!isOpenCodeStatus(status)) return;
-      if (status === "idle") tree.busy.delete(sessionId);
+      if (!isHostStatus(status)) return;
+      const statusPhase = HOST_CONFIG.statuses[status];
+      if (statusPhase === undefined) return;
+      incomingPhase = statusPhase;
+      if (incomingPhase === "idle") tree.busy.delete(sessionId);
       else tree.busy.add(sessionId);
       nativeEventName = `session.status.${status}`;
     } else if (event.type === "session.idle" || event.type === "session.error") {
+      incomingPhase = "idle";
       tree.busy.delete(sessionId);
       tree.pendingAsks.delete(sessionId);
       nativeEventName = event.type;
     } else if (event.type === "permission.asked") {
+      incomingPhase = "permission";
       const askId = typeof properties?.id === "string" ? properties.id : undefined;
       if (askId) {
         const asks = tree.pendingAsks.get(sessionId) ?? new Set<string>();
@@ -358,18 +388,11 @@ export const HooklinesinkerPlugin = async ({
 
     heldRoots.delete(root);
     const phase = treePhase(tree, root);
-    const idleMeaning =
-      nativeEventName === "session.status.idle" ||
-      nativeEventName === "session.idle" ||
-      nativeEventName === "session.error";
-    const busyMeaning =
-      nativeEventName === "session.status.busy" || nativeEventName === "session.status.retry";
-
-    if (idleMeaning && phase !== "idle") {
+    if (incomingPhase === "idle" && phase !== "idle") {
       send({ event: PHASE_EVENT[phase], sessionId: root }, { root, phase });
       return;
     }
-    if (busyMeaning && phase === "permission") {
+    if (incomingPhase === "working" && phase === "permission") {
       send({ event: "permission.asked", sessionId: root }, { root, phase });
       return;
     }
@@ -379,12 +402,43 @@ export const HooklinesinkerPlugin = async ({
   // Resuming a session can skip the native session.created event.
   await queueHook({ event: "session.created" });
 
+  let disposal: Promise<void> | undefined;
+  const dispose = () => {
+    if (disposal) return disposal;
+    const removals: HookRequest[] = [];
+    handleEvent({ type: "server.instance.disposed" }, (request) => removals.push(request));
+    disposal = hookQueue.then(async () => {
+      const deadline = Date.now() + HOOK_TIMEOUT_MS;
+      let attempted = 0;
+      const sendRemovals = async () => {
+        while (attempted < removals.length) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return;
+          const request = removals[attempted++];
+          if (!request) return;
+          // eslint-disable-next-line no-await-in-loop -- Each worker owns one subprocess at a time.
+          await runHook({ ...request, cwd: directory, timeoutMs: remaining });
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(MAX_TERMINAL_HOOKS, removals.length) }, sendRemovals));
+      if (Date.now() >= deadline) {
+        console.warn(`hooklinesinker: disposal budget expired; ${removals.length - attempted} of ${removals.length} root deletions unattempted. Cleanup is best effort; stale records remain until process-liveness cleanup.`);
+      }
+    });
+    return disposal;
+  };
+
   return {
+    ...(HOST_CONFIG.disposal === "callback" ? { dispose } : {}),
     event: async ({
       event,
     }: {
       event: unknown;
     }) => {
+      if (HOST_CONFIG.disposal === "callback") {
+        if (disposal) return disposal;
+        if (isRecord(event) && event.type === "server.instance.disposed") return dispose();
+      }
       const queued: Promise<void>[] = [];
       handleEvent(event, (request, record) => {
         queued.push(queueHook(request, record));

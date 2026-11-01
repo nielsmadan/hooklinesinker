@@ -16,6 +16,8 @@ These documents explain the flows and constraints behind that interface.
 | Understand why reset sends no removal events for live sessions | [Explicit session reset decision](decisions/0004-explicit-session-reset.md) |
 | Understand why home-relative hook spellings count as installed | [Home-relative ownership decision](decisions/0005-home-relative-ownership.md) |
 | Repeat an upgrade check with real release binaries | [Shared upgrade procedure](tests/shared-upgrade/README.md) |
+| Check host version pins, native evidence, and validation gaps | [Native CLI validation](reference/agent-validation.md) |
+| Repeat one isolated native hook smoke check | [Native smoke procedure](tests/native-agent-smoke/README.md) |
 
 Flow documents track the current code. Decision records preserve rationale; superseding one
 requires a new ADR and a link from the old record. Manual test procedures stay current, while

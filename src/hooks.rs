@@ -12,24 +12,59 @@ use std::io;
 use std::path::{Path, PathBuf};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value as toml_value};
 
+mod antigravity;
+mod copilot;
+
 const MARKER_PREFIX: &str = "// hooklinesinker-generated protocol=";
 const BIN_PLACEHOLDER: &str = "\"__HOOKLINESINKER_BIN__\"";
 const BIN_EXPRESSION: &str = "join(homedir(), \"__HOOKLINESINKER_BIN__\")";
 
 struct AdapterTemplate {
     source: &'static str,
+    host: Option<PluginHost>,
     // The absolute rendering swaps these so it ships no import only `BIN_EXPRESSION` uses.
     home_imports: &'static str,
     absolute_imports: &'static str,
 }
 
+#[derive(Clone, Copy)]
+enum PluginHost {
+    OpenCode,
+    Kilo,
+}
+
+impl PluginHost {
+    fn config(self) -> Value {
+        match self {
+            Self::OpenCode => serde_json::json!({
+                "agent": "opencode", "statuses": {"idle": "idle", "busy": "working", "retry": "working"},
+                "backgroundEnv": "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS",
+                "backgroundFallbackEnv": "OPENCODE_EXPERIMENTAL", "backgroundDefault": false,
+                "compaction": "active", "disposal": "event"
+            }),
+            Self::Kilo => serde_json::json!({
+                "agent": "kilo", "statuses": {"idle": "idle", "busy": "working", "retry": "working", "offline": "working", "scheduled": "idle"},
+                "backgroundEnv": "KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS",
+                "backgroundFallbackEnv": null, "backgroundDefault": true, "compaction": "complete", "disposal": "callback"
+            }),
+        }
+    }
+}
+
 const OPENCODE_ADAPTER: AdapterTemplate = AdapterTemplate {
+    host: Some(PluginHost::OpenCode),
     source: include_str!("../adapters/opencode-hooklinesinker.ts"),
     home_imports: "import { homedir } from \"node:os\";\nimport { join } from \"node:path\";\n",
     absolute_imports: "",
 };
 
+const KILO_ADAPTER: AdapterTemplate = AdapterTemplate {
+    host: Some(PluginHost::Kilo),
+    ..OPENCODE_ADAPTER
+};
+
 const PI_ADAPTER: AdapterTemplate = AdapterTemplate {
+    host: None,
     source: include_str!("../adapters/pi-hooklinesinker.ts"),
     home_imports: "import { homedir, tmpdir } from \"node:os\";",
     absolute_imports: "import { tmpdir } from \"node:os\";",
@@ -55,10 +90,13 @@ pub(crate) struct HookRoots {
     pub claude_dir: PathBuf,
     pub codex_dir: PathBuf,
     pub opencode_config_dir: PathBuf,
+    pub kilo_config_dir: PathBuf,
     pub pi_agent_dir: PathBuf,
     pub factory_dir: PathBuf,
     pub qwen_config_dir: PathBuf,
     pub kimi_code_dir: PathBuf,
+    pub goose_root: PathBuf,
+    pub copilot_home: PathBuf,
     pub binary_path: PathBuf,
     pub home: PathBuf,
 }
@@ -74,17 +112,34 @@ impl HookRoots {
             } else {
                 defaults.opencode_config_dir.clone()
             };
+        let kilo_config_dir =
+            if let Some(path) = crate::paths::absolute_env_path("KILO_CONFIG_DIR")? {
+                path
+            } else if let Some(path) = crate::paths::absolute_env_path("XDG_CONFIG_HOME")? {
+                path.join("kilo")
+            } else {
+                defaults.kilo_config_dir.clone()
+            };
         let pi_agent_dir = crate::paths::absolute_env_path("PI_CODING_AGENT_DIR")?
             .unwrap_or_else(|| defaults.pi_agent_dir.clone());
         let qwen_config_dir = crate::paths::absolute_env_path("QWEN_HOME")?
             .unwrap_or_else(|| defaults.qwen_config_dir.clone());
         let kimi_code_dir = crate::paths::absolute_env_path("KIMI_CODE_HOME")?
             .unwrap_or_else(|| defaults.kimi_code_dir.clone());
+        let goose_root = std::env::var_os("GOOSE_PATH_ROOT")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| defaults.goose_root.clone());
+        let copilot_home = crate::paths::absolute_env_path("COPILOT_HOME")?
+            .unwrap_or_else(|| defaults.copilot_home.clone());
         Ok(Self {
             opencode_config_dir,
+            kilo_config_dir,
             pi_agent_dir,
             qwen_config_dir,
             kimi_code_dir,
+            goose_root,
+            copilot_home,
             ..defaults
         })
     }
@@ -94,10 +149,13 @@ impl HookRoots {
             claude_dir: home.join(".claude"),
             codex_dir: home.join(".codex"),
             opencode_config_dir: home.join(".config/opencode"),
+            kilo_config_dir: home.join(".config/kilo"),
             pi_agent_dir: home.join(".pi/agent"),
             factory_dir: home.join(".factory"),
             qwen_config_dir: home.join(".qwen"),
             kimi_code_dir: home.join(".kimi-code"),
+            goose_root: home.clone(),
+            copilot_home: home.join(".copilot"),
             binary_path,
             home,
         }
@@ -109,6 +167,12 @@ pub(crate) struct HookManager {
 }
 
 enum HookBackend {
+    Antigravity {
+        path: PathBuf,
+    },
+    Copilot {
+        path: PathBuf,
+    },
     Json {
         path: PathBuf,
         location: HooksLocation,
@@ -118,7 +182,7 @@ enum HookBackend {
     },
     TypeScript {
         path: PathBuf,
-        legacy_path: PathBuf,
+        legacy_path: Option<PathBuf>,
         template: &'static AdapterTemplate,
     },
 }
@@ -133,6 +197,18 @@ impl HookManager {
         let _guard = LockGuard::acquire_for(backend.path())?;
         let events = subscribed_event_specs(agent, Capability::ALL);
         match backend {
+            HookBackend::Antigravity { path } => antigravity::reconcile(
+                self.binary_location(),
+                &path,
+                &events,
+                ReconcileMode::Install,
+            ),
+            HookBackend::Copilot { path } => copilot::reconcile(
+                self.binary_location(),
+                &path,
+                &events,
+                ReconcileMode::Install,
+            ),
             HookBackend::Json { path, location } => {
                 self.json_hooks()
                     .reconcile(agent, &path, &events, ReconcileMode::Install, location)
@@ -147,13 +223,19 @@ impl HookManager {
                 template,
             } => self
                 .typescript_hooks()
-                .install(agent, &path, template, &legacy_path),
+                .install(agent, &path, template, legacy_path.as_deref()),
         }
     }
 
     pub(crate) fn status(&self, agent: Agent) -> io::Result<HookStatus> {
         let events = subscribed_event_specs(agent, Capability::ALL);
         match self.backend(agent) {
+            HookBackend::Antigravity { path } => {
+                antigravity::status(self.binary_location(), &path, &events)
+            }
+            HookBackend::Copilot { path } => {
+                copilot::status(self.binary_location(), &path, &events)
+            }
             HookBackend::Json { path, location } => {
                 self.json_hooks().status(agent, &path, &events, location)
             }
@@ -169,6 +251,18 @@ impl HookManager {
         let _guard = LockGuard::acquire_for(backend.path())?;
         let events = subscribed_event_specs(agent, Capability::ALL);
         match backend {
+            HookBackend::Antigravity { path } => antigravity::reconcile(
+                self.binary_location(),
+                &path,
+                &events,
+                ReconcileMode::Uninstall,
+            ),
+            HookBackend::Copilot { path } => copilot::reconcile(
+                self.binary_location(),
+                &path,
+                &events,
+                ReconcileMode::Uninstall,
+            ),
             HookBackend::Json { path, location } => self.json_hooks().reconcile(
                 agent,
                 &path,
@@ -186,12 +280,18 @@ impl HookManager {
                 template,
             } => self
                 .typescript_hooks()
-                .uninstall(agent, &path, template, &legacy_path),
+                .uninstall(agent, &path, template, legacy_path.as_deref()),
         }
     }
 
     fn backend(&self, agent: Agent) -> HookBackend {
         match profile(agent).hook_target {
+            HookTarget::AntigravityJson => HookBackend::Antigravity {
+                path: self.roots.home.join(".gemini/config/hooks.json"),
+            },
+            HookTarget::CopilotJson => HookBackend::Copilot {
+                path: self.roots.copilot_home.join("hooks/hooklinesinker.json"),
+            },
             HookTarget::ClaudeJson => HookBackend::Json {
                 path: self.claude_settings_path(),
                 location: HooksLocation::Nested("hooks"),
@@ -202,12 +302,17 @@ impl HookManager {
             },
             HookTarget::OpenCodeTypeScript => HookBackend::TypeScript {
                 path: self.opencode_plugin_path(),
-                legacy_path: self.opencode_legacy_path(),
+                legacy_path: Some(self.opencode_legacy_path()),
                 template: &OPENCODE_ADAPTER,
+            },
+            HookTarget::KiloTypeScript => HookBackend::TypeScript {
+                path: self.kilo_plugin_path(),
+                legacy_path: None,
+                template: &KILO_ADAPTER,
             },
             HookTarget::PiTypeScript => HookBackend::TypeScript {
                 path: self.pi_extension_path(),
-                legacy_path: self.pi_legacy_path(),
+                legacy_path: Some(self.pi_legacy_path()),
                 template: &PI_ADAPTER,
             },
             HookTarget::DroidJson => HookBackend::Json {
@@ -216,6 +321,17 @@ impl HookManager {
             },
             HookTarget::QwenJson => HookBackend::Json {
                 path: self.qwen_settings_path(),
+                location: HooksLocation::Nested("hooks"),
+            },
+            HookTarget::GooseJson => HookBackend::Json {
+                path: self
+                    .roots
+                    .goose_root
+                    .join(".agents/plugins/hooklinesinker/hooks/hooks.json"),
+                location: HooksLocation::Nested("hooks"),
+            },
+            HookTarget::DevinJson => HookBackend::Json {
+                path: self.roots.home.join(".config/devin/config.json"),
                 location: HooksLocation::Nested("hooks"),
             },
             HookTarget::KimiToml => HookBackend::Toml {
@@ -237,6 +353,12 @@ impl HookManager {
             .opencode_config_dir
             .join("plugins")
             .join("hooklinesinker-opencode.ts")
+    }
+
+    fn kilo_plugin_path(&self) -> PathBuf {
+        self.roots
+            .kilo_config_dir
+            .join("plugins/hooklinesinker-kilo.ts")
     }
 
     fn opencode_legacy_path(&self) -> PathBuf {
@@ -301,7 +423,11 @@ impl HookManager {
 impl HookBackend {
     fn path(&self) -> &Path {
         match self {
-            Self::Json { path, .. } | Self::Toml { path } | Self::TypeScript { path, .. } => path,
+            Self::Antigravity { path }
+            | Self::Copilot { path }
+            | Self::Json { path, .. }
+            | Self::Toml { path }
+            | Self::TypeScript { path, .. } => path,
         }
     }
 }
@@ -627,13 +753,17 @@ impl TypeScriptHooks<'_> {
         let source = template
             .source
             .replace(template.home_imports, template.absolute_imports);
-        render_adapter(&source, &string_literal(self.binary.path))
+        render_adapter(&source, &string_literal(self.binary.path), template.host)
     }
 
     fn home_relative_content(&self, template: &AdapterTemplate) -> Option<String> {
         let relative = self.binary.path.strip_prefix(self.binary.home).ok()?;
         let bin_expression = BIN_EXPRESSION.replace(BIN_PLACEHOLDER, &string_literal(relative));
-        Some(render_adapter(template.source, &bin_expression))
+        Some(render_adapter(
+            template.source,
+            &bin_expression,
+            template.host,
+        ))
     }
 
     fn status(
@@ -679,9 +809,11 @@ impl TypeScriptHooks<'_> {
         agent: Agent,
         path: &Path,
         template: &AdapterTemplate,
-        legacy_path: &Path,
+        legacy_path: Option<&Path>,
     ) -> io::Result<HookStatus> {
-        remove_legacy_generated_file(legacy_path)?;
+        if let Some(legacy_path) = legacy_path {
+            remove_legacy_generated_file(legacy_path)?;
+        }
         let current = self.status(agent, path, template)?;
         match current.state {
             HookState::Unsupported => return Ok(current),
@@ -701,9 +833,11 @@ impl TypeScriptHooks<'_> {
         agent: Agent,
         path: &Path,
         template: &AdapterTemplate,
-        legacy_path: &Path,
+        legacy_path: Option<&Path>,
     ) -> io::Result<HookStatus> {
-        remove_legacy_generated_file(legacy_path)?;
+        if let Some(legacy_path) = legacy_path {
+            remove_legacy_generated_file(legacy_path)?;
+        }
         let current = self.status(agent, path, template)?;
         match current.state {
             HookState::Missing | HookState::Unsupported => Ok(current),
@@ -1067,7 +1201,16 @@ fn is_group_or_world_writable(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn render_adapter(template: &str, bin_expression: &str) -> String {
+fn render_adapter(template: &str, bin_expression: &str, host: Option<PluginHost>) -> String {
+    let template = host.map_or_else(
+        || template.to_owned(),
+        |host| {
+            template.replace(
+                "JSON.parse(\"__HOOKLINESINKER_HOST_CONFIG__\")",
+                &host.config().to_string(),
+            )
+        },
+    );
     let marker = format!("{MARKER_PREFIX}{}\n", crate::protocol::PROTOCOL_VERSION);
     format!(
         "{marker}{}",
@@ -1168,21 +1311,62 @@ mod tests {
         ))
     }
 
-    fn manager() -> (HookManager, PathBuf) {
+    pub(super) fn manager() -> (HookManager, PathBuf) {
         let base = temp_root("manager");
         let binary_path = base.join("bin").join("hooklinesinker");
         let roots = HookRoots {
             claude_dir: base.join("claude"),
             codex_dir: base.join("codex"),
             opencode_config_dir: base.join("opencode"),
+            kilo_config_dir: base.join("kilo"),
             pi_agent_dir: base.join("pi"),
             factory_dir: base.join("factory"),
             qwen_config_dir: base.join("qwen"),
             kimi_code_dir: base.join("kimi-code"),
+            goose_root: base.join("goose"),
+            copilot_home: base.join("copilot"),
             binary_path,
             home: base.join("home"),
         };
         (HookManager::new(roots), base)
+    }
+
+    #[test]
+    fn kilo_reconciliation_preserves_opencode_and_foreign_files() {
+        let (manager, base) = manager();
+        let legacy = manager.opencode_legacy_path();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "// Juggler plugin for OpenCode\n").unwrap();
+        assert_eq!(
+            manager.install(Agent::Kilo).unwrap().state,
+            HookState::Installed
+        );
+        let path = manager.kilo_plugin_path();
+        let bytes = fs::read(&path).unwrap();
+        manager.install(Agent::Kilo).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            manager.uninstall(Agent::Kilo).unwrap().state,
+            HookState::Missing
+        );
+        assert_eq!(
+            fs::read_to_string(&legacy).unwrap(),
+            "// Juggler plugin for OpenCode\n"
+        );
+        fs::write(&path, "export const foreign = 1;\n").unwrap();
+        assert_eq!(
+            manager.install(Agent::Kilo).unwrap().state,
+            HookState::Unsupported
+        );
+        assert_eq!(
+            manager.uninstall(Agent::Kilo).unwrap().state,
+            HookState::Unsupported
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "export const foreign = 1;\n"
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -1977,7 +2161,11 @@ mod tests {
     fn adapter_templates_keep_the_binary_expression_verbatim() {
         // generated_content replaces the whole expression, and String::replace no-ops
         // silently, so a reworded template would ship an adapter spawning the placeholder.
-        for (agent, template) in [("opencode", &OPENCODE_ADAPTER), ("pi", &PI_ADAPTER)] {
+        for (agent, template) in [
+            ("opencode", &OPENCODE_ADAPTER),
+            ("kilo", &KILO_ADAPTER),
+            ("pi", &PI_ADAPTER),
+        ] {
             assert!(
                 template.source.contains(BIN_EXPRESSION),
                 "{agent} adapter must keep {BIN_EXPRESSION} verbatim"
@@ -2195,6 +2383,7 @@ mod tests {
             },
         };
         let template = AdapterTemplate {
+            host: None,
             source: "const bin = join(homedir(), \"__HOOKLINESINKER_BIN__\");",
             home_imports: "",
             absolute_imports: "",
@@ -2383,7 +2572,7 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    fn config_path(manager: &HookManager, agent: Agent) -> PathBuf {
+    pub(super) fn config_path(manager: &HookManager, agent: Agent) -> PathBuf {
         manager.backend(agent).path().to_path_buf()
     }
 
@@ -2405,12 +2594,23 @@ mod tests {
     }
 
     fn home_relative_adapter(template: &AdapterTemplate, relative: &str) -> String {
-        render_adapter(template.source, &format!("join(homedir(), \"{relative}\")"))
+        render_adapter(
+            template.source,
+            &format!("join(homedir(), \"{relative}\")"),
+            template.host,
+        )
     }
 
     #[test]
     fn home_relative_commands_count_as_installed_and_are_left_untouched() {
-        for agent in [Agent::Claude, Agent::Codex, Agent::Droid, Agent::Qwen] {
+        for agent in [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Droid,
+            Agent::Qwen,
+            Agent::Devin,
+            Agent::Goose,
+        ] {
             for prefix in ["~/", "$HOME/"] {
                 let (manager, home) = manager_with_home_binary();
                 let path = config_path(&manager, agent);
@@ -2590,6 +2790,7 @@ mod tests {
         );
         for (agent, path) in [
             (Agent::Opencode, manager.opencode_plugin_path()),
+            (Agent::Kilo, manager.kilo_plugin_path()),
             (Agent::Pi, manager.pi_extension_path()),
         ] {
             assert_eq!(manager.install(agent).unwrap().state, HookState::Installed);
@@ -2693,6 +2894,7 @@ mod tests {
         let (manager, home) = manager_with_home_binary();
         for (agent, path) in [
             (Agent::Opencode, manager.opencode_plugin_path()),
+            (Agent::Kilo, manager.kilo_plugin_path()),
             (Agent::Pi, manager.pi_extension_path()),
         ] {
             manager.install(agent).unwrap();
@@ -2712,6 +2914,7 @@ mod tests {
         let (manager, home) = manager_with_home_binary();
         for (agent, path) in [
             (Agent::Opencode, manager.opencode_plugin_path()),
+            (Agent::Kilo, manager.kilo_plugin_path()),
             (Agent::Pi, manager.pi_extension_path()),
         ] {
             manager.install(agent).unwrap();
@@ -2729,7 +2932,7 @@ mod tests {
     fn installing_into_a_writable_directory_is_refused_even_when_already_installed() {
         use std::os::unix::fs::PermissionsExt;
         let (manager, home) = manager_with_home_binary();
-        for agent in [Agent::Opencode, Agent::Pi, Agent::Kimi] {
+        for agent in [Agent::Opencode, Agent::Kilo, Agent::Pi, Agent::Kimi] {
             manager.install(agent).unwrap();
             let dir = config_path(&manager, agent).parent().unwrap().to_path_buf();
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
@@ -2739,5 +2942,107 @@ mod tests {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
         fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn devin_grouped_hooks_preserve_foreign_config_and_modes() {
+        let (manager, base) = manager();
+        let path = config_path(&manager, Agent::Devin);
+        let foreign = serde_json::json!({"matcher":"^exec$", "hooks":[{"type":"command","command":"echo audit"}]});
+        let original =
+            serde_json::json!({"model": "user-choice", "hooks": {"PreToolUse": [foreign]}});
+        write_with_mode(&path, &serde_json::to_vec(&original).unwrap(), 0o640);
+        let installed = manager.install(Agent::Devin).unwrap();
+        assert_eq!(installed.state, HookState::Installed);
+        assert_eq!(installed.entries.len(), 8);
+        let bytes = fs::read(&path).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["model"], "user-choice");
+        assert_eq!(value["hooks"]["PreToolUse"][0], foreign);
+        assert_eq!(
+            value["hooks"]["SessionStart"][0],
+            serde_json::json!({"hooks": [{
+                "type": "command", "command": canonical_command(&manager.roots.binary_path, Agent::Devin, "SessionStart"), "timeout": 5
+            }]})
+        );
+        assert_eq!(file_mode(&path), 0o640);
+        assert_eq!(
+            manager.install(Agent::Devin).unwrap().state,
+            HookState::Installed
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            manager.uninstall(Agent::Devin).unwrap().state,
+            HookState::Missing
+        );
+        let remaining: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(remaining["model"], "user-choice");
+        assert_eq!(
+            remaining["hooks"]["PreToolUse"],
+            serde_json::json!([foreign])
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn devin_invalid_hook_shapes_are_preserved() {
+        let (manager, base) = manager();
+        let path = config_path(&manager, Agent::Devin);
+        for original in [r#"{"hooks": []}"#, r#"{"hooks": {"Stop": {}}}"#] {
+            write_with_mode(&path, original.as_bytes(), 0o600);
+            assert_eq!(
+                manager.install(Agent::Devin).unwrap().state,
+                HookState::Unsupported
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+        write_with_mode(&path, b"{broken", 0o600);
+        assert!(manager.install(Agent::Devin).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{broken");
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn goose_reconciles_regex_hooks_without_touching_settings() {
+        let (manager, base) = manager();
+        let path = config_path(&manager, Agent::Goose);
+        let settings = manager.roots.goose_root.join("config/config.yaml");
+        write_with_mode(&settings, b"plugins: user-owned\n", 0o600);
+        let foreign = serde_json::json!({"matcher":"^audit$", "hooks":[{"type":"command","command":"echo audit"}]});
+        write_with_mode(
+            &path,
+            serde_json::json!({"hooks":{"PreToolUse":[foreign]}})
+                .to_string()
+                .as_bytes(),
+            0o640,
+        );
+        assert_eq!(
+            manager.install(Agent::Goose).unwrap().state,
+            HookState::Installed
+        );
+        let bytes = fs::read(&path).unwrap();
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["hooks"]["PreToolUse"][1]["matcher"], ".*");
+        assert_eq!(value["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"], 5);
+        assert_eq!(file_mode(&path), 0o640);
+        manager.install(Agent::Goose).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        value["hooks"]["Stop"][0]["hooks"][0]["timeout"] = Value::from(9);
+        fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(
+            manager.status(Agent::Goose).unwrap().state,
+            HookState::Drifted
+        );
+        manager.install(Agent::Goose).unwrap();
+        assert_eq!(
+            manager.status(Agent::Goose).unwrap().state,
+            HookState::Installed
+        );
+        manager.uninstall(Agent::Goose).unwrap();
+        let remaining: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            remaining["hooks"]["PreToolUse"],
+            serde_json::json!([foreign])
+        );
+        assert_eq!(fs::read(&settings).unwrap(), b"plugins: user-owned\n");
+        fs::remove_dir_all(base).unwrap();
     }
 }

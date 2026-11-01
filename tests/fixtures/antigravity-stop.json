@@ -1,0 +1,8 @@
+{
+  "conversationId": "antigravity-conversation",
+  "workspacePaths": ["/work/first", "/work/second"],
+  "transcriptPath": "/home/test/.gemini/antigravity-cli/brain/antigravity-conversation/.system_generated/logs/transcript.jsonl",
+  "modelName": "gemini-test",
+  "fullyIdle": false,
+  "toolCall": {"name": "run_command", "args": {"CommandLine": "private tool content"}}
+}

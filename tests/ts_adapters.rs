@@ -76,6 +76,7 @@ struct Run {
     registered_channels: Vec<String>,
     subscribed_channels: Vec<String>,
     elapsed_ms: u64,
+    warnings: Vec<String>,
 }
 
 impl Run {
@@ -152,6 +153,7 @@ fn run_harness() -> Option<HashMap<String, Run>> {
         .arg(&root)
         .arg(&workdir)
         .env("NODE_NO_WARNINGS", "1")
+        .env("HLS_TEST_BINARY", env!("CARGO_BIN_EXE_hooklinesinker"))
         .output()
         .expect("failed to launch node");
     let _ = std::fs::remove_dir_all(&workdir);
@@ -190,6 +192,7 @@ fn run_harness() -> Option<HashMap<String, Run>> {
                         registered_channels: string_list(&result["registeredChannels"]),
                         subscribed_channels: string_list(&result["subscribedChannels"]),
                         elapsed_ms: result["elapsedMs"].as_u64().unwrap_or_default(),
+                        warnings: string_list(&result["warnings"]),
                     },
                 )
             })
@@ -286,7 +289,7 @@ fn both_adapters_share_one_run_hook_implementation() {
     );
 
     let translated = opencode
-        .replace("\"opencode\"", "\"pi\"")
+        .replace("HOST_CONFIG.agent", "\"pi\"")
         .replace("  cwd,", "  fields,")
         .replace(
             "if (cwd) native.cwd = cwd;",
@@ -1496,4 +1499,162 @@ fn harness_and_adapters_exist() {
         let full: &Path = &repo_root().join(path);
         assert!(full.exists(), "missing {}", full.display());
     }
+}
+
+#[test]
+fn kilo_installed_adapter_preserves_shared_scenarios_with_explicit_background_flags() {
+    let Some(report) = report() else {
+        return;
+    };
+    for (name, opencode) in report
+        .iter()
+        .filter(|(name, _)| name.starts_with("opencode:"))
+    {
+        let kilo_name = name.replacen("opencode:", "kilo:", 1);
+        let kilo = report.get(&kilo_name).unwrap();
+        assert!(
+            kilo.agents().iter().all(|agent| agent == "kilo"),
+            "{kilo_name}"
+        );
+        if !name.ends_with(":slow") && !name.ends_with(":stubborn") {
+            let expected = opencode
+                .events()
+                .into_iter()
+                .map(|event| {
+                    if event == "session.compacted" {
+                        "session.compaction.completed".to_owned()
+                    } else {
+                        event
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(kilo.events(), expected, "{kilo_name}");
+            assert_eq!(kilo.session_ids(), opencode.session_ids(), "{kilo_name}");
+        } else {
+            assert_eq!(kilo.events().first(), Some(&"session.created".to_owned()));
+            assert!(kilo.elapsed_ms < HANG_BUDGET_MS * 3, "{kilo_name}");
+        }
+        assert!(kilo.running_pids.is_empty(), "{kilo_name}");
+    }
+}
+
+#[test]
+fn kilo_background_default_holds_until_root_wakes() {
+    let Some(actual) =
+        run("kilo:background_child_completion_holds_the_root_until_its_wake:background:defaults")
+    else {
+        return;
+    };
+    let expected =
+        run("opencode:background_child_completion_holds_the_root_until_its_wake:background")
+            .unwrap();
+    assert_eq!(actual.events(), expected.events());
+    assert_eq!(actual.session_ids(), expected.session_ids());
+}
+
+#[test]
+fn kilo_offline_and_scheduled_preserve_children_and_permission_precedence() {
+    let Some(run) = run("kilo:kilo_status_precedence:defaults") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        [
+            "session.created",
+            "session.created",
+            "session.status.offline",
+            "session.compaction.completed",
+            "session.status.scheduled",
+            "session.status.busy",
+            "session.status.busy",
+            "permission.asked",
+            "permission.asked",
+            "permission.asked",
+            "session.status.busy",
+        ]
+    );
+    assert!(run.session_ids()[1..].iter().all(|id| id == "R"));
+}
+
+#[test]
+fn kilo_disposal_callback_drains_root_removal_once() {
+    let Some(run) = run("kilo:dispose_callback") else {
+        return;
+    };
+    assert_eq!(
+        run.events(),
+        ["session.created", "session.created", "session.deleted"]
+    );
+    assert_eq!(run.session_ids(), ["", "R", "R"]);
+}
+
+#[test]
+fn kilo_disposal_survives_saturation_deadlines_and_concurrent_callbacks() {
+    for (scenario, roots) in [
+        ("kilo:dispose_full_queue", 1),
+        ("kilo:dispose_many_roots", 40),
+        ("kilo:dispose_pending:dispose-slow", 1),
+    ] {
+        let Some(run) = run(scenario) else { return };
+        let mut removals: Vec<_> = run
+            .invocations
+            .iter()
+            .filter(|invocation| invocation["args"][4] == "session.deleted")
+            .map(|invocation| {
+                invocation["stdin"]["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        removals.sort();
+        let mut expected = (0..roots).map(|i| format!("R{i}")).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(removals, expected, "{scenario}");
+        let events = run.events();
+        assert!(
+            events[events.len() - roots..]
+                .iter()
+                .all(|event| event == "session.deleted"),
+            "{scenario}"
+        );
+        let busy = if scenario == "kilo:dispose_full_queue" {
+            32
+        } else {
+            1
+        };
+        assert_eq!(run.invocations.len(), 1 + roots * 2 + busy, "{scenario}");
+        assert!(run.running_pids.is_empty(), "{scenario}");
+        assert!(run.elapsed_ms < HANG_BUDGET_MS * 2, "{scenario}");
+    }
+}
+
+#[test]
+fn kilo_many_stalled_deletions_share_one_cleanup_budget() {
+    let Some(run) = run("kilo:dispose_many_roots:deletion-slow") else {
+        return;
+    };
+    let removals: Vec<_> = run
+        .invocations
+        .iter()
+        .filter(|invocation| invocation["args"][4] == "session.deleted")
+        .map(|invocation| invocation["stdin"]["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(removals.len(), 8);
+    assert_eq!(
+        removals
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        8
+    );
+    assert_eq!(
+        run.warnings,
+        [
+            "hooklinesinker: disposal budget expired; 32 of 40 root deletions unattempted. Cleanup is best effort; stale records remain until process-liveness cleanup."
+        ]
+    );
+    assert_eq!(run.running_pids, [] as [u64; 0]);
+    assert!(run.elapsed_ms < HANG_BUDGET_MS);
 }

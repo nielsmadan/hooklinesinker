@@ -134,7 +134,7 @@ pub struct DoctorResponse {
     pub exit_code: i32,
 }
 
-// Unknown agents lack hook and lifecycle mappings; accepting them requires a protocol-major bump.
+// Unknown agents require implemented hook and lifecycle mappings before ingestion.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Agent {
@@ -145,10 +145,15 @@ pub enum Agent {
     Droid,
     Qwen,
     Kimi,
+    Devin,
+    Goose,
+    Copilot,
+    Antigravity,
+    Kilo,
 }
 
 impl Agent {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 12] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
@@ -156,6 +161,11 @@ impl Agent {
         Self::Droid,
         Self::Qwen,
         Self::Kimi,
+        Self::Devin,
+        Self::Goose,
+        Self::Copilot,
+        Self::Antigravity,
+        Self::Kilo,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -167,6 +177,11 @@ impl Agent {
             Self::Droid => "droid",
             Self::Qwen => "qwen",
             Self::Kimi => "kimi",
+            Self::Devin => "devin",
+            Self::Goose => "goose",
+            Self::Copilot => "copilot",
+            Self::Antigravity => "antigravity",
+            Self::Kilo => "kilo",
         }
     }
 }

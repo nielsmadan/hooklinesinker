@@ -42,6 +42,8 @@ waiting.
 | Factory Droid | `Notification` with `notification_type: elicitation_dialog` or `permission_prompt` | No dedicated answer event; the corresponding `PostToolUse` follows after the interaction resolves |
 | Qwen Code | `PermissionRequest`, or `Notification` with `notification_type: permission_prompt` | `PermissionDenied`, the corresponding `PostToolUse`, or a later turn event |
 | Kimi Code CLI | `PermissionRequest` | `PermissionResult` |
+| Devin CLI | `PermissionRequest` (permission decision, possibly resolved by policy) | No documented resolution; hooklinesinker conservatively waits for root prompt/start/stop |
+| Copilot CLI | lowercase `notification`: `permission_prompt` or `elicitation_dialog` | Root prompt/start/stop; tool completion alone does not resolve a wait |
 | OpenCode | `permission.asked` | A later authoritative session status, normally `session.status.busy` |
 | Pi | `permission_prompt`, synthesized from the optional permission extension | `permission_resolved`, synthesized after its pending prompts resolve |
 
@@ -115,6 +117,8 @@ means the agent has no dedicated resolution event for that interaction.
 | Factory Droid | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | `Notification` | corresponding `PostToolUse` | `Stop` |
 | Qwen Code | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` or `PostToolUseFailure` | `PermissionRequest` or `Notification` | `PermissionDenied`, corresponding `PostToolUse`, or later status | `Stop` or `StopFailure` |
 | Kimi Code CLI | `TurnStarted` or `UserPromptSubmit` | `PreToolUse` | `PostToolUse` or `PostToolUseFailure` | `PermissionRequest` | `PermissionResult` | `Stop` or `StopFailure` |
+| Devin CLI | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | `PermissionRequest` | root prompt/start/stop | `Stop` |
+| Copilot CLI | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` / `PostToolUseFailure` | `notification` permission / elicitation | root prompt/start/stop | `Stop` |
 | OpenCode | `session.status.busy` | No equivalent used | No equivalent used | `permission.asked` | `session.status.busy` | `session.status.idle`, `session.idle`, or `session.error` |
 | Pi | `agent_start` | No equivalent used | No equivalent used | `permission_prompt` | `permission_resolved` | `agent_settled` |
 
@@ -227,3 +231,82 @@ The external lifecycle comparison constrains normalization:
   <https://docs.factory.ai/harness/hooks.md>
 - Status storage and evidence limits:
   [Status lifecycle](../status-lifecycle.md)
+
+Devin CLI contract evidence (2026-11-01): [hook overview](https://docs.devin.ai/cli/extensibility/hooks/overview),
+[lifecycle hooks](https://docs.devin.ai/cli/extensibility/hooks/lifecycle-hooks), and
+[public release manifest](https://static.devin.ai/cli/3000.11.234/manifest.json).
+The installer identifies the executable as `devin`; fixtures use native `session_id`,
+`prompt_id`, and `tool_name`. The docs provide no complete child-hook contract, so child
+aggregation remains unreported. Release metadata is version evidence, not a live hook test.
+
+Goose CLI v1.57.0 source evidence (2026-11-01):
+[hook schema and runner](https://github.com/block/goose/blob/30bba95105e59bc3e7df624cf6b4d433690cfe12/crates/goose/src/hooks/mod.rs),
+[plugin discovery](https://github.com/block/goose/blob/30bba95105e59bc3e7df624cf6b4d433690cfe12/crates/goose/src/plugins/discovery.rs),
+[path roots](https://github.com/block/goose/blob/30bba95105e59bc3e7df624cf6b4d433690cfe12/crates/goose/src/config/paths.rs),
+and [desktop backend launch](https://github.com/block/goose/blob/30bba95105e59bc3e7df624cf6b4d433690cfe12/ui/desktop/src/main.ts).
+`HookContext` supplies native `session_id`, `working_dir`, and optional `tool_name`/
+`tool_call_id`. Tool failure is completion of one tool, never proof the turn settled.
+`PreToolUseResult` reports policy allow/deny and is not a user-wait signal; it is not subscribed.
+Only `Stop` settles the turn, and no compaction or complete child lifecycle is inferred.
+
+
+Copilot CLI contract evidence (2026-11-01): [official hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference),
+checked alongside the official 1.0.105 binary. PascalCase registrations receive `session_id`
+and `tool_name`; lowercase `notification` receives `sessionId` and `notification_type`.
+Canonicalization accepts both documented identity/tool spellings only for Copilot, before
+normalization and lifecycle recording. Contradictory identity aliases are rejected.
+`PermissionRequest` runs before the permission service and does not establish a visible wait.
+`PreCompact` starts compaction; `Stop` settles the root; errors alone do not end its turn.
+Known child `parent_agent_id` / `agent_type` fields (including camelCase equivalents) suppress
+child status callbacks. An `agent_id` alone does not suppress a root. Child counts and complete
+child activity coverage remain unavailable. `/clear` ends the old session independently of
+its replacement; detached late end hooks remove only their named session.
+
+Antigravity CLI is **provisional; support blocked**. The preparatory subscription is
+`SessionStart` (idle), `PreInvocation` (working, not a turn), `PostToolUse` (refresh), and
+`Stop` (boolean `fullyIdle` decides idle/working). `PreToolUse` and `PostInvocation` are not
+subscribed. Missing/invalid fullyIdle is an ingest health error without a state transition.
+The [official hook contract](https://antigravity.google/docs/hooks) was checked 2026-11-01;
+1.1.11 and 1.4.12 isolated prompts were authentication-blocked. No real ownership or eventual
+Stop(false) settlement contract is established. See the
+[full limits](../hooks-and-adapters.md#antigravity-cli--provisional-support-blocked).
+
+
+## Kilo CLI source contract
+
+Verified against Kilo CLI **7.8.25**, commit
+`b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c` (2026-11-01):
+
+- [Generated SDK types](https://github.com/Kilo-Org/kilocode/blob/b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c/packages/sdk/js/src/v2/gen/types.gen.ts)
+  define `parentID?: string`, `sessionID: string`, permission ask `id`, reply `requestID`, and
+  status variants idle/busy/retry/offline/scheduled.
+- [Plugin discovery](https://github.com/Kilo-Org/kilocode/blob/b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c/packages/opencode/src/config/plugin.ts)
+  scans `"{plugin,plugins}/*.{ts,js}"`.
+  [Paths](https://github.com/Kilo-Org/kilocode/blob/b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c/packages/opencode/src/config/paths.ts)
+  include global Kilo config, `.kilocode`/`.kilo`, and `KILO_CONFIG_DIR`.
+- [Runtime flags](https://github.com/Kilo-Org/kilocode/blob/b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c/packages/opencode/src/effect/runtime-flags.ts)
+  use `Config.withDefault(true)` for `KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS`.
+- [Scheduled status](https://github.com/Kilo-Org/kilocode/blob/b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c/packages/opencode/src/kilocode/session/scheduled.ts):
+  “Precedence: permission > question > a live turn > a future wakeup > idle.”
+  The status mapper includes `if (input.statusType === "offline") return "retry"`.
+- [Compaction](https://github.com/Kilo-Org/kilocode/blob/b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c/packages/opencode/src/session/compaction.ts)
+  executes `yield* prune({ sessionID: input.sessionID, reason: "post-compaction" })` before
+  `yield* events.publish(Event.Compacted, { sessionID: input.sessionID })`.
+- [Plugin loader](https://github.com/Kilo-Org/kilocode/blob/b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c/packages/opencode/src/plugin/index.ts)
+  uses `const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])` and awaits
+  `Promise.resolve(hook.dispose?.())` during finalization. Legacy function exports are accepted.
+
+| Native event | Normalized effect |
+| --- | --- |
+| `session.created`, `session.idle`, idle status | Idle, subject to tree precedence |
+| busy, retry, offline status | Working, subject to permission precedence |
+| scheduled status | Idle, subject to tree precedence |
+| `permission.asked` / `permission.replied` | Track ask/reply and recompute root phase |
+| `session.compacted` | Annotate completed compaction, preserve phase |
+| `tui.session.select` | Select root, preserve existing phase |
+| `session.deleted`, instance disposal, plugin disposal | Remove affected roots |
+
+The shared adapter fixtures and installed artifacts are tested. The isolated live prompt
+completed using `openrouter/openai/gpt-4.1-mini`, with native plugin discovery, Kilo process
+attribution and disposal removal observed. The default model first returned an endpoint/tool-
+compatibility error. Real background-child settlement remains unverified live.

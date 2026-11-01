@@ -69,7 +69,7 @@ an explicit protocol and delivery review rather than accepting arbitrary strings
 ## Install or refresh hooks
 
 `install --consumer` does not install or refresh hooks. Existing command hooks follow the
-shared symlink when it changes, but new events, changed timeouts and embedded OpenCode/Pi
+shared symlink when it changes, but new events, changed timeouts and embedded OpenCode/Kilo/Pi
 adapter source require a separate `hooks install --agent AGENT` using the updated helper.
 Hook installation requires a usable active shared binary. Run the active binary so its
 templates match the command path written into agent configuration.
@@ -112,3 +112,31 @@ Separate XDG data/state directories are sufficient for an isolated activation ex
 using only `install`, `version` and `consumers`. They do not relocate agent configuration:
 last-consumer `uninstall` and `hooks install|uninstall` can still touch host configuration.
 See the [shared-upgrade procedure](tests/shared-upgrade/README.md) for a bounded check.
+
+## Goose CLI plugin
+
+Goose hooks install into `~/.agents/plugins/hooklinesinker/hooks/hooks.json`. An absolute
+`GOOSE_PATH_ROOT` replaces the home root; relative values are ignored, matching Goose.
+The file contains grouped native commands under `hooks`, with five-second timeouts and
+`.*` regex matchers for tool events. No manifest is needed. The installer reconciles only
+owned commands and preserves foreign entries; it does not modify Goose plugin settings.
+Goose itself auto-discovers new plugin directories and may add them as enabled in its
+`config.yaml`. Explicit disabled entries and scoped `enabledPlugins`/`disabledPlugins`
+settings can prevent execution even when `hooks status` reports the file installed.
+
+Antigravity's `~/.gemini/config/hooks.json` definition is **provisional** and included in
+all-agent configuration management. Its status reason advertises the blocked CLI ownership,
+background-settlement, and live timeout validation. An `installed` result establishes the
+configuration shape only; it does not establish supported Antigravity session tracking.
+See [Antigravity limits](hooks-and-adapters.md#antigravity-cli--provisional-support-blocked).
+
+
+## Kilo CLI plugin
+
+Kilo installs a standalone generated plugin at
+`$KILO_CONFIG_DIR/plugins/hooklinesinker-kilo.ts`. Without that override, the root is
+`$XDG_CONFIG_HOME/kilo`, otherwise `~/.config/kilo`. Absolute overrides are required.
+`KILO_PURE=true` and `--pure` prevent external plugin loading even when hook status reports
+installed. No OpenCode legacy asset is removed by Kilo installation or uninstallation.
+Both absolute and home-relative generated binary paths are recognized. See the
+[Kilo adapter contract](hooks-and-adapters.md#kilo-cli) for supported states and live coverage.

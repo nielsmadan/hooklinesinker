@@ -10,6 +10,12 @@ pub(crate) trait ProcessLiveness {
 
 pub(crate) trait ProcessLookup: ProcessLiveness {
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity>;
+    fn goose_non_cli_host(&self, _hook_pid: u32) -> bool {
+        false
+    }
+    fn nearest_agent(&self, _hook_pid: u32) -> Option<(Agent, ProcessIdentity)> {
+        None
+    }
     fn has_exclusive_session(&self, _identity: &ProcessIdentity, _agent: Agent) -> bool {
         true
     }
@@ -211,22 +217,250 @@ fn runs_a_script_runtime(name: &str, cmd: &[std::ffi::OsString]) -> bool {
     })
 }
 
+fn runtime_option_takes_operand(runtime: &str, text: &str) -> bool {
+    matches!(
+        (runtime, text),
+        (
+            "node",
+            "-r" | "--require"
+                | "--import"
+                | "--loader"
+                | "--experimental-loader"
+                | "--conditions"
+                | "-C"
+                | "--icu-data-dir"
+                | "--env-file"
+                | "--env-file-if-exists"
+                | "--allow-fs-read"
+                | "--allow-fs-write"
+                | "--build-snapshot-config"
+                | "--cpu-prof-dir"
+                | "--cpu-prof-interval"
+                | "--cpu-prof-name"
+                | "--diagnostic-dir"
+                | "--disable-proto"
+                | "--disable-warning"
+                | "--dns-result-order"
+                | "--experimental-config-file"
+                | "--experimental-package-map"
+                | "--experimental-sea-config"
+                | "--heap-prof-dir"
+                | "--heap-prof-interval"
+                | "--heap-prof-name"
+                | "--heapsnapshot-near-heap-limit"
+                | "--heapsnapshot-signal"
+                | "--input-type"
+                | "--inspect-port"
+                | "--debug-port"
+                | "--inspect-publish-uid"
+                | "--localstorage-file"
+                | "--max-http-header-size"
+                | "--max-old-space-size-percentage"
+                | "--network-family-autoselection-attempt-timeout"
+                | "--openssl-config"
+                | "--redirect-warnings"
+                | "--report-directory"
+                | "--report-dir"
+                | "--report-filename"
+                | "--report-signal"
+                | "--secure-heap"
+                | "--secure-heap-min"
+                | "--snapshot-blob"
+                | "--title"
+                | "--tls-cipher-list"
+                | "--tls-keylog"
+                | "--trace-event-categories"
+                | "--trace-event-file-pattern"
+                | "--trace-require-module"
+                | "--unhandled-rejections"
+                | "--use-largepages"
+                | "--v8-pool-size"
+                | "--watch-kill-signal"
+                | "--watch-path"
+                | "--max-old-space-size"
+                | "--max-semi-space-size"
+                | "--stack-size"
+                | "--stack_size"
+        ) | (
+            "bun",
+            "--preload" | "--require" | "-r" | "--cwd" | "--env-file" | "--config" | "-c"
+        ) | (
+            "deno",
+            "--config" | "-c" | "--import-map" | "--lock" | "--cert" | "--location" | "--v8-flags"
+        )
+    )
+}
+
+fn runtime_script<'a>(name: &str, cmd: &'a [std::ffi::OsString]) -> Option<&'a std::ffi::OsStr> {
+    let runtime = cmd
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .map(|arg| arg.to_string_lossy().to_ascii_lowercase())
+        .filter(|arg| is_script_runtime(arg))
+        .unwrap_or_else(|| name.to_ascii_lowercase());
+    let mut args = cmd.iter().skip(1);
+    let mut run = false;
+    while let Some(arg) = args.next() {
+        let text = arg.to_str()?;
+        if text == "--" {
+            return args.next().map(std::ffi::OsString::as_os_str);
+        }
+        if matches!(runtime.as_str(), "bun" | "deno") && text == "run" && !run {
+            run = true;
+            continue;
+        }
+        if matches!(text, "-e" | "--eval" | "-p" | "--print" | "eval" | "repl")
+            || (runtime == "node"
+                && (matches!(
+                    text,
+                    "--run" | "--test" | "--prof-process" | "--check" | "-c" | "inspect"
+                ) || text.starts_with("--run=")
+                    || (text.starts_with("-e") && !text.starts_with("--"))
+                    || (text.starts_with("-p") && !text.starts_with("--"))))
+            || text.starts_with("--eval=")
+            || text.starts_with("--print=")
+        {
+            return None;
+        }
+        if runtime_option_takes_operand(&runtime, text) {
+            args.next()?;
+            continue;
+        }
+        if text.starts_with('-') {
+            if (runtime == "node" && text.starts_with("--"))
+                || text.contains('=')
+                || matches!(
+                    text,
+                    "--no-warnings"
+                        | "--trace-warnings"
+                        | "--enable-source-maps"
+                        | "--experimental-strip-types"
+                        | "--watch"
+                        | "--inspect"
+                        | "--inspect-brk"
+                )
+                || (runtime == "deno"
+                    && matches!(
+                        text,
+                        "-A" | "--allow-all"
+                            | "--no-check"
+                            | "--quiet"
+                            | "-q"
+                            | "--allow-read"
+                            | "--allow-write"
+                            | "--allow-env"
+                            | "--allow-net"
+                            | "--allow-run"
+                    ))
+                || (runtime == "bun" && matches!(text, "--bun" | "--silent" | "--hot"))
+            {
+                continue;
+            }
+            return None;
+        }
+        if runtime == "deno" && !run {
+            return None;
+        }
+        // Bun run also accepts package scripts, which do not establish an executable owner.
+        if runtime == "bun" && run && !text.contains('/') && !text.contains('\\') {
+            return None;
+        }
+        return Some(arg.as_os_str());
+    }
+    None
+}
+
 fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &[&str]) -> bool {
     if expected.iter().any(|e| name.eq_ignore_ascii_case(e)) {
         return true;
     }
-    if !runs_a_script_runtime(name, cmd) {
-        return false;
-    }
-    cmd.iter().any(|arg| {
-        Path::new(arg)
-            .file_name()
-            .map(|f| f.to_string_lossy())
-            .is_some_and(|f| expected.iter().any(|e| f.eq_ignore_ascii_case(e)))
-    })
+    runs_a_script_runtime(name, cmd)
+        && runtime_script(name, cmd).is_some_and(|arg| {
+            Path::new(arg)
+                .file_name()
+                .map(|f| f.to_string_lossy())
+                .is_some_and(|f| expected.iter().any(|e| f.eq_ignore_ascii_case(e)))
+        })
 }
 
-fn is_shared_session_host(agent: Agent, cmd: &[std::ffi::OsString]) -> bool {
+fn antigravity_subcommand(cmd: &[std::ffi::OsString]) -> Option<&str> {
+    let mut args = cmd.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let text = arg.to_str()?;
+        if text == "--" {
+            return args.next()?.to_str();
+        }
+        if !text.starts_with('-') {
+            return Some(text);
+        }
+        let (option, value) = text
+            .split_once('=')
+            .map_or((text, None), |(option, value)| (option, Some(value)));
+        match option {
+            "--add-dir"
+            | "--agent"
+            | "--conversation"
+            | "--effort"
+            | "--input-format"
+            | "--json-schema"
+            | "--log-file"
+            | "--mode"
+            | "--model"
+            | "--new-project"
+            | "--output-format"
+            | "-p"
+            | "--print"
+            | "--print-timeout"
+            | "--project"
+            | "--prompt"
+            | "-i"
+            | "--prompt-interactive"
+            | "--settings" => {
+                if value.is_none() {
+                    args.next()?;
+                }
+            }
+            "-c"
+            | "--continue"
+            | "--dangerously-skip-permissions"
+            | "--disable-slash-commands"
+            | "--remote-control"
+            | "--sandbox" => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn is_agent_process(agent: Agent, name: &str, cmd: &[std::ffi::OsString]) -> bool {
+    if agent == Agent::Antigravity {
+        let Some(executable) = cmd.first().map(Path::new) else {
+            return false;
+        };
+        if antigravity_subcommand(cmd) == Some("remote-control") {
+            return false;
+        }
+        if executable
+            .components()
+            .any(|component| component.as_os_str().to_string_lossy().ends_with(".app"))
+        {
+            return false;
+        }
+        return executable
+            .file_name()
+            .is_some_and(|file| file == "agy" || file == "antigravity")
+            && profile(agent).executable_names.contains(&name);
+    }
+    is_owning_process(name, cmd, SystemProcessLookup::expected_executables(agent))
+}
+
+pub(crate) fn is_shared_session_host(agent: Agent, cmd: &[std::ffi::OsString]) -> bool {
+    if agent == Agent::Goose {
+        return cmd
+            .get(1)
+            .and_then(|arg| arg.to_str())
+            .is_some_and(|command| matches!(command, "acp" | "serve" | "gateway" | "gw"));
+    }
     let markers = profile(agent).shared_host_markers;
     cmd.iter().skip(1).any(|arg| {
         let arg = arg.to_string_lossy();
@@ -258,7 +492,78 @@ impl ProcessLiveness for SystemProcessLookup {
     }
 }
 
+fn nearest_agent_in(
+    hook_pid: u32,
+    mut observe: impl FnMut(u32) -> Option<(Option<u32>, Option<(Agent, ProcessIdentity)>)>,
+) -> Option<(Agent, ProcessIdentity)> {
+    let mut current = hook_pid;
+    for _ in 0..64 {
+        let (parent, agent) = observe(current)?;
+        if agent.is_some() {
+            return agent;
+        }
+        current = parent?;
+    }
+    None
+}
+
+fn goose_non_cli_in(
+    hook_pid: u32,
+    mut observe: impl FnMut(u32) -> Option<(Option<u32>, String, Vec<std::ffi::OsString>)>,
+) -> bool {
+    let mut current = hook_pid;
+    for _ in 0..64 {
+        let Some((parent, name, cmd)) = observe(current) else {
+            return false;
+        };
+        if is_owning_process(&name, &cmd, &["goosed"]) {
+            return true;
+        }
+        if is_owning_process(&name, &cmd, &["goose"]) {
+            return cmd.get(1).is_some_and(|arg| arg == "serve");
+        }
+        let Some(parent) = parent else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
+
 impl ProcessLookup for SystemProcessLookup {
+    fn goose_non_cli_host(&self, hook_pid: u32) -> bool {
+        goose_non_cli_in(hook_pid, |pid| {
+            let process = self.system.process(Pid::from_u32(pid))?;
+            Some((
+                process.parent().map(Pid::as_u32),
+                process.name().to_string_lossy().into_owned(),
+                process.cmd().to_vec(),
+            ))
+        })
+    }
+
+    fn nearest_agent(&self, hook_pid: u32) -> Option<(Agent, ProcessIdentity)> {
+        nearest_agent_in(hook_pid, |pid| {
+            let process = self.system.process(Pid::from_u32(pid))?;
+            let agent = Agent::ALL
+                .into_iter()
+                .find(|agent| {
+                    is_agent_process(*agent, &process.name().to_string_lossy(), process.cmd())
+                })
+                .map(|agent| {
+                    (
+                        agent,
+                        ProcessIdentity {
+                            pid,
+                            started_at: format_epoch_seconds(process.start_time()),
+                            host: local_hostname(),
+                        },
+                    )
+                });
+            Some((process.parent().map(Pid::as_u32), agent))
+        })
+    }
+
     fn has_exclusive_session(&self, identity: &ProcessIdentity, agent: Agent) -> bool {
         self.system
             .process(Pid::from_u32(identity.pid))
@@ -269,7 +574,6 @@ impl ProcessLookup for SystemProcessLookup {
     }
 
     fn owner_of(&self, hook_pid: u32, agent: Agent) -> Option<ProcessIdentity> {
-        let expected = Self::expected_executables(agent);
         let mut current = Some(Pid::from(hook_pid as usize));
         let mut depth = 0;
         while let Some(pid) = current {
@@ -278,7 +582,7 @@ impl ProcessLookup for SystemProcessLookup {
             }
             depth += 1;
             let process = self.system.process(pid)?;
-            if is_owning_process(&process.name().to_string_lossy(), process.cmd(), expected) {
+            if is_agent_process(agent, &process.name().to_string_lossy(), process.cmd()) {
                 return Some(ProcessIdentity {
                     pid: pid.as_u32(),
                     started_at: format_epoch_seconds(process.start_time()),
@@ -294,6 +598,87 @@ impl ProcessLookup for SystemProcessLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_owner_requires_the_cli_launcher_not_app_or_backend() {
+        for (name, args, expected) in [
+            ("agy", vec!["/bin/agy", "--continue"], true),
+            ("antigravity", vec!["/bin/antigravity", "-p", "hello"], true),
+            (
+                "antigravity",
+                vec!["/Applications/Antigravity.app/Contents/MacOS/antigravity"],
+                false,
+            ),
+            (
+                "language_server_macos_arm",
+                vec!["language_server_macos_arm", "antigravity"],
+                false,
+            ),
+            ("sh", vec!["sh", "-c", "agy"], false),
+            (
+                "antigravity",
+                vec!["/bin/antigravity", "remote-control", "start"],
+                false,
+            ),
+            ("antigravity", vec![], false),
+        ] {
+            let args = args
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(is_agent_process(Agent::Antigravity, name, &args), expected);
+        }
+    }
+
+    #[test]
+    fn antigravity_remote_daemon_exclusion_respects_global_option_operands() {
+        for (args, expected) in [
+            (
+                vec!["--log-file", "/tmp/ag.log", "remote-control", "start"],
+                false,
+            ),
+            (
+                vec!["--log-file=/tmp/ag.log", "remote-control", "start"],
+                false,
+            ),
+            (
+                vec!["--continue", "--sandbox", "remote-control", "start"],
+                false,
+            ),
+            (
+                vec!["--sandbox=true", "--model", "example", "remote-control"],
+                false,
+            ),
+            (
+                vec!["--add-dir", "remote-control", "remote-control", "start"],
+                false,
+            ),
+            (vec!["--", "remote-control", "start"], false),
+            (vec!["--log-file", "remote-control"], true),
+            (vec!["--log-file=remote-control"], true),
+            (vec!["-p", "remote-control"], true),
+            (vec!["--prompt=remote-control"], true),
+            (vec!["--prompt-interactive", "remote-control"], true),
+            (
+                vec!["--settings", "remote-control", "agent", "remote-control"],
+                true,
+            ),
+            (vec!["help", "remote-control"], true),
+            (vec!["explain", "remote-control"], true),
+        ] {
+            for name in ["agy", "antigravity"] {
+                let cmd = std::iter::once(name)
+                    .chain(args.iter().copied())
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    is_agent_process(Agent::Antigravity, name, &cmd),
+                    expected,
+                    "{cmd:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn server_launch_modes_are_shared_session_hosts() {
@@ -435,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn kilo_owner_matches_native_and_runtime_launchers() {
+        let names = crate::agents::profile(Agent::Kilo).executable_names;
+        for name in ["kilo", "kilocode"] {
+            assert!(is_owning_process(
+                name,
+                &os_string_argv(&[name, "run"]),
+                names
+            ));
+            assert!(is_owning_process(
+                "node",
+                &os_string_argv(&["node", name]),
+                names
+            ));
+        }
+        assert!(!is_owning_process(
+            "node",
+            &os_string_argv(&["node", "other.js", "kilo"]),
+            names
+        ));
+    }
+
+    #[test]
     fn an_implausible_pid_is_never_alive() {
         let lookup = SystemProcessLookup::new();
         let identity = ProcessIdentity {
@@ -496,5 +903,200 @@ mod tests {
             parse_epoch_seconds("2024-02-29T00:00:00Z"),
             Some(1_709_164_800)
         );
+    }
+    #[test]
+    fn nearest_agent_uses_the_closest_recognized_process_across_wrappers() {
+        for (inner, outer) in [
+            (Agent::Devin, Agent::Claude),
+            (Agent::Claude, Agent::Devin),
+            (Agent::Copilot, Agent::Claude),
+            (Agent::Claude, Agent::Copilot),
+        ] {
+            let result = nearest_agent_in(10, |pid| {
+                let found = match pid {
+                    12 => Some(inner),
+                    14 => Some(outer),
+                    _ => None,
+                };
+                Some((
+                    Some(pid + 1),
+                    found.map(|agent| {
+                        (
+                            agent,
+                            ProcessIdentity {
+                                pid,
+                                started_at: format_epoch_seconds(123),
+                                host: "test".into(),
+                            },
+                        )
+                    }),
+                ))
+            })
+            .unwrap();
+            assert_eq!(result.0, inner);
+            assert_eq!(result.1.pid, 12);
+            assert_eq!(result.1.started_at, format_epoch_seconds(123));
+        }
+    }
+
+    #[test]
+    fn nearest_agent_stops_on_missing_processes_and_bounds_cycles() {
+        assert_eq!(nearest_agent_in(10, |_| None), None);
+        let mut observations = 0;
+        assert_eq!(
+            nearest_agent_in(10, |pid| {
+                observations += 1;
+                Some((Some(pid), None))
+            }),
+            None
+        );
+        assert_eq!(observations, 64);
+    }
+
+    #[test]
+    fn runtime_options_preserve_script_ownership() {
+        for args in [
+            vec!["node", "--no-warnings", "/bin/qwen"],
+            vec![
+                "node",
+                "--trace-deprecation",
+                "--preserve-symlinks",
+                "/bin/qwen",
+            ],
+            vec!["node", "--redirect-warnings", "/tmp/warnings", "/bin/qwen"],
+            vec!["node", "--max-old-space-size", "128", "/bin/qwen"],
+            vec!["node", "--require", "/bin/helper", "--", "/bin/qwen"],
+            vec!["node", "--import=/bin/helper", "/bin/qwen"],
+            vec!["bun", "--preload", "/bin/helper", "run", "/bin/qwen"],
+            vec!["deno", "run", "--config", "/tmp/config", "-A", "/bin/qwen"],
+        ] {
+            assert!(
+                is_owning_process(args[0], &os_string_argv(&args), &["qwen"]),
+                "{args:?}"
+            );
+        }
+        for args in [
+            vec!["node", "--require", "/bin/qwen", "/bin/other"],
+            vec!["node", "--redirect-warnings", "/bin/qwen", "/bin/other"],
+            vec!["node", "--title", "/bin/qwen"],
+            vec!["node", "--run", "qwen", "/bin/qwen"],
+            vec!["node", "-econsole.log(1)", "/bin/qwen"],
+            vec!["node", "-p1", "/bin/qwen"],
+            vec!["node", "--eval", "code", "/bin/qwen"],
+            vec!["node", "--eval=code", "/bin/qwen"],
+            vec!["node", "/bin/other", "/bin/qwen"],
+            vec!["bun", "run", "qwen"],
+            vec!["deno", "eval", "/bin/qwen"],
+        ] {
+            assert!(
+                !is_owning_process(args[0], &os_string_argv(&args), &["qwen"]),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_options_keep_real_inner_claude_nearer_than_devin() {
+        let result = nearest_agent_in(10, |pid| {
+            let (name, args) = match pid {
+                11 => (
+                    "node",
+                    vec![
+                        "node",
+                        "--trace-deprecation",
+                        "--preserve-symlinks",
+                        "--require",
+                        "/bin/helper",
+                        "/bin/claude",
+                    ],
+                ),
+                12 => ("devin", vec!["devin"]),
+                _ => ("sh", vec!["sh"]),
+            };
+            let cmd = os_string_argv(&args);
+            let agent = Agent::ALL.into_iter().find(|agent| {
+                is_owning_process(
+                    name,
+                    &cmd,
+                    SystemProcessLookup::expected_executables(*agent),
+                )
+            });
+            Some((
+                Some(pid + 1),
+                agent.map(|agent| {
+                    (
+                        agent,
+                        ProcessIdentity {
+                            pid,
+                            started_at: format_epoch_seconds(123),
+                            host: "test".into(),
+                        },
+                    )
+                }),
+            ))
+        })
+        .unwrap();
+        assert_eq!(result.0, Agent::Claude);
+        assert_eq!(result.1.pid, 11);
+    }
+
+    #[test]
+    fn script_runtime_only_matches_the_launcher_position() {
+        for args in [
+            vec!["node", "/bin/other", "devin"],
+            vec!["node", "--eval", "devin"],
+            vec!["bun", "run", "devin"],
+        ] {
+            assert!(!is_owning_process(
+                "node",
+                &os_string_argv(&args),
+                &["devin"]
+            ));
+        }
+        assert!(is_owning_process(
+            "node",
+            &os_string_argv(&["node", "/bin/devin", "claude"]),
+            &["devin"]
+        ));
+        assert!(is_owning_process("devin", &[], &["devin"]));
+    }
+    #[test]
+    fn goose_cli_ownership_excludes_desktop_and_preserves_unknown_provenance() {
+        for (name, args, expected) in [
+            ("goose", vec!["goose", "run", "--text", "serve"], false),
+            ("goose", vec!["goose", "session"], false),
+            ("goose", vec!["goose", "serve", "--port", "1234"], true),
+            ("goosed", vec!["goosed"], true),
+            ("sh", vec!["sh"], false),
+        ] {
+            assert_eq!(
+                goose_non_cli_in(1, |pid| (pid == 1).then(|| (
+                    None,
+                    name.into(),
+                    os_string_argv(&args)
+                ))),
+                expected
+            );
+        }
+        assert!(!goose_non_cli_in(1, |pid| match pid {
+            1 => Some((Some(2), "goose".into(), os_string_argv(&["goose", "run"]))),
+            2 => Some((None, "goosed".into(), os_string_argv(&["goosed"]))),
+            _ => None,
+        }));
+        for command in ["acp", "serve", "gateway", "gw"] {
+            assert!(is_shared_session_host(
+                Agent::Goose,
+                &os_string_argv(&["goose", command, "start"])
+            ));
+        }
+        assert!(!is_shared_session_host(
+            Agent::Goose,
+            &os_string_argv(&["goose", "run"])
+        ));
+        assert!(is_owning_process(
+            "goose",
+            &os_string_argv(&["goose", "session"]),
+            &["goose"]
+        ));
     }
 }

@@ -1,0 +1,1 @@
+{"event":"PreToolUse","session_id":"goose-session","working_dir":"/work/goose-project","tool_name":"developer__shell","tool_call_id":"tool-1","tool_input":{"command":"private"},"tool_output":"private","message":"private"}

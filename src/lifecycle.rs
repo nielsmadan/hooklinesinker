@@ -151,6 +151,18 @@ impl SessionContext {
             }),
             EventSource::Native => {
                 let hints = Hints::parse(input).map_err(invalid)?;
+                if agent == Agent::Goose && event == "SessionStart" {
+                    return Ok(Self::Selected);
+                }
+                if matches!(agent, Agent::Devin | Agent::Copilot | Agent::Antigravity) {
+                    return Ok(
+                        if event == "SessionStart" && hints.text("source") == Some("resume") {
+                            Self::SelectedParallel
+                        } else {
+                            Self::Parallel
+                        },
+                    );
+                }
                 let role = if subagent_id(&hints.0).is_some() {
                     Self::Background
                 } else if event == "SessionStart" && hints.text("source") == Some("resume") {

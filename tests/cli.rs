@@ -26,9 +26,12 @@ fn hooklinesinker_isolated(temp: &std::path::Path) -> Command {
     cmd.env("XDG_DATA_HOME", temp.join("data"));
     cmd.env_remove("XDG_CONFIG_HOME");
     cmd.env_remove("OPENCODE_CONFIG_DIR");
+    cmd.env_remove("KILO_CONFIG_DIR");
     cmd.env_remove("PI_CODING_AGENT_DIR");
     cmd.env_remove("QWEN_HOME");
     cmd.env_remove("KIMI_CODE_HOME");
+    cmd.env_remove("GOOSE_PATH_ROOT");
+    cmd.env_remove("COPILOT_HOME");
     cmd
 }
 
@@ -246,29 +249,24 @@ fn hooks_accept_home_relative_configs_under_the_callers_home() {
     );
     std::fs::write(&settings_path, &settings).unwrap();
 
-    let template = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("adapters/opencode-hooklinesinker.ts"),
-    )
-    .unwrap();
-    let plugin = format!(
-        "// hooklinesinker-generated protocol=1\n{}",
-        template.replace(
-            "join(homedir(), \"__HOOKLINESINKER_BIN__\")",
-            "join(homedir(), \".local/share/hooklinesinker/bin/hooklinesinker\")"
-        )
-    );
-    let plugin_path = home.join(".config/opencode/plugins/hooklinesinker-opencode.ts");
-    std::fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
-    std::fs::write(&plugin_path, &plugin).unwrap();
-
-    for agent in ["claude", "opencode"] {
+    for agent in ["opencode", "kilo"] {
+        run(&["hooks", "install", "--agent", agent]);
+        let path = home.join(format!(".config/{agent}/plugins/hooklinesinker-{agent}.ts"));
+        let plugin = std::fs::read_to_string(&path).unwrap()
+            .replace(&serde_json::to_string(&binary).unwrap(), "join(homedir(), \".local/share/hooklinesinker/bin/hooklinesinker\")")
+            .replace("import { spawn } from \"node:child_process\";", "import { spawn } from \"node:child_process\";\nimport { homedir } from \"node:os\";\nimport { join } from \"node:path\";");
+        std::fs::write(&path, &plugin).unwrap();
         let status = run(&["hooks", "status", "--agent", agent, "--json"]);
         let value: Value = serde_json::from_slice(&status.stdout).unwrap();
         assert_eq!(value["state"], "installed", "{agent}");
         run(&["hooks", "install", "--agent", agent]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), plugin);
     }
+    let status = run(&["hooks", "status", "--agent", "claude", "--json"]);
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "installed");
+    run(&["hooks", "install", "--agent", "claude"]);
     assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), settings);
-    assert_eq!(std::fs::read_to_string(&plugin_path).unwrap(), plugin);
 }
 
 #[test]
@@ -317,6 +315,55 @@ fn opencode_config_dir_falls_back_to_xdg_config_home() {
             .join("opencode/plugins/hooklinesinker-opencode.ts")
             .exists(),
         "OPENCODE_CONFIG_DIR must fall back to XDG_CONFIG_HOME/opencode"
+    );
+}
+
+#[test]
+fn hooks_install_writes_the_kilo_plugin_and_reports_it() {
+    let temp = unique_temp_dir("hooks-install-kilo");
+    install_isolated(&temp);
+    let config_dir = temp.join("custom-kilo");
+    let output = hooklinesinker_isolated(&temp)
+        .env("KILO_CONFIG_DIR", &config_dir)
+        .args(["hooks", "install", "--agent", "kilo"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let plugin = config_dir.join("plugins/hooklinesinker-kilo.ts");
+    let text = std::fs::read_to_string(&plugin).unwrap();
+    assert!(text.contains("--agent"), "{text}");
+    assert!(
+        !text.contains("__HOOKLINESINKER_BIN__"),
+        "placeholder survived"
+    );
+
+    let status = hooklinesinker_isolated(&temp)
+        .env("KILO_CONFIG_DIR", &config_dir)
+        .args(["hooks", "status", "--agent", "kilo", "--json"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "installed");
+    assert_eq!(value["path"], plugin.to_str().unwrap());
+}
+
+#[test]
+fn kilo_config_dir_falls_back_to_xdg_config_home() {
+    let temp = unique_temp_dir("hooks-install-kilo-xdg");
+    install_isolated(&temp);
+    let xdg_config = temp.join("xdg-config");
+    let output = hooklinesinker_isolated(&temp)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .args(["hooks", "install", "--agent", "kilo"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        xdg_config
+            .join("kilo/plugins/hooklinesinker-kilo.ts")
+            .exists(),
+        "KILO_CONFIG_DIR must fall back to XDG_CONFIG_HOME/kilo"
     );
 }
 
@@ -1374,4 +1421,263 @@ fn sessions_help_lists_the_reset_subcommand() {
         stdout.contains("reset") && stdout.contains("delete every session record"),
         "{stdout}"
     );
+}
+
+#[test]
+fn devin_installed_command_records_with_project_root_and_preserves_native_policy() {
+    let temp = unique_temp_dir("devin quoted ' path");
+    install_isolated(&temp);
+    hooklinesinker_isolated(&temp)
+        .env("XDG_CONFIG_HOME", temp.join("different-config"))
+        .args(["hooks", "install", "--agent", "devin"])
+        .assert()
+        .success();
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(temp.join("home/.config/devin/config.json")).unwrap(),
+    )
+    .unwrap();
+    let command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let project = temp.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let output = Command::new("sh")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", temp.join("home"))
+        .env("XDG_STATE_HOME", &temp)
+        .env("XDG_DATA_HOME", temp.join("data"))
+        .env("DEVIN_PROJECT_DIR", &project)
+        .current_dir(temp.join("home"))
+        .args(["-c", command])
+        .write_stdin(include_str!("fixtures/devin-pretool.json"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"");
+    let output = hooklinesinker_isolated(&temp)
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["sessions"], serde_json::json!([]));
+    let records: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/status"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(records.len(), 1);
+    let record: Value = serde_json::from_slice(&std::fs::read(&records[0]).unwrap()).unwrap();
+    assert_eq!(record["agent"], "devin");
+    assert_eq!(record["phase"], "working");
+    assert_eq!(record["session"]["cwd"], project.to_str().unwrap());
+    assert_eq!(record["process"], Value::Null);
+    hooklinesinker_isolated(&temp)
+        .args(["hooks", "status", "--agent", "devin", "--json"])
+        .assert()
+        .success();
+    hooklinesinker_isolated(&temp)
+        .args(["hooks", "uninstall", "--agent", "devin"])
+        .assert()
+        .success();
+    let output = hooklinesinker_isolated(&temp)
+        .args(["hooks", "status", "--agent", "devin", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["state"],
+        "missing"
+    );
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn goose_installed_commands_honor_native_root_and_directory() {
+    let temp = unique_temp_dir("goose quoted ' path");
+    install_isolated(&temp);
+    let root = temp.join("goose-root");
+    hooklinesinker_isolated(&temp)
+        .env("GOOSE_PATH_ROOT", &root)
+        .args(["hooks", "install", "--agent", "goose"])
+        .assert()
+        .success();
+    let path = root.join(".agents/plugins/hooklinesinker/hooks/hooks.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(config["hooks"].as_object().unwrap().len(), 7);
+    assert_eq!(config["hooks"]["PreToolUse"][0]["matcher"], ".*");
+    for (event, phase) in [
+        ("UserPromptSubmit", "working"),
+        ("PostToolUseFailure", "working"),
+        ("Stop", "idle"),
+    ] {
+        let command = config["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        Command::new("sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", temp.join("home"))
+            .env("XDG_STATE_HOME", &temp)
+            .env("XDG_DATA_HOME", temp.join("data"))
+            .args(["-c", command])
+            .write_stdin(include_str!("fixtures/goose-tool.json"))
+            .assert()
+            .success()
+            .stdout("");
+        let records: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/status"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(records.len(), 1);
+        let record: Value = serde_json::from_slice(&std::fs::read(&records[0]).unwrap()).unwrap();
+        assert_eq!(record["agent"], "goose");
+        assert_eq!(record["phase"], phase);
+        assert_eq!(record["session"]["cwd"], "/work/goose-project");
+        assert_eq!(record["activity"]["turns"], 1);
+    }
+    for action in ["status", "uninstall"] {
+        hooklinesinker_isolated(&temp)
+            .env("GOOSE_PATH_ROOT", &root)
+            .args(["hooks", action, "--agent", "goose"])
+            .assert()
+            .success();
+    }
+    let remaining: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(remaining["hooks"], serde_json::json!({}));
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn goose_relative_path_root_falls_back_to_home() {
+    let temp = unique_temp_dir("goose-relative-root");
+    install_isolated(&temp);
+    hooklinesinker_isolated(&temp)
+        .env("GOOSE_PATH_ROOT", "relative")
+        .args(["hooks", "install", "--agent", "goose"])
+        .assert()
+        .success();
+    assert!(
+        temp.join("home/.agents/plugins/hooklinesinker/hooks/hooks.json")
+            .is_file()
+    );
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn copilot_generated_commands_are_silent_and_telemetry_errors_exit_zero() {
+    let temp = unique_temp_dir("copilot quoted ' path");
+    install_isolated(&temp);
+    std::fs::create_dir_all(temp.join("home")).unwrap();
+    let copilot_home = temp.join("copilot-home");
+    hooklinesinker_isolated(&temp)
+        .env("COPILOT_HOME", &copilot_home)
+        .args(["hooks", "install", "--agent", "copilot"])
+        .assert()
+        .success();
+    let path = copilot_home.join("hooks/hooklinesinker.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(config["version"], 1);
+    let command = config["hooks"]["PreToolUse"][0]["command"]
+        .as_str()
+        .unwrap();
+    for input in [
+        include_str!("fixtures/copilot-pretool.json"),
+        "invalid-json",
+    ] {
+        let output = Command::new("sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", temp.join("home"))
+            .env("XDG_STATE_HOME", &temp)
+            .env("XDG_DATA_HOME", temp.join("data"))
+            .current_dir(temp.join("home"))
+            .args(["-c", command])
+            .write_stdin(input)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"");
+    }
+    let records: Vec<_> = std::fs::read_dir(temp.join("hooklinesinker/status"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(records.len(), 1);
+    let record: Value = serde_json::from_slice(&std::fs::read(&records[0]).unwrap()).unwrap();
+    assert_eq!(record["agent"], "copilot");
+    assert_eq!(record["phase"], "working");
+    assert_eq!(record["session"]["cwd"], "/work/copilot-project");
+    let blocked = temp.join("state-file");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    hooklinesinker_isolated(&temp)
+        .env("XDG_STATE_HOME", &blocked)
+        .args(["ingest", "--agent", "copilot", "--event", "PreToolUse"])
+        .write_stdin(include_str!("fixtures/copilot-pretool.json"))
+        .assert()
+        .success()
+        .stdout("");
+    for action in ["status", "uninstall"] {
+        hooklinesinker_isolated(&temp)
+            .env("COPILOT_HOME", &copilot_home)
+            .args(["hooks", action, "--agent", "copilot"])
+            .assert()
+            .success();
+    }
+    let output = hooklinesinker_isolated(&temp)
+        .env("COPILOT_HOME", &copilot_home)
+        .args(["hooks", "status", "--agent", "copilot", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["state"],
+        "missing"
+    );
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn antigravity_controlled_exits_return_neutral_json() {
+    let temp = unique_temp_dir("antigravity-neutral");
+    for (event, expected) in [
+        ("Stop", "{\"decision\":\"allow\"}\n"),
+        ("SessionStart", "{}\n"),
+        ("PreInvocation", "{}\n"),
+        ("PostToolUse", "{}\n"),
+    ] {
+        let output = hooklinesinker_isolated(&temp)
+            .args(["ingest", "--agent", "antigravity", "--event", event])
+            .write_stdin(include_str!("fixtures/antigravity-stop.json"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+    for invalid in [vec![0xff], vec![b'x'; 1_048_577]] {
+        let output = hooklinesinker_isolated(&temp)
+            .args(["ingest", "--agent", "antigravity", "--event", "Stop"])
+            .write_stdin(invalid)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{\"decision\":\"allow\"}\n");
+    }
+    let blocked = temp.join("blocked");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    let output = hooklinesinker_isolated(&temp)
+        .env("XDG_STATE_HOME", &blocked)
+        .args(["ingest", "--agent", "antigravity", "--event", "Stop"])
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{\"decision\":\"allow\"}\n");
+    let output = hooklinesinker_isolated(&temp)
+        .env("XDG_STATE_HOME", "relative")
+        .args(["ingest", "--agent", "antigravity", "--event", "Stop"])
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{\"decision\":\"allow\"}\n");
+    std::fs::remove_dir_all(temp).unwrap();
 }

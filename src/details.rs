@@ -43,6 +43,7 @@ pub(crate) enum DetailKind {
 pub(crate) struct EventTraits {
     pub kind: DetailKind,
     pub turn_start: bool,
+    pub preserve_permission: bool,
     pub subagent_origin: bool,
     pub live_background_children: Option<u32>,
 }

@@ -1,6 +1,8 @@
 # hooklinesinker
 
-I am working on an app ([Juggler](https://github.com/nielsmadan/juggler)) and a CLI ([ringleader](https://github.com/nielsmadan/ringleader)) that both consume agent status hook events from multiple agents. I did not want to register both the app and the CLI in every hook config for every agent. So I built this little CLI utility. Hook events from any supported agent (Claude Code, Codex, OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI) get sent to hooklinesinker, which keeps its own queryable state on session status and forwards normalized events. Other apps can register with hooklinesinker to receive the the events directly as well.
+I am working on an app ([Juggler](https://github.com/nielsmadan/juggler)) and a CLI ([ringleader](https://github.com/nielsmadan/ringleader)) that both consume agent status hook events from multiple agents. I did not want to register both the app and the CLI in every hook config for every agent. So I built this little CLI utility. Hook events from any supported agent (Claude Code, Codex, OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI, Devin CLI, Goose CLI, GitHub Copilot CLI, Kilo CLI) get sent to hooklinesinker, which keeps its own queryable state on session status and forwards normalized events. Other apps can register with hooklinesinker to receive the the events directly as well.
+
+Eleven CLI agents are supported. Antigravity CLI has [provisional hooks](docs/hooks-and-adapters.md#antigravity-cli--provisional-support-blocked), included in configuration management but not counted as supported: actual CLI ownership, eventual background completion, and host timeout behavior remain unverified.
 
 This is just a little piece of plumbing, but if you're building anything that needs agent lifecycle status hook events, it might save you some time. It can be installed standalone or integrated into your own app. See [Integrating](#integrating).
 
@@ -56,7 +58,7 @@ hooklinesinker consumers [--json]                # who is registered
 hooklinesinker doctor [--json]                   # every self-check; nonzero on a real fault
 hooklinesinker install --consumer NAME [--sink URL]
 hooklinesinker uninstall --consumer NAME
-hooklinesinker hooks install|status|uninstall --agent claude|codex|opencode|pi|droid|qwen|kimi
+hooklinesinker hooks install|status|uninstall --agent claude|codex|opencode|pi|droid|qwen|kimi|devin|goose|copilot|kilo|antigravity
 hooklinesinker ingest --agent AGENT --event EVENT   # what the installed hooks call
 ```
 
@@ -104,12 +106,16 @@ envelope whose `protocol` is not one they speak, and skip individual records who
 ```
 
 Keys are camelCase. `agent` is kebab-case (`claude`, `codex`, `opencode`, `pi`, `droid`, `qwen`,
-`kimi`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`).
+`kimi`, `devin`, `goose`, `copilot`, `kilo`, `antigravity`). `phase` is snake_case (`idle`, `working`, `permission`, `compacting`, `unknown`).
 Rust deserialization maps unfamiliar phase values to `unknown` when the rest of the record can
 be decoded; consumers in other languages should provide the same fallback.
+Protocol 1 retains its wire fields when implemented agents are added. Older Rust SDKs use a
+closed `Agent` enum: upgrade before consuming newly implemented agent values, including `devin`, `goose`, `copilot`, `kilo`, and provisional `antigravity` records, or skip unknown-agent records
+before typed decoding; exhaustive matches may also need updating. This does not add an
+unknown-agent fallback to ingestion. Release-time crate compatibility remains a separate review.
 
 `event` carries each agent's own spelling and has no single casing: PascalCase for the native
-agents (`SessionStart`), snake_case for Pi (`session_start`), dot-case for OpenCode
+agents (`SessionStart`) plus Copilot’s lowercase `notification`, snake_case for Pi (`session_start`), dot-case for OpenCode and Kilo
 (`session.created`), plus the synthetic `swept`. A corrective re-send after fan-out carries the
 stored event prefixed `resend:` (for example `resend:UserPromptSubmit`) instead of repeating it
 verbatim. Branch on `phase` and `running`, which are normalized; treat `event` as a diagnostic
@@ -266,6 +272,10 @@ This is Juggler's model (`juggler/Services/HooklinesinkerClient.swift`, `HookSer
 | `~/.factory/hooks.json` | Factory Droid hooks (top-level event map, no `hooks` wrapper) |
 | `$QWEN_HOME/settings.json` (default `~/.qwen`) | Qwen Code hooks |
 | `$KIMI_CODE_HOME/config.toml` (default `~/.kimi-code`) | Kimi Code CLI hooks (`[[hooks]]`) |
+| `~/.config/devin/config.json` | Devin CLI hooks (nested `hooks`) |
+| `$GOOSE_PATH_ROOT/.agents/plugins/hooklinesinker/hooks/hooks.json` (default `~/.agents/plugins/...`) | Goose CLI plugin hooks |
+| `$COPILOT_HOME/hooks/hooklinesinker.json` (default `~/.copilot/hooks/hooklinesinker.json`) | GitHub Copilot CLI version 1 direct hooks |
+| `~/.gemini/config/hooks.json` | Antigravity provisional hooks |
 
 Without `XDG_*` set these fall back to `~/.local/share` and `~/.local/state`. Both roots are
 created `0700`.
@@ -273,9 +283,10 @@ created `0700`.
 Hooks are written into each agent's own configuration, and nowhere else:
 `~/.claude/settings.json`, `~/.codex/hooks.json`,
 `$OPENCODE_CONFIG_DIR/plugins/hooklinesinker-opencode.ts`,
+`$KILO_CONFIG_DIR/plugins/hooklinesinker-kilo.ts` (default `$XDG_CONFIG_HOME/kilo` or `~/.config/kilo`),
 `$PI_CODING_AGENT_DIR/extensions/hooklinesinker-pi.ts`, `~/.factory/hooks.json`,
-`$QWEN_HOME/settings.json`, and `$KIMI_CODE_HOME/config.toml`. Entries this tool wrote are
-identified by their `command` naming this binary (and the generated OpenCode/Pi plugin files
+`$QWEN_HOME/settings.json`, `$KIMI_CODE_HOME/config.toml`, `~/.config/devin/config.json`, Goose’s `.agents/plugins/hooklinesinker/hooks/hooks.json`, `$COPILOT_HOME/hooks/hooklinesinker.json`, and `~/.gemini/config/hooks.json` (Antigravity provisional hooks). Entries this tool wrote are
+identified by their `command` naming this binary (and the generated OpenCode/Kilo/Pi plugin files
 also carry an ownership marker), so an install reconciles its own entries and leaves
 everyone else's alone. An entry or plugin that a config manager renders with a home-relative
 path to the active binary counts as installed and is left as written; see

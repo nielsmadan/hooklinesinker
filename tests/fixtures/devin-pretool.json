@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "devin-session",
+  "prompt_id": "devin-turn",
+  "tool_name": "exec",
+  "tool_input": {"command": "printf fixture"}
+}

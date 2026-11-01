@@ -74,9 +74,10 @@ ledger transaction in `state.rs`:
 | Codex | Ordinary activity, including a root `source: fork`; `source: resume` reactivates | Any event carrying `agent_id` attaches to the root's tracked children instead of starting its own binding (only `SubagentStart` creates a new entry there); an `agent_id` with no known root starts a parallel binding that tracks that one child; app-server and legacy mcp-server modes stay independent |
 | Droid | Ordinary activity; `SessionStart source: resume` reactivates | A child `SessionStart` naming its parent's (or grandparent's) `calling_session_id` attaches to that root instead of starting its own session; distinct owner processes stay independent; ambiguous same-process sessions are retained conservatively |
 | Qwen | Ordinary activity, including `source: branch`; `source: resume` reactivates | ACP/serve modes and attributed `source_type`/`source_id` sessions stay independent |
+| Devin | Root prompt/start/stop boundaries update its own phase | Same-process conversations remain independent; `SessionEnd` removes only the named session |
 | Kimi | Ordinary activity; `SessionStart source: resume` reactivates | ACP, web and wire launch modes stay independent |
 | Pi | UI session activity, including new/fork; `session_start reason: resume` reactivates | Adapter suppresses contexts with `hasUI: false` |
-| OpenCode | `tui.session.select` selects/reactivates an independent binding | Selection and activity never retire another conversation |
+| OpenCode / Kilo | `tui.session.select` selects/reactivates an independent binding | Selection and activity never retire another conversation |
 
 Recognized child activity cannot replace another binding. When it introduces a separate binding,
 that binding is marked parallel; child activity on an existing parent preserves its role.
@@ -148,6 +149,13 @@ A poll between process exit and the next hook cannot consume that event. If no
 further hook arrives, dead files remain while live-session reads exclude them. A sweep
 retains successful removals alongside per-record failures and sends those removal events
 even if another record could not be read or deleted.
+
+Devin and Copilot permission waits survive both unrelated `PreToolUse` and `PostToolUse` callbacks.
+Without a documented resolution event or tool-call identifier, denial, cancellation, or
+completion cannot prove the outstanding wait ended. The next root `UserPromptSubmit`,
+`Stop`, or `SessionStart` clears it. `PostCompaction` preserves phase because it reports
+completed compaction. This conservative policy can retain permission longer than the host
+actually waits; it never sends an approval to the host.
 
 ### Child agents
 
@@ -333,11 +341,17 @@ kebab-case agent names, and snake_case phases. One protocol major versions all
 consumer-facing envelopes, capability registrations, and status records. Consumers must reject unknown
 envelope majors, skip records with unsupported majors, and surface `problems`.
 An unrecognized phase string deserializes to `unknown` rather than failing the record,
-so a future phase added in a protocol minor degrades instead of breaking. `Agent` has no
-such fallback and cannot get a meaningful one — an unknown agent has no hook table,
-executable names or lifecycle mapping — so accepting one is a protocol-major bump.
+so a future phase added in a protocol minor degrades instead of breaking. `Agent` remains
+closed: unknown values fail typed decoding. A generic unknown-agent fallback would need
+a protocol-major decision because an unimplemented producer has no hook table,
+executable names, or lifecycle mapping.
 
-Optional additive fields preserve compatibility. Other wire changes need a
+Implemented agent additions retain protocol 1: current Juggler and ringleader consumers
+decode agent names as strings. Older Rust SDKs must upgrade or skip unknown-agent records
+before typed decoding, and exhaustive matches may need changes. Crate release compatibility
+must be decided before publishing; see [native CLI validation](reference/agent-validation.md).
+
+Optional additive fields preserve compatibility. Other incompatible wire changes need a
 protocol bump and coordinated Juggler and ringleader changes. Consumers read state
 through CLI JSON commands; the private files are an implementation detail.
 The crate exports only this protocol model and the CLI entry point; stores, hook
@@ -398,3 +412,62 @@ sessions, marker migration and wire privacy; [`tests/cli.rs`](../tests/cli.rs) c
 envelopes, ingest failure exits and reset.
 See [hooks and adapters](hooks-and-adapters.md) for event production and host
 timeouts, and [installation](installation.md) for consumer registration.
+
+## Goose CLI lifecycle
+
+`SessionStart` selects an idle conversation, including reopening an earlier native session ID
+(the native payload has no `source: resume` discriminator). `UserPromptSubmit` starts a
+working turn; `PreToolUse` reports working and the tool name. `PostToolUse` and
+`PostToolUseFailure` clear the tool and refresh the record without ending the turn.
+`Stop` settles idle and `SessionEnd` removes that session. Process death uses the normal
+PID/start-time sweep. Foreground CLI conversations replace earlier foreground bindings;
+recognized ACP/gateway shared processes preserve independent conversations. Goose exposes
+no subscribed permission-wait or compaction state; child count remains unreported.
+
+
+## Copilot CLI lifecycle
+
+Copilot uses root session IDs across startup, new, and resume boundaries. Same-process
+conversations remain independent, including ACP and headless modes; a delayed `/clear`
+`SessionEnd` removes only the old ID. The owning `copilot` process supplies liveness.
+Notifications carrying `permission_prompt` or `elicitation_dialog` begin a wait. Both tool
+starts and tool completions preserve that wait, including failure, denial, and cancellation;
+the next root prompt/start/stop clears it. A wait may outlast the actual dialog because no
+verified correlation joins the notification to a resolution. Asynchronous notification delivery
+can also arrive after a root boundary; there is no invented ordering or resolution signal.
+
+Callbacks positively marked as children are ignored, keeping the root phase intact. Full
+child aggregation is unavailable. A root `Stop` therefore reports only root settlement.
+Inherited Claude project hooks are ignored when the nearest recognized producer is Copilot;
+an actual inner Claude process and callbacks with unknown provenance retain Claude behavior.
+
+## Antigravity provisional lifecycle
+
+Antigravity support is blocked pending real CLI ownership and eventual background-settlement
+verification. Preparatory hooks require a positive CLI ancestor plus the documented CLI
+transcript subtree; callbacks from App/IDE or without that owner are ignored, including their
+inherited terminal/tmux metadata. A shared backend cannot keep a closed CLI session alive.
+
+Fixture behavior is `SessionStart` → idle, `PreInvocation` → working (zero turn increments),
+`PostToolUse` → refresh, and `Stop` → idle only for boolean `fullyIdle: true`. False holds working;
+missing or ill-typed values leave state unchanged and record health. No later completion is
+inferred. Separate conversation IDs remain independent, and only an actual recorded CLI owner
+can establish process liveness. A fully functioning native lifecycle has not been demonstrated;
+see [integration limits](hooks-and-adapters.md#antigravity-cli--provisional-support-blocked).
+
+
+## Kilo CLI lifecycle
+
+Kilo shares OpenCode's independent plugin sessions and phase-preserving selection. Legacy stored
+Kilo records default to parallel roots, and serialization preserves that classification. The
+plugin aggregates root/child permission and working states before ingest; Rust receives root IDs
+and no child count. `offline` means working/retry, while `scheduled` means idle unless children
+are working or awaiting permission. Background completion holds working until the root's next
+authoritative event, enabled by default and disabled by
+`KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false`.
+
+`session.compacted` is a completion annotation and preserves the prior phase. Each root deletion
+removes only that conversation. The native plugin disposal callback attempts known-root deletions
+with bounded concurrency and a shared deadline; failed helpers or exhausted cleanup can leave
+stale records while the backend remains alive.
+PID/start-time liveness remains available when the process exits without clean disposal.

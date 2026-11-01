@@ -167,7 +167,13 @@ fn agent_details(agent: Agent, event: &str, native: &serde_json::Value) -> Detai
             problem: problem_token(native.get("problem")),
             ..Details::default()
         },
-        Agent::Opencode => Details::default(),
+        Agent::Antigravity => Details {
+            model: text("modelName"),
+            ..Details::default()
+        },
+        Agent::Opencode | Agent::Kilo | Agent::Devin | Agent::Goose | Agent::Copilot => {
+            Details::default()
+        }
     }
 }
 
@@ -200,7 +206,10 @@ fn read_traits(
     EventTraits {
         kind,
         turn_start: role == DetailRole::TurnStart,
-        subagent_origin: subagent_id(native).is_some(),
+        preserve_permission: matches!(agent, Agent::Devin | Agent::Copilot)
+            && matches!(role, DetailRole::ToolStart | DetailRole::ToolEnd),
+        subagent_origin: !matches!(agent, Agent::Devin | Agent::Copilot)
+            && subagent_id(native).is_some(),
         live_background_children: native
             .get("background_tasks")
             .filter(|tasks| reports_tasks && tasks.is_array())
@@ -285,6 +294,11 @@ fn map_event(
                 | "tui.session.select" => Update(Phase::Idle),
                 "session.status.busy" | "session.status.retry" => Update(Phase::Working),
                 "permission.asked" => Update(Phase::Permission),
+                "session.compacted" | "session.compaction.completed" if agent == Agent::Kilo => {
+                    Annotate
+                }
+                "session.status.offline" if agent == Agent::Kilo => Update(Phase::Working),
+                "session.status.scheduled" if agent == Agent::Kilo => Update(Phase::Idle),
                 "session.compacted" => Update(Phase::Compacting),
                 "session.deleted" | "server.instance.disposed" => Remove,
                 _ => Unrecognized,
@@ -311,6 +325,134 @@ fn invalid_native_event(detail: &str) -> io::Error {
     )
 }
 
+pub(crate) fn canonical_native_input(agent: Agent, event: &str, input: &str) -> io::Result<String> {
+    if !matches!(
+        agent,
+        Agent::Devin | Agent::Goose | Agent::Copilot | Agent::Antigravity
+    ) {
+        return Ok(input.to_string());
+    }
+    let mut native: serde_json::Value =
+        serde_json::from_str(input).map_err(|_| invalid_native_event(": expected an object"))?;
+    if agent == Agent::Antigravity {
+        if !native.is_object() {
+            return Err(invalid_native_event(": expected an object"));
+        }
+        for (source, target) in [
+            ("conversationId", "session_id"),
+            ("transcriptPath", "transcript_path"),
+        ] {
+            let value = native
+                .get(source)
+                .cloned()
+                .ok_or_else(|| invalid_native_event(": missing Antigravity identity"))?;
+            if !value.is_string() || native.get(target).is_some_and(|other| other != &value) {
+                return Err(invalid_native_event(": invalid Antigravity identity"));
+            }
+            native[target] = value;
+        }
+        if event == "Stop"
+            && native
+                .get("fullyIdle")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+        {
+            return Err(invalid_native_event(": Stop requires boolean fullyIdle"));
+        }
+        if let Some(tool) = native.pointer("/toolCall/name").cloned() {
+            native["tool_name"] = tool;
+        }
+        native.as_object_mut().unwrap().remove("cwd");
+    }
+    if agent == Agent::Copilot {
+        for (source, target) in [
+            ("sessionId", "session_id"),
+            ("toolName", "tool_name"),
+            ("parentAgentId", "parent_agent_id"),
+            ("agentType", "agent_type"),
+        ] {
+            if let Some(value) = native.get(source).cloned() {
+                if native.get(target).is_some_and(|other| other != &value) {
+                    return Err(invalid_native_event(": conflicting native field spellings"));
+                }
+                native[target] = value;
+            }
+        }
+    }
+    if native
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|id| id.trim().is_empty())
+    {
+        return Err(invalid_native_event(
+            ": native host requires a nonempty session_id",
+        ));
+    }
+    if agent == Agent::Goose {
+        if let Some(cwd) = native.get("working_dir").cloned() {
+            if !cwd.is_string() {
+                return Err(invalid_native_event(": working_dir must be a string"));
+            }
+            native["cwd"] = cwd;
+        }
+        return serde_json::to_string(&native).map_err(io::Error::other);
+    }
+    if matches!(agent, Agent::Copilot | Agent::Antigravity) {
+        serde_json::to_string(&native).map_err(io::Error::other)
+    } else {
+        Ok(input.to_string())
+    }
+}
+
+pub(crate) fn effective_hook_cwd(
+    agent: Agent,
+    input: &str,
+    launch_cwd: String,
+    devin_project_dir: Option<&str>,
+) -> String {
+    if agent == Agent::Antigravity {
+        let native: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+        let workspaces: Vec<_> = native
+            .get("workspacePaths")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|path| std::path::Path::new(path).is_absolute())
+            .collect();
+        if workspaces
+            .iter()
+            .any(|workspace| std::path::Path::new(&launch_cwd).starts_with(workspace))
+        {
+            return launch_cwd;
+        }
+        return workspaces
+            .first()
+            .map_or(launch_cwd, |path| (*path).to_string());
+    }
+    if agent == Agent::Goose {
+        let native: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+        return native
+            .get("working_dir")
+            .and_then(serde_json::Value::as_str)
+            .filter(|cwd| !cwd.is_empty())
+            .map_or(launch_cwd, str::to_string);
+    }
+    if !matches!(agent, Agent::Devin | Agent::Copilot) {
+        return launch_cwd;
+    }
+    let native: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+    native
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .or_else(|| {
+            devin_project_dir
+                .filter(|cwd| agent == Agent::Devin && std::path::Path::new(cwd).is_absolute())
+        })
+        .map_or(launch_cwd, str::to_string)
+}
+
 pub(crate) fn normalize(
     agent: Agent,
     event: &str,
@@ -321,16 +463,33 @@ pub(crate) fn normalize(
     let input: serde_json::Value = serde_json::from_str(input).map_err(|e| {
         invalid_native_event(&format!(" at line {} column {}", e.line(), e.column()))
     })?;
+    if agent == Agent::Copilot
+        && ["parent_agent_id", "agent_type"].iter().any(|key| {
+            input
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+        })
+    {
+        return Ok(Normalized::Ignored);
+    }
     let native = NativeEvent::deserialize(&input)
         .map_err(|_| invalid_native_event(": a known field has the wrong type"))?;
 
-    let (action, role) = map_event(
+    let (mut action, role) = map_event(
         agent,
         event,
         native.tool_name.as_deref(),
         native.notification_type.as_deref(),
         native.background_work,
     );
+    if agent == Agent::Antigravity && event == "Stop" {
+        let idle = input
+            .get("fullyIdle")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| invalid_native_event(": Stop requires boolean fullyIdle"))?;
+        action = MappedAction::Update(if idle { Phase::Idle } else { Phase::Working });
+    }
     let (phase, running, kind) = match action {
         MappedAction::Ignore => return Ok(Normalized::Ignored),
         MappedAction::Unrecognized => return Ok(Normalized::Unrecognized),
@@ -343,7 +502,11 @@ pub(crate) fn normalize(
     let traits = read_traits(agent, &input, kind, role);
 
     let session_id = capped(native.session_id.unwrap_or_default());
-    let cwd = capped(native.cwd.unwrap_or_else(|| env.cwd.clone()));
+    let cwd = capped(if agent == Agent::Antigravity {
+        effective_hook_cwd(agent, &input.to_string(), env.cwd.clone(), None)
+    } else {
+        native.cwd.unwrap_or_else(|| env.cwd.clone())
+    });
     let host = process
         .as_ref()
         .map_or_else(|| env.host.clone(), |p| p.host.clone());
@@ -444,6 +607,36 @@ mod tests {
             pid,
             started_at: "2026-09-04T00:00:00Z".into(),
             host: "test-host".into(),
+        }
+    }
+
+    #[test]
+    fn antigravity_canonical_fields_and_workspace_selection() {
+        let raw = include_str!("../tests/fixtures/antigravity-stop.json");
+        let input = canonical_native_input(Agent::Antigravity, "Stop", raw).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&input).unwrap();
+        assert_eq!(value["session_id"], "antigravity-conversation");
+        assert_eq!(value["tool_name"], "run_command");
+        assert_eq!(value["transcript_path"], value["transcriptPath"]);
+        for (cwd, expected) in [
+            ("/work/second/sub", "/work/second/sub"),
+            ("/work/firstly", "/work/first"),
+            ("/elsewhere", "/work/first"),
+        ] {
+            assert_eq!(
+                effective_hook_cwd(Agent::Antigravity, raw, cwd.into(), None),
+                expected
+            );
+        }
+        let normalized = normalize(Agent::Antigravity, "Stop", &input, &env(), None).unwrap();
+        assert_eq!(normalized.into_event().unwrap().phase, Phase::Working);
+        for raw in [
+            "null",
+            "[]",
+            r#"{"conversationId":false}"#,
+            r#"{"conversationId":"id","session_id":"different","transcriptPath":"/log"}"#,
+        ] {
+            assert!(canonical_native_input(Agent::Antigravity, "Stop", raw).is_err());
         }
     }
 
@@ -891,5 +1084,118 @@ mod tests {
             );
             assert_eq!(details.tool, expected, "{agent:?} {event}");
         }
+    }
+    #[test]
+    fn devin_canonicalization_validates_identity_and_preserves_metadata() {
+        let input =
+            r#"{"session_id":"s","prompt_id":"turn-1","source":"resume","tool_name":"exec"}"#;
+        let canonical = canonical_native_input(Agent::Devin, "PreToolUse", input).unwrap();
+        assert_eq!(canonical, input);
+        let Normalized::Recordable(event, details, traits) =
+            normalize(Agent::Devin, "PreToolUse", &canonical, &env(), None).unwrap()
+        else {
+            panic!("valid Devin input must be recordable");
+        };
+        assert_eq!(event.session.id, "s");
+        assert_eq!(event.phase, Phase::Working);
+        assert_eq!(details.tool, Field::Set("exec".into()));
+        assert!(traits.preserve_permission);
+        assert!(canonical_native_input(Agent::Devin, "Stop", r#"{"session_id":false}"#).is_err());
+    }
+
+    #[test]
+    fn devin_project_directory_precedes_hook_launch_directory() {
+        for (agent, input, project, expected) in [
+            (Agent::Devin, "{}", Some("/project"), "/project"),
+            (
+                Agent::Devin,
+                r#"{"cwd":"/payload"}"#,
+                Some("/project"),
+                "/payload",
+            ),
+            (Agent::Devin, "{}", Some("relative"), "/launch"),
+            (Agent::Devin, "{}", None, "/launch"),
+            (Agent::Claude, "{}", Some("/project"), "/launch"),
+        ] {
+            assert_eq!(
+                effective_hook_cwd(agent, input, "/launch".into(), project),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn goose_canonicalization_maps_only_native_working_directory() {
+        let input = include_str!("../tests/fixtures/goose-tool.json");
+        let canonical = canonical_native_input(Agent::Goose, "PreToolUse", input).unwrap();
+        let Normalized::Recordable(event, details, _) = normalize(
+            Agent::Goose,
+            "PreToolUse",
+            &canonical,
+            &env(),
+            Some(process(1)),
+        )
+        .unwrap() else {
+            panic!("recordable");
+        };
+        assert_eq!(event.session.id, "goose-session");
+        assert_eq!(event.session.cwd, "/work/goose-project");
+        assert_eq!(details.tool, Field::Set("developer__shell".into()));
+        assert_eq!(
+            effective_hook_cwd(Agent::Goose, input, "/launch".into(), None),
+            "/work/goose-project"
+        );
+        for invalid in [
+            r#"{"session_id":false}"#,
+            r#"{"session_id":"s","working_dir":3}"#,
+        ] {
+            assert!(canonical_native_input(Agent::Goose, "Stop", invalid).is_err());
+        }
+    }
+    #[test]
+    fn copilot_canonicalization_is_scoped_and_validates_identity() {
+        for input in [
+            include_str!("../tests/fixtures/copilot-pretool.json"),
+            r#"{"sessionId":"copilot-session","toolName":"Bash","cwd":"/work/copilot-project"}"#,
+        ] {
+            let canonical = canonical_native_input(Agent::Copilot, "PreToolUse", input).unwrap();
+            let Normalized::Recordable(event, details, traits) =
+                normalize(Agent::Copilot, "PreToolUse", &canonical, &env(), None).unwrap()
+            else {
+                panic!("recordable")
+            };
+            assert_eq!(event.session.id, "copilot-session");
+            assert_eq!(event.session.cwd, "/work/copilot-project");
+            assert_eq!(details.tool, Field::Set("Bash".into()));
+            assert!(traits.preserve_permission);
+        }
+        let input = include_str!("../tests/fixtures/copilot-notification.json");
+        let canonical = canonical_native_input(Agent::Copilot, "notification", input).unwrap();
+        let event = normalize(Agent::Copilot, "notification", &canonical, &env(), None)
+            .unwrap()
+            .into_event()
+            .unwrap();
+        assert_eq!(event.phase, Phase::Permission);
+        assert_eq!(
+            canonical_native_input(Agent::Claude, "SessionStart", input).unwrap(),
+            input
+        );
+        for input in [
+            "[]",
+            "{}",
+            r#"{"sessionId":false}"#,
+            r#"{"sessionId":" "}"#,
+            r#"{"sessionId":"one","session_id":"two"}"#,
+        ] {
+            assert!(canonical_native_input(Agent::Copilot, "Stop", input).is_err());
+        }
+        assert_eq!(
+            effective_hook_cwd(
+                Agent::Copilot,
+                r#"{"cwd":"/project"}"#,
+                "/launch".into(),
+                Some("/devin")
+            ),
+            "/project"
+        );
     }
 }
