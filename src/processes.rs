@@ -57,7 +57,7 @@ impl<'de> Deserialize<'de> for Timestamp {
 }
 
 pub(crate) fn local_hostname() -> String {
-    System::host_name().unwrap_or_else(|| "localhost".to_string())
+    System::host_name().unwrap_or_else(|_| "localhost".to_string())
 }
 
 pub(crate) fn now_rfc3339() -> String {
@@ -148,7 +148,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 // A PID whose start time still matches is the same process; a reused PID is not.
 fn pid_is_alive(identity: &ProcessIdentity) -> bool {
     let pid = Pid::from_u32(identity.pid);
-    let mut current = System::new();
+    let mut current = System::new().expect("sysinfo supports every hooklinesinker target");
     current.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
@@ -178,7 +178,7 @@ pub(crate) struct SystemProcessLookup {
 
 impl SystemProcessLookup {
     pub(crate) fn new() -> Self {
-        let mut system = System::new();
+        let mut system = System::new().expect("sysinfo supports every hooklinesinker target");
         // Ancestry matching reads name, parent, start time and argv. `refresh_processes`
         // leaves argv unset and would silently fall through to a same-named ancestor.
         system.refresh_processes_specifics(
@@ -453,7 +453,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = Pid::from_u32(child.id());
-        let mut current = System::new();
+        let mut current = System::new().unwrap();
         current.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
             true,
