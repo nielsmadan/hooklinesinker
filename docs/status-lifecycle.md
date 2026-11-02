@@ -159,6 +159,12 @@ actually waits; it never sends an approval to the host.
 
 ### Child agents
 
+Claude's `AskUserQuestion` maps `PreToolUse` and `PermissionRequest` to `idle` while
+keeping the binding running; it is an input wait rather than an approval request.
+Tool completion/failure or a new user prompt restores `working`. Marked Claude child
+events use the same mapping and existing session isolation; background-task counts do
+not turn a question into a permission wait. Codex's child-wait policy below is unchanged.
+
 A session can track child agents (Codex subagents, Droid Task children) on its own ledger
 record. The aggregate rule: `permission` if the session's own phase or any tracked child is
 `permission`; else `working` if the session's own phase is `idle` or `unknown` and any child is

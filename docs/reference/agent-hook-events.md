@@ -37,7 +37,7 @@ waiting.
 
 | Agent | Waiting begins | Waiting ends |
 |---|---|---|
-| Claude Code | `PermissionRequest` | No dedicated resolution event; a later tool or turn event supplies the next state |
+| Claude Code | `PreToolUse` or `PermissionRequest` for `AskUserQuestion` (input wait); other `PermissionRequest` events (approval) | `PostToolUse`, `PostToolUseFailure`, or a later tool or turn event supplies the next state |
 | Codex | `PreToolUse` with `tool_name: request_user_input`, or `PermissionRequest` | The corresponding `PostToolUse`, or a later tool or turn event |
 | Factory Droid | `Notification` with `notification_type: elicitation_dialog` or `permission_prompt` | No dedicated answer event; the corresponding `PostToolUse` follows after the interaction resolves |
 | Qwen Code | `PermissionRequest`, or `Notification` with `notification_type: permission_prompt` | `PermissionDenied`, the corresponding `PostToolUse`, or a later turn event |
@@ -112,7 +112,7 @@ means the agent has no dedicated resolution event for that interaction.
 
 | Agent | Turn begins | Before a tool | After a tool | User wait begins | User wait ends | Turn settles |
 |---|---|---|---|---|---|---|
-| Claude Code | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` or `PostToolUseFailure` | `PermissionRequest` | later tool or turn event | `Stop` or `StopFailure` |
+| Claude Code | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` or `PostToolUseFailure` | `PermissionRequest`, or `PreToolUse` for `AskUserQuestion` | corresponding tool completion or later turn event | `Stop` or `StopFailure` |
 | Codex | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | `PermissionRequest`, or `PreToolUse` for `request_user_input` | corresponding `PostToolUse` | `Stop` |
 | Factory Droid | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` | `Notification` | corresponding `PostToolUse` | `Stop` |
 | Qwen Code | `UserPromptSubmit` | `PreToolUse` | `PostToolUse` or `PostToolUseFailure` | `PermissionRequest` or `Notification` | `PermissionDenied`, corresponding `PostToolUse`, or later status | `Stop` or `StopFailure` |

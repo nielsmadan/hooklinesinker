@@ -763,6 +763,86 @@ fn last_body(fixture: &Fixture) -> Value {
 }
 
 #[test]
+fn claude_ask_user_question_waits_and_answer_resumes_work() {
+    for child in [None, Some("worker")] {
+        for resumed in ["PostToolUse", "PostToolUseFailure", "UserPromptSubmit"] {
+            let fixture = Fixture::new();
+            fixture.send(Agent::Claude, "SessionStart", &json!({"session_id": "a"}));
+            fixture.send(
+                Agent::Claude,
+                "UserPromptSubmit",
+                &json!({"session_id": "a"}),
+            );
+            fixture.send(
+                Agent::Claude,
+                "PermissionRequest",
+                &json!({"session_id": "a", "tool_name": "Bash"}),
+            );
+            assert_eq!(last_body(&fixture)["phase"], "permission");
+            let question = json!({
+                "session_id": "a", "tool_name": "AskUserQuestion", "agent_id": child,
+                "background_tasks": [{"type": "subagent", "status": "running"}]
+            });
+            for event in ["PreToolUse", "PermissionRequest"] {
+                fixture.send(Agent::Claude, event, &question);
+                let body = last_body(&fixture);
+                assert_eq!(body["phase"], "idle", "{event} {child:?}");
+                assert_eq!(body["activity"]["subagents"], 1);
+                assert_eq!(body["running"], true);
+                assert_eq!(
+                    fixture.store.running(&fixture.owner).unwrap()[0].phase,
+                    Phase::Idle
+                );
+                assert_eq!(fixture.record("a")["ownPhase"], "idle");
+            }
+            fixture.send(Agent::Claude, resumed, &question);
+            assert_eq!(
+                last_body(&fixture)["phase"],
+                "working",
+                "{resumed} {child:?}"
+            );
+            assert_eq!(
+                fixture.store.running(&fixture.owner).unwrap()[0].phase,
+                Phase::Working
+            );
+            assert!(last_body(&fixture)["activity"].get("tool").is_none());
+            fixture.send(
+                Agent::Claude,
+                "PermissionRequest",
+                &json!({"session_id": "a", "tool_name": "Bash"}),
+            );
+            assert_eq!(last_body(&fixture)["phase"], "permission");
+            assert_eq!(
+                fixture.store.running(&fixture.owner).unwrap()[0].phase,
+                Phase::Permission
+            );
+        }
+    }
+}
+
+#[test]
+fn claude_ask_user_question_in_a_separate_child_preserves_the_parent() {
+    let fixture = Fixture::new();
+    fixture.send(
+        Agent::Claude,
+        "UserPromptSubmit",
+        &json!({"session_id": "parent"}),
+    );
+    let parent = fixture.record("parent");
+    let question =
+        json!({"session_id": "child", "agent_id": "worker", "tool_name": "AskUserQuestion"});
+    for event in ["PreToolUse", "PermissionRequest"] {
+        fixture.send(Agent::Claude, event, &question);
+        assert_eq!(last_body(&fixture)["phase"], "idle");
+        assert_eq!(fixture.record("parent"), parent);
+        assert_eq!(fixture.ids(), ["child", "parent"]);
+    }
+    fixture.send(Agent::Claude, "PostToolUse", &question);
+    assert_eq!(last_body(&fixture)["phase"], "working");
+    assert_eq!(fixture.record("parent"), parent);
+}
+
+#[test]
 fn codex_child_activity_keeps_the_root_working_after_its_stop() {
     let fixture = Fixture::new();
     codex_started(&fixture);

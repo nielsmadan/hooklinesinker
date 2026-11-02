@@ -226,6 +226,11 @@ pub(crate) fn native_event_lookup(
 ) -> EventLookup {
     use EventLookup::{Mapped, Unmapped, Unrecognized};
     match (agent, event) {
+        (Agent::Claude, "PreToolUse" | "PermissionRequest")
+            if tool_name == Some("AskUserQuestion") =>
+        {
+            return Mapped(Update(Phase::Idle));
+        }
         (Agent::Claude, "Stop") if background_work => {
             return Mapped(Update(Phase::Working));
         }

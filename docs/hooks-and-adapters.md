@@ -71,7 +71,11 @@ errors exit zero. See [status lifecycle](status-lifecycle.md) for sink deadlines
 
 Registration and normalization must move together. `events.rs` owns native command-hook
 registration and actions; `normalize.rs` adds Pi and OpenCode adapter mappings and
-metadata-dependent refinements. For example, Codex `Interrupt` keeps the binding live and sets
+metadata-dependent refinements. Claude `PreToolUse` and `PermissionRequest` for the exact
+`AskUserQuestion` tool report `idle` (waiting for input), with `running: true`.
+Other Claude permission requests remain `permission`. `PostToolUse`,
+`PostToolUseFailure`, or a new `UserPromptSubmit` returns the session to `working`.
+For example, Codex `Interrupt` keeps the binding live and sets
 it idle; `request_user_input` also maps to idle for its own binding, though child tracking (see
 [child agents](status-lifecycle.md#child-agents)) treats it as that child waiting on the user.
 Codex's `SubagentStart`/`SubagentStop` map to working/idle like any other event, but only ever

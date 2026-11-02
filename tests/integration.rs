@@ -770,6 +770,28 @@ fn unknown_events_are_reported_as_unrecognized() {
 }
 
 #[test]
+fn claude_ask_user_question_waits_are_idle_and_other_tools_keep_their_phases() {
+    for (tool, before, permission) in [
+        (Some("AskUserQuestion"), Phase::Idle, Phase::Idle),
+        (Some("Bash"), Phase::Working, Phase::Permission),
+        (Some("ExitPlanMode"), Phase::Working, Phase::Permission),
+        (
+            Some("mcp__example__AskUserQuestion"),
+            Phase::Working,
+            Phase::Permission,
+        ),
+        (None, Phase::Working, Phase::Permission),
+    ] {
+        let native = serde_json::json!({"session_id": "s", "tool_name": tool}).to_string();
+        for (event, phase) in [("PreToolUse", before), ("PermissionRequest", permission)] {
+            let result = normalize_for_test(Agent::Claude, event, &native);
+            assert_eq!(result.phase, phase, "{event} {tool:?}");
+            assert!(result.running);
+        }
+    }
+}
+
+#[test]
 fn codex_request_user_input_tool_use_becomes_idle() {
     let native = r#"{"session_id":"codex-session","tool_name":"request_user_input"}"#;
     let result = normalize_for_test(Agent::Codex, "PreToolUse", native);
