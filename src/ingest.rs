@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 // A sweep backlog is unbounded, each sink send costs up to ~600ms of ureq timeouts, and
 // Codex caps a hook at 3s. Deliver what fits and record the rest as a health problem.
 const SINK_FANOUT_BUDGET: Duration = Duration::from_millis(1_000);
+pub(crate) const INGEST_BUDGET: Duration = Duration::from_millis(1_500);
 
 pub(crate) fn read_capped(reader: &mut impl Read, limit: u64) -> io::Result<String> {
     let mut buf = Vec::new();
@@ -86,7 +87,7 @@ pub(crate) fn handle_ingest(
         && ctx
             .liveness
             .nearest_agent(hook_pid)
-            .is_some_and(|(host, _)| matches!(host, Agent::Devin | Agent::Copilot))
+            .is_some_and(|(host, _)| matches!(host, Agent::Devin | Agent::Copilot | Agent::Cursor))
     {
         return IngestOutcome { problem: None };
     }
@@ -99,8 +100,16 @@ pub(crate) fn handle_ingest(
     {
         return IngestOutcome { problem: None };
     }
+    if agent == Agent::Cursor
+        && !ctx
+            .liveness
+            .nearest_agent(hook_pid)
+            .is_some_and(|(host, _)| host == agent)
+    {
+        return IngestOutcome { problem: None };
+    }
     let process = ctx.liveness.owner_of(hook_pid, agent);
-    if agent == Agent::Antigravity && process.is_none() {
+    if matches!(agent, Agent::Antigravity | Agent::Cursor) && process.is_none() {
         return IngestOutcome { problem: None };
     }
     match canonical_native_input(agent, event, input) {
@@ -198,10 +207,10 @@ pub(crate) fn handle_normalized(
         }
     }
 
-    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
+    let deadline = delivery_deadline(store);
     let fan_out = fan_out_to_sinks(ctx, forwarded.as_ref(), swept, deadline);
     problems.extend(fan_out.problems);
-    if needs_convergence(profile(agent).child_tracking, stored, fan_out.had_consumers)
+    if needs_convergence(agent, stored, fan_out.had_consumers)
         && let Some(sent) = forwarded.as_ref()
     {
         problems.extend(converge_on_stored_status(ctx, sent, deadline));
@@ -224,7 +233,7 @@ pub(crate) fn handle_normalized(
 // A consumer whose sink is down must not turn a completed reset into a failed one.
 pub(crate) fn reset_sessions(ctx: &IngestContext) -> io::Result<ResetOutcome> {
     let mut outcome = ctx.store.reset(ctx.liveness)?;
-    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
+    let deadline = delivery_deadline(ctx.store);
     let delivery = fan_out_to_sinks(ctx, None, outcome.ended.clone(), deadline).problems;
     if !delivery.is_empty()
         && let Err(e) = ctx.store.record_health_many(delivery)
@@ -234,6 +243,13 @@ pub(crate) fn reset_sessions(ctx: &IngestContext) -> io::Result<ResetOutcome> {
             .push(format!("failed to record health problems: {e}"));
     }
     Ok(outcome)
+}
+
+fn delivery_deadline(store: &StatusStore) -> Instant {
+    let deadline = Instant::now() + SINK_FANOUT_BUDGET;
+    store
+        .deadline()
+        .map_or(deadline, |limit| deadline.min(limit))
 }
 
 fn record_session(
@@ -270,12 +286,11 @@ fn record_session(
         .ingest_session(status_event, &signals, ctx.liveness)
 }
 
-const fn needs_convergence(
-    child_tracking: ChildTracking,
-    stored: bool,
-    had_consumers: bool,
-) -> bool {
-    stored && had_consumers && !matches!(child_tracking, ChildTracking::Untracked)
+fn needs_convergence(agent: Agent, stored: bool, had_consumers: bool) -> bool {
+    stored
+        && had_consumers
+        && (agent == Agent::Cursor
+            || !matches!(profile(agent).child_tracking, ChildTracking::Untracked))
 }
 
 fn resend_labelled(status: &StatusEvent) -> StatusEvent {
@@ -349,7 +364,7 @@ fn fan_out_to_sinks(
         };
     };
 
-    let snapshot = match consumers.snapshot() {
+    let snapshot = match consumers.snapshot_until(deadline) {
         Ok(snapshot) => snapshot,
         Err(e) => {
             problems.push(HealthProblem::new(
@@ -434,22 +449,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn convergence_needs_a_stored_tracked_status_that_reached_a_consumer() {
-        let tracked = ChildTracking::LinkedSessions {
-            child_stop: "Stop",
-            completion_wakes_root: true,
-        };
+    fn convergence_applies_to_tracked_and_async_start_hosts_after_delivery() {
         let cases = [
-            (tracked, true, true, true),
-            (tracked, true, false, false),
-            (tracked, false, true, false),
-            (ChildTracking::Untracked, true, true, false),
+            (Agent::Droid, true, true, true),
+            (Agent::Droid, true, false, false),
+            (Agent::Droid, false, true, false),
+            (Agent::Claude, true, true, false),
+            (Agent::Cursor, true, true, true),
+            (Agent::Cursor, true, false, false),
+            (Agent::Cursor, false, true, false),
         ];
-        for (child_tracking, stored, had_consumers, expected) in cases {
+        for (agent, stored, had_consumers, expected) in cases {
             assert_eq!(
-                needs_convergence(child_tracking, stored, had_consumers),
+                needs_convergence(agent, stored, had_consumers),
                 expected,
-                "{child_tracking:?} stored={stored} had_consumers={had_consumers}"
+                "{agent:?} stored={stored} had_consumers={had_consumers}"
             );
         }
     }

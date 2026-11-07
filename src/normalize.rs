@@ -171,6 +171,19 @@ fn agent_details(agent: Agent, event: &str, native: &serde_json::Value) -> Detai
             model: text("modelName"),
             ..Details::default()
         },
+        Agent::Cursor => Details {
+            model: text_field(native.get("model_id").or_else(|| native.get("model"))),
+            problem: if event == "stop" {
+                match native.get("status").and_then(serde_json::Value::as_str) {
+                    Some("aborted") => Some("interrupted".into()),
+                    Some("error") => Some("error".into()),
+                    _ => None,
+                }
+            } else {
+                None
+            },
+            ..Details::default()
+        },
         Agent::Opencode | Agent::Kilo | Agent::Devin | Agent::Goose | Agent::Copilot => {
             Details::default()
         }
@@ -208,7 +221,7 @@ fn read_traits(
         turn_start: role == DetailRole::TurnStart,
         preserve_permission: matches!(agent, Agent::Devin | Agent::Copilot)
             && matches!(role, DetailRole::ToolStart | DetailRole::ToolEnd),
-        subagent_origin: !matches!(agent, Agent::Devin | Agent::Copilot)
+        subagent_origin: !matches!(agent, Agent::Devin | Agent::Copilot | Agent::Cursor)
             && subagent_id(native).is_some(),
         live_background_children: native
             .get("background_tasks")
@@ -328,12 +341,28 @@ fn invalid_native_event(detail: &str) -> io::Error {
 pub(crate) fn canonical_native_input(agent: Agent, event: &str, input: &str) -> io::Result<String> {
     if !matches!(
         agent,
-        Agent::Devin | Agent::Goose | Agent::Copilot | Agent::Antigravity
+        Agent::Devin | Agent::Goose | Agent::Copilot | Agent::Antigravity | Agent::Cursor
     ) {
         return Ok(input.to_string());
     }
     let mut native: serde_json::Value =
         serde_json::from_str(input).map_err(|_| invalid_native_event(": expected an object"))?;
+    if agent == Agent::Cursor {
+        let id = native
+            .get("conversation_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| invalid_native_event(": Cursor requires a nonempty conversation_id"))?;
+        if native
+            .get("session_id")
+            .is_some_and(|other| other.as_str() != Some(id))
+        {
+            return Err(invalid_native_event(
+                ": conflicting Cursor session identity",
+            ));
+        }
+        native["session_id"] = serde_json::Value::String(id.to_string());
+    }
     if agent == Agent::Antigravity {
         if !native.is_object() {
             return Err(invalid_native_event(": expected an object"));
@@ -397,7 +426,7 @@ pub(crate) fn canonical_native_input(agent: Agent, event: &str, input: &str) -> 
         }
         return serde_json::to_string(&native).map_err(io::Error::other);
     }
-    if matches!(agent, Agent::Copilot | Agent::Antigravity) {
+    if matches!(agent, Agent::Copilot | Agent::Antigravity | Agent::Cursor) {
         serde_json::to_string(&native).map_err(io::Error::other)
     } else {
         Ok(input.to_string())
@@ -408,8 +437,26 @@ pub(crate) fn effective_hook_cwd(
     agent: Agent,
     input: &str,
     launch_cwd: String,
-    devin_project_dir: Option<&str>,
+    project_dir: Option<&str>,
 ) -> String {
+    if agent == Agent::Cursor {
+        let native: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+        return native
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .filter(|cwd| std::path::Path::new(cwd).is_absolute())
+            .or_else(|| project_dir.filter(|cwd| std::path::Path::new(cwd).is_absolute()))
+            .or_else(|| {
+                native
+                    .get("workspace_roots")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .find(|cwd| std::path::Path::new(cwd).is_absolute())
+            })
+            .map_or(launch_cwd, str::to_string);
+    }
     if agent == Agent::Antigravity {
         let native: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
         let workspaces: Vec<_> = native
@@ -447,7 +494,7 @@ pub(crate) fn effective_hook_cwd(
         .and_then(serde_json::Value::as_str)
         .filter(|cwd| !cwd.is_empty())
         .or_else(|| {
-            devin_project_dir
+            project_dir
                 .filter(|cwd| agent == Agent::Devin && std::path::Path::new(cwd).is_absolute())
         })
         .map_or(launch_cwd, str::to_string)
@@ -463,6 +510,14 @@ pub(crate) fn normalize(
     let input: serde_json::Value = serde_json::from_str(input).map_err(|e| {
         invalid_native_event(&format!(" at line {} column {}", e.line(), e.column()))
     })?;
+    if agent == Agent::Cursor
+        && input
+            .get("parent_tool_call_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+    {
+        return Ok(Normalized::Ignored);
+    }
     if agent == Agent::Copilot
         && ["parent_agent_id", "agent_type"].iter().any(|key| {
             input
@@ -502,7 +557,9 @@ pub(crate) fn normalize(
     let traits = read_traits(agent, &input, kind, role);
 
     let session_id = capped(native.session_id.unwrap_or_default());
-    let cwd = capped(if agent == Agent::Antigravity {
+    let cwd = capped(if agent == Agent::Cursor {
+        effective_hook_cwd(agent, &input.to_string(), env.cwd.clone(), Some(&env.cwd))
+    } else if agent == Agent::Antigravity {
         effective_hook_cwd(agent, &input.to_string(), env.cwd.clone(), None)
     } else {
         native.cwd.unwrap_or_else(|| env.cwd.clone())
@@ -593,6 +650,84 @@ fn binding_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_conversation_identity_is_required_and_generation_independent() {
+        let normalize_cursor = |generation: &str| {
+            let raw = serde_json::json!({"conversation_id":"chat", "generation_id":generation,
+                "session_id":"chat", "tool_name":"Shell", "model":"auto", "model_id":"model-id"})
+            .to_string();
+            let canonical = canonical_native_input(Agent::Cursor, "preToolUse", &raw).unwrap();
+            let Normalized::Recordable(event, details, traits) = normalize(
+                Agent::Cursor,
+                "preToolUse",
+                &canonical,
+                &env(),
+                Some(process(1)),
+            )
+            .unwrap() else {
+                panic!("recordable");
+            };
+            assert_eq!(event.session.id, "chat");
+            assert_eq!(event.phase, Phase::Working);
+            assert_eq!(details.tool, Field::Set("Shell".into()));
+            assert_eq!(details.model, Field::Set("model-id".into()));
+            assert!(!traits.preserve_permission);
+            event.binding_id
+        };
+        assert_eq!(normalize_cursor("turn-1"), normalize_cursor("turn-2"));
+        for raw in [
+            "{}",
+            "[]",
+            r#"{"session_id":"chat"}"#,
+            r#"{"conversation_id":" "}"#,
+            r#"{"conversation_id":5}"#,
+            r#"{"conversation_id":"chat","session_id":"other"}"#,
+            r#"{"conversation_id":"chat","session_id":null}"#,
+        ] {
+            assert!(
+                canonical_native_input(Agent::Cursor, "sessionStart", raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_cwd_precedence_is_shared_with_environment_collection() {
+        for (raw, project, expected) in [
+            (
+                r#"{"cwd":"/native","workspace_roots":["/workspace"]}"#,
+                Some("/project"),
+                "/native",
+            ),
+            (
+                r#"{"workspace_roots":["/workspace"]}"#,
+                Some("/project"),
+                "/project",
+            ),
+            (
+                r#"{"cwd":"","workspace_roots":[null,"relative","/workspace"]}"#,
+                None,
+                "/workspace",
+            ),
+            ("{}", Some("relative"), "/launch"),
+            ("{}", None, "/launch"),
+        ] {
+            let cwd = effective_hook_cwd(Agent::Cursor, raw, "/launch".into(), project);
+            assert_eq!(cwd, expected);
+            let mut input: serde_json::Value = serde_json::from_str(raw).unwrap();
+            input["conversation_id"] = "chat".into();
+            let input =
+                canonical_native_input(Agent::Cursor, "sessionStart", &input.to_string()).unwrap();
+            let env = HookEnvironment { cwd, ..env() };
+            let Normalized::Recordable(event, _, _) =
+                normalize(Agent::Cursor, "sessionStart", &input, &env, None).unwrap()
+            else {
+                panic!("recordable");
+            };
+            assert_eq!(event.session.cwd, expected);
+        }
+    }
 
     fn env() -> HookEnvironment {
         HookEnvironment {

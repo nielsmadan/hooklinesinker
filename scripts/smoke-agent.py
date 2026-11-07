@@ -13,7 +13,7 @@ import threading
 
 def arguments():
     parser = argparse.ArgumentParser(description="Run one isolated native-agent hook smoke check")
-    parser.add_argument("agent", choices=["devin", "goose", "copilot", "antigravity", "kilo"])
+    parser.add_argument("agent", choices=["devin", "goose", "copilot", "antigravity", "kilo", "cursor"])
     parser.add_argument("binary", type=Path)
     parser.add_argument("--hls", type=Path, default=Path("target/debug/hooklinesinker"))
     parser.add_argument("--model", default="openrouter/openai/gpt-4.1-mini")
@@ -36,6 +36,7 @@ def environment(root, agent, inherited):
         env[key] = str(path)
     credential_keys = {
         "devin": [],
+        "cursor": ["CURSOR_API_KEY"],
         "goose": ["GOOSE_PROVIDER", "GOOSE_MODEL", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"],
         "copilot": ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
         "antigravity": ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
@@ -55,6 +56,7 @@ def prompt_arguments(agent, root, model):
         "copilot": ["--no-auto-update", "--disable-builtin-mcps", "--no-custom-instructions", "-p", prompt],
         "antigravity": ["--log-file", str(root / "cli.log"), "--print-timeout", "15s", "-p", prompt],
         "kilo": ["run", "--format", "json", "--model", model, prompt],
+        "cursor": ["--trust", "--print", "--output-format", "json", prompt],
     }[agent]
 
 

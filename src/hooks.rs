@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value as toml_value};
 
 mod antigravity;
-mod copilot;
+mod direct;
 
 const MARKER_PREFIX: &str = "// hooklinesinker-generated protocol=";
 const BIN_PLACEHOLDER: &str = "\"__HOOKLINESINKER_BIN__\"";
@@ -170,7 +170,7 @@ enum HookBackend {
     Antigravity {
         path: PathBuf,
     },
-    Copilot {
+    Direct {
         path: PathBuf,
     },
     Json {
@@ -203,8 +203,9 @@ impl HookManager {
                 &events,
                 ReconcileMode::Install,
             ),
-            HookBackend::Copilot { path } => copilot::reconcile(
+            HookBackend::Direct { path } => direct::reconcile(
                 self.binary_location(),
+                agent,
                 &path,
                 &events,
                 ReconcileMode::Install,
@@ -233,8 +234,8 @@ impl HookManager {
             HookBackend::Antigravity { path } => {
                 antigravity::status(self.binary_location(), &path, &events)
             }
-            HookBackend::Copilot { path } => {
-                copilot::status(self.binary_location(), &path, &events)
+            HookBackend::Direct { path } => {
+                direct::status(self.binary_location(), agent, &path, &events)
             }
             HookBackend::Json { path, location } => {
                 self.json_hooks().status(agent, &path, &events, location)
@@ -257,8 +258,9 @@ impl HookManager {
                 &events,
                 ReconcileMode::Uninstall,
             ),
-            HookBackend::Copilot { path } => copilot::reconcile(
+            HookBackend::Direct { path } => direct::reconcile(
                 self.binary_location(),
+                agent,
                 &path,
                 &events,
                 ReconcileMode::Uninstall,
@@ -289,7 +291,10 @@ impl HookManager {
             HookTarget::AntigravityJson => HookBackend::Antigravity {
                 path: self.roots.home.join(".gemini/config/hooks.json"),
             },
-            HookTarget::CopilotJson => HookBackend::Copilot {
+            HookTarget::CursorJson => HookBackend::Direct {
+                path: self.roots.home.join(".cursor/hooks.json"),
+            },
+            HookTarget::CopilotJson => HookBackend::Direct {
                 path: self.roots.copilot_home.join("hooks/hooklinesinker.json"),
             },
             HookTarget::ClaudeJson => HookBackend::Json {
@@ -424,7 +429,7 @@ impl HookBackend {
     fn path(&self) -> &Path {
         match self {
             Self::Antigravity { path }
-            | Self::Copilot { path }
+            | Self::Direct { path }
             | Self::Json { path, .. }
             | Self::Toml { path }
             | Self::TypeScript { path, .. } => path,

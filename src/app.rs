@@ -74,19 +74,21 @@ fn print_version(json: bool) {
 }
 
 fn run_ingest(agent: Agent, event: &str) {
-    ingest_telemetry(agent, event);
+    let deadline = std::time::Instant::now() + ingest::INGEST_BUDGET;
+    ingest_telemetry(agent, event, deadline);
     if let Some(response) = crate::events::native_hook_response(agent, event) {
         stdoutln!("{response}");
     }
 }
 
-fn ingest_telemetry(agent: Agent, event: &str) {
+fn ingest_telemetry(agent: Agent, event: &str, deadline: std::time::Instant) {
     let Ok(state_root) = paths::state_root() else {
         return;
     };
     let Ok(store) = StatusStore::open(&state_root) else {
         return;
     };
+    let store = store.with_deadline(deadline);
 
     let input = match ingest::read_capped(&mut io::stdin(), 1_048_576) {
         Ok(input) => input,
@@ -118,7 +120,13 @@ fn ingest_telemetry(agent: Agent, event: &str) {
         agent,
         &input,
         cwd,
-        std::env::var("DEVIN_PROJECT_DIR").ok().as_deref(),
+        std::env::var(if agent == Agent::Cursor {
+            "CURSOR_PROJECT_DIR"
+        } else {
+            "DEVIN_PROJECT_DIR"
+        })
+        .ok()
+        .as_deref(),
     );
     let env = environment::gather_environment(&SystemEnv, cwd);
     let liveness = SystemProcessLookup::new();

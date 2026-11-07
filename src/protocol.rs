@@ -150,10 +150,11 @@ pub enum Agent {
     Copilot,
     Antigravity,
     Kilo,
+    Cursor,
 }
 
 impl Agent {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Claude,
         Self::Codex,
         Self::Opencode,
@@ -166,6 +167,7 @@ impl Agent {
         Self::Copilot,
         Self::Antigravity,
         Self::Kilo,
+        Self::Cursor,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -182,6 +184,7 @@ impl Agent {
             Self::Copilot => "copilot",
             Self::Antigravity => "antigravity",
             Self::Kilo => "kilo",
+            Self::Cursor => "cursor",
         }
     }
 }

@@ -9,6 +9,7 @@ pub(crate) enum SessionContext {
     Foreground,
     Background,
     Parallel,
+    StartedParallel,
     Selected,
     SelectedParallel,
 }
@@ -126,6 +127,7 @@ impl SessionContext {
     pub(crate) const fn in_shared_process(self) -> Self {
         match self {
             Self::Selected | Self::SelectedParallel => Self::SelectedParallel,
+            Self::StartedParallel => Self::StartedParallel,
             _ => Self::Parallel,
         }
     }
@@ -151,6 +153,13 @@ impl SessionContext {
             }),
             EventSource::Native => {
                 let hints = Hints::parse(input).map_err(invalid)?;
+                if agent == Agent::Cursor {
+                    return Ok(if event == "sessionStart" {
+                        Self::StartedParallel
+                    } else {
+                        Self::Parallel
+                    });
+                }
                 if agent == Agent::Goose && event == "SessionStart" {
                     return Ok(Self::Selected);
                 }

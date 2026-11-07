@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const MAX_HEALTH_PROBLEMS: usize = 50;
 // Expired diagnostics must not replay as current faults on every read.
@@ -206,6 +207,7 @@ pub(crate) struct StatusStore {
     bindings_dir: PathBuf,
     lock_path: PathBuf,
     health_path: PathBuf,
+    deadline: Option<Instant>,
 }
 
 impl StatusStore {
@@ -218,11 +220,24 @@ impl StatusStore {
             lock_path: root.join("status.lock"),
             health_path: root.join("health.json"),
             bindings_dir,
+            deadline: None,
         })
     }
 
+    pub(crate) const fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     fn lock(&self) -> io::Result<LockGuard> {
-        LockGuard::acquire(&self.lock_path)
+        self.deadline.map_or_else(
+            || LockGuard::acquire(&self.lock_path),
+            |deadline| LockGuard::acquire_until(&self.lock_path, deadline),
+        )
     }
 
     fn binding_path(&self, binding_id: &str) -> io::Result<PathBuf> {
@@ -358,7 +373,9 @@ impl StatusStore {
                 Phase::Permission
             } else if matches!(
                 signals.context,
-                SessionContext::Selected | SessionContext::SelectedParallel
+                SessionContext::Selected
+                    | SessionContext::SelectedParallel
+                    | SessionContext::StartedParallel
             ) && crate::agents::profile(event.agent).retains_phase_on_selection
                 && let Some(previous) = previous
             {
@@ -1173,7 +1190,10 @@ fn session_disposition(
         || !resume
             && (previous.is_some_and(|stored| stored.parallel)
                 || (previous.is_none() && matches!(context, SessionContext::Background))
-                || matches!(context, SessionContext::Parallel));
+                || matches!(
+                    context,
+                    SessionContext::Parallel | SessionContext::StartedParallel
+                ));
     SessionDisposition::Store(if parallel {
         StoreMode::Parallel
     } else {

@@ -4,6 +4,24 @@ Eleven agents are supported; Antigravity is a twelfth configuration profile with
 provisional lifecycle support. Configuration status reports owned artifact integrity,
 not host discovery, trust, authentication, or successful hook delivery.
 
+Cursor is the thirteenth configuration profile. Its implementation was checked against
+the installed CLI `2026.11.05-86047df` on 2026-11-07, including the bundle's hook loader,
+response validation and lifecycle call sites. Fixture coverage includes generated
+commands, neutral responses on handled failures, configuration preservation/drift,
+conversation identity, project-directory precedence, startup ordering, tool/stop
+transitions, resume, parallel conversations, child isolation and producer detection.
+Controlled Node owners also exercise the installed command through real process lookup,
+including compact options, persisted session identity and malformed-JSON diagnostics.
+Privacy regressions inspect both stored records and sink bodies. Held-lock fixtures cover
+ingestion, consumer lookup, convergence and health reporting under the shared deadline.
+An isolated generated-hook install/status/uninstall and native `--version` succeeded.
+The no-tools `--print` prompt exited 1 with `Authentication required`, before any
+native hooks arrived. Native startup/prompt/tool success and failure/stop/resume/exit,
+foreign-deny precedence, compaction and child-isolation checks remain blocked on
+authentication. Supply an already-injected `CURSOR_API_KEY` to the isolated smoke
+process to continue; do not copy credential stores. Native delivery remains a required
+validation gate; source inspection and payload fixtures do not close it.
+
 The five additions were checked on 2026-11-01 against these versions. Versions are
 evidence pins, not minimum-version promises.
 
@@ -17,10 +35,12 @@ evidence pins, not minimum-version promises.
 
 The Kilo turn used `openrouter/openai/gpt-4.1-mini`. Its default provider selection
 failed before that successful explicit-model run. The Antigravity loader observation
-does not establish lifecycle support. In a separate helper-only probe, a held status
-lock delayed neutral `Stop` output by 10.518 seconds, exceeding the registered
-five-second deadline; SIGTERM produced no neutral output. Host handling of these
-conditions is unverified. See [the Antigravity support gates](../hooks-and-adapters.md#antigravity-cli--provisional-support-blocked).
+does not establish lifecycle support. An earlier helper-only probe found that a held status
+lock delayed neutral `Stop` output by 10.518 seconds. Ingest now shares a 1.5-second
+deadline across lock waits and delivery; controlled Cursor and Antigravity CLI fixtures
+require their neutral responses before the five-second host deadline while the lock stays
+held. SIGTERM produced no neutral output in the earlier probe. Host handling of termination
+and timeouts remains unverified. See [the Antigravity support gates](../hooks-and-adapters.md#antigravity-cli--provisional-support-blocked).
 
 ## What fixtures establish
 
@@ -53,6 +73,6 @@ scripts or copying credential stores. A blocked check stays blocked until its st
 prerequisite exists; it does not justify changing the user's active configuration.
 
 Protocol remains 1. Older Rust SDKs have a closed `Agent` enum: upgrade before typed
-decoding of `devin`, `goose`, `copilot`, `kilo`, or `antigravity`, or skip unknown-agent
+decoding of `devin`, `goose`, `copilot`, `kilo`, `cursor`, or `antigravity`, or skip unknown-agent
 records before decoding. Exhaustive matches may need changes. See the
 [wire compatibility contract](../../README.md#protocol-1).

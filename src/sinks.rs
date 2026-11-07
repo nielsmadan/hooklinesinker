@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 const SINK_REQUEST_BUDGET: Duration = Duration::from_millis(600);
 
 pub(crate) trait HttpClient {
-    fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String>;
+    fn post_json(&self, url: &str, body: &[u8], timeout: Duration) -> Result<u16, String>;
 }
 
 impl<T: HttpClient + ?Sized> HttpClient for &T {
-    fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String> {
-        (**self).post_json(url, body)
+    fn post_json(&self, url: &str, body: &[u8], timeout: Duration) -> Result<u16, String> {
+        (**self).post_json(url, body, timeout)
     }
 }
 
@@ -63,11 +63,16 @@ impl<C: HttpClient> SinkFanout<C> {
             let Some(sink) = status_sink(consumer) else {
                 continue;
             };
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let timeout = deadline.map_or(SINK_REQUEST_BUDGET, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(SINK_REQUEST_BUDGET)
+            });
+            if timeout.is_zero() {
                 outcome.undelivered += consumers[index..].iter().filter_map(status_sink).count();
                 break;
             }
-            match self.client.post_json(sink, &body) {
+            match self.client.post_json(sink, &body, timeout) {
                 Ok(status) if (200..300).contains(&status) => {}
                 Ok(status) => outcome.problems.push(SinkProblem {
                     consumer: consumer.name.clone(),
@@ -120,11 +125,14 @@ impl Default for UreqHttpClient {
 }
 
 impl HttpClient for UreqHttpClient {
-    fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String> {
+    fn post_json(&self, url: &str, body: &[u8], timeout: Duration) -> Result<u16, String> {
         match self
             .agent
             .post(url)
             .header("Content-Type", "application/json")
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
             .send(body)
         {
             Ok(response) => Ok(response.status().as_u16()),
@@ -212,7 +220,12 @@ mod tests {
     }
 
     impl HttpClient for StubClient {
-        fn post_json(&self, url: &str, _body: &[u8]) -> Result<u16, String> {
+        fn post_json(
+            &self,
+            url: &str,
+            _body: &[u8],
+            _: std::time::Duration,
+        ) -> Result<u16, String> {
             self.calls.borrow_mut().push(url.to_string());
             self.response.clone()
         }
@@ -247,13 +260,41 @@ mod tests {
     }
 
     #[test]
+    fn a_request_uses_the_remaining_fanout_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let consumers = [
+            consumer("one", &["status"], Some(&url)),
+            consumer("two", &["status"], Some(&url)),
+        ];
+        let outcome = SinkFanout::new(UreqHttpClient::new()).send_until(
+            &event(),
+            &consumers,
+            Some(Instant::now() + Duration::from_millis(100)),
+        );
+        assert_eq!(outcome.problems.len(), 1);
+        assert_eq!(outcome.problems[0].consumer, "one");
+        assert!(
+            outcome.problems[0].message.contains("global"),
+            "{:?}",
+            outcome.problems
+        );
+        assert_eq!(outcome.undelivered, 1);
+    }
+
+    #[test]
     fn a_deadline_skips_remaining_sink_deliveries() {
         struct SlowClient {
             calls: RefCell<usize>,
         }
 
         impl HttpClient for SlowClient {
-            fn post_json(&self, _url: &str, _body: &[u8]) -> Result<u16, String> {
+            fn post_json(
+                &self,
+                _url: &str,
+                _body: &[u8],
+                _: std::time::Duration,
+            ) -> Result<u16, String> {
                 *self.calls.borrow_mut() += 1;
                 thread::sleep(Duration::from_millis(30));
                 Ok(200)

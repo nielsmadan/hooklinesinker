@@ -94,11 +94,23 @@ pub(crate) const ANTIGRAVITY: &[EventSpec] = &[
 
 pub(crate) fn native_hook_response(agent: Agent, event: &str) -> Option<&'static str> {
     match (agent, event) {
+        (Agent::Cursor, _) if CURSOR.iter().any(|spec| spec.name == event) => Some("{}"),
         (Agent::Antigravity, "Stop") => Some(r#"{"decision":"allow"}"#),
         (Agent::Antigravity, "SessionStart" | "PreInvocation" | "PostToolUse") => Some("{}"),
         _ => None,
     }
 }
+
+pub(crate) const CURSOR: &[EventSpec] = &[
+    event!("sessionStart", None, 5, Update(Phase::Idle)),
+    event!("beforeSubmitPrompt", None, 5, Update(Phase::Working)).role(TurnStart),
+    event!("preToolUse", None, 5, Update(Phase::Working)).role(ToolStart),
+    event!("postToolUse", None, 5, Update(Phase::Working)).role(ToolEnd),
+    event!("postToolUseFailure", None, 5, Update(Phase::Working)).role(ToolEnd),
+    event!("preCompact", None, 5, Update(Phase::Compacting)),
+    event!("stop", None, 5, Update(Phase::Idle)),
+    event!("sessionEnd", None, 5, Remove),
+];
 
 pub(crate) const COPILOT: &[EventSpec] = &[
     event!("SessionStart", None, 5, Update(Phase::Idle)),

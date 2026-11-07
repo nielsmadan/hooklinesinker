@@ -42,6 +42,7 @@ python3 scripts/smoke-agent.py goose /absolute/path/to/goose
 python3 scripts/smoke-agent.py copilot /absolute/path/to/copilot
 python3 scripts/smoke-agent.py antigravity /absolute/path/to/antigravity
 python3 scripts/smoke-agent.py kilo /absolute/path/to/kilo --model openrouter/openai/gpt-4.1-mini
+python3 scripts/smoke-agent.py cursor /absolute/path/to/cursor-agent
 ```
 
 Run only the host being investigated. Add `--prepare-only` to install/inspect its artifact
@@ -59,6 +60,18 @@ The driver executes these host commands after isolated HLS installation:
 | Copilot | `copilot --no-auto-update --disable-builtin-mcps --no-custom-instructions -p 'Reply with OK. Do not use tools.'` |
 | Antigravity | `antigravity --log-file <isolated-root>/cli.log --print-timeout 15s -p 'Reply with OK. Do not use tools.'` |
 | Kilo | `kilo run --format json --model <selected-model> 'Reply with OK. Do not use tools.'` |
+| Cursor | `cursor-agent --trust --print --output-format json 'Reply with OK. Do not use tools.'` |
+
+Cursor passes through only an already-injected `CURSOR_API_KEY` for authentication.
+`--trust` applies to the disposable project. Its user hooks are installed under the
+isolated HOME, because `CURSOR_CONFIG_DIR` does not redirect the hook loader.
+For broader validation, use the same isolated configuration to exercise a successful
+file read, a missing-file failure, a foreign `preToolUse` hook returning
+`{"permission":"deny"}`, resume with `--resume <conversation_id>`, and interactive
+`/compact` and exit. Capture normalized events while the process is alive to compare
+polling with the sink. A deny must remain denied alongside HLS's `{}` response.
+Check child callbacks separately; synthetic payload replay establishes HLS behavior,
+not that the host emits the expected payload or ordering.
 
 ## Evaluate and clean up
 

@@ -6,7 +6,12 @@ use super::{
 use crate::protocol::Agent;
 use std::{io, path::Path};
 
-fn owned_command<'a>(entry: &'a Value, binary: BinaryLocation<'_>, event: &str) -> Option<&'a str> {
+fn owned_command<'a>(
+    entry: &'a Value,
+    binary: BinaryLocation<'_>,
+    agent: Agent,
+    event: &str,
+) -> Option<&'a str> {
     if entry
         .get("type")
         .is_some_and(|kind| kind.as_str() != Some("command"))
@@ -18,28 +23,32 @@ fn owned_command<'a>(entry: &'a Value, binary: BinaryLocation<'_>, event: &str) 
         .and_then(Value::as_str)
         .filter(|command| {
             matches!(
-                classify_command(command, binary, Agent::Copilot, event),
+                classify_command(command, binary, agent, event),
                 GroupOwnership::Ours { .. }
             )
         })
 }
 
-fn unsupported(root: &Map<String, Value>, binary: BinaryLocation<'_>) -> Option<&'static str> {
+fn unsupported(
+    root: &Map<String, Value>,
+    binary: BinaryLocation<'_>,
+    agent: Agent,
+) -> Option<&'static str> {
     if root.get("version") != Some(&Value::from(1)) {
-        return Some("Copilot hook files require version 1");
+        return Some("Direct hook files require version 1");
     }
     let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
         return Some("the hooks key is not an object");
     };
     for (event, entries) in hooks {
         let Some(entries) = entries.as_array() else {
-            return Some("a Copilot event's value is not an array");
+            return Some("an event's value is not an array");
         };
         for entry in entries {
             if !entry.is_object() || entry.get("hooks").is_some() {
-                return Some("Copilot hooks require direct handler objects");
+                return Some("These hooks require direct handler objects");
             }
-            if owned_command(entry, binary, event).is_some()
+            if owned_command(entry, binary, agent, event).is_some()
                 && ["bash", "powershell", "exec", "args", "env", "cwd"]
                     .iter()
                     .any(|key| entry.get(key).is_some())
@@ -53,21 +62,35 @@ fn unsupported(root: &Map<String, Value>, binary: BinaryLocation<'_>) -> Option<
     None
 }
 
-fn handler(spec: &EventSpec, command: &str) -> Value {
-    serde_json::json!({"type": "command", "command": command, "timeoutSec": spec.timeout.as_secs()})
+fn handler(agent: Agent, spec: &EventSpec, command: &str) -> Value {
+    match agent {
+        Agent::Cursor => {
+            serde_json::json!({"type": "command", "command": command, "timeout": spec.timeout.as_secs(), "failClosed": false})
+        }
+        _ => {
+            serde_json::json!({"type": "command", "command": command, "timeoutSec": spec.timeout.as_secs()})
+        }
+    }
 }
 
-fn installed(entries: &[Value], spec: &EventSpec, binary: BinaryLocation<'_>) -> bool {
+fn installed(
+    entries: &[Value],
+    spec: &EventSpec,
+    binary: BinaryLocation<'_>,
+    agent: Agent,
+) -> bool {
     let owned: Vec<_> = entries
         .iter()
-        .filter_map(|entry| owned_command(entry, binary, spec.name).map(|command| (entry, command)))
+        .filter_map(|entry| {
+            owned_command(entry, binary, agent, spec.name).map(|command| (entry, command))
+        })
         .collect();
     match owned.as_slice() {
         [(entry, command)] => {
             matches!(
-                classify_command(command, binary, Agent::Copilot, spec.name),
+                classify_command(command, binary, agent, spec.name),
                 GroupOwnership::Ours { exact: true }
-            ) && **entry == handler(spec, command)
+            ) && **entry == handler(agent, spec, command)
         }
         _ => false,
     }
@@ -75,16 +98,17 @@ fn installed(entries: &[Value], spec: &EventSpec, binary: BinaryLocation<'_>) ->
 
 pub(super) fn status(
     binary: BinaryLocation<'_>,
+    agent: Agent,
     path: &Path,
     events: &[EventSpec],
 ) -> io::Result<HookStatus> {
     let Some(bytes) = read_optional_bytes(path)? else {
-        return Ok(empty_status(Agent::Copilot, HookState::Missing, path, None));
+        return Ok(empty_status(agent, HookState::Missing, path, None));
     };
     let root = parse_json_root(path, &bytes)?;
-    if let Some(reason) = unsupported(&root, binary) {
+    if let Some(reason) = unsupported(&root, binary, agent) {
         return Ok(empty_status(
-            Agent::Copilot,
+            agent,
             HookState::Unsupported,
             path,
             Some(reason),
@@ -99,7 +123,7 @@ pub(super) fn status(
     };
     let complete = events
         .iter()
-        .all(|spec| installed(items_for(spec), spec, binary));
+        .all(|spec| installed(items_for(spec), spec, binary, agent));
     let entries: Vec<_> = events
         .iter()
         .flat_map(|spec| {
@@ -107,7 +131,7 @@ pub(super) fn status(
                 .iter()
                 .enumerate()
                 .filter_map(move |(index, entry)| {
-                    owned_command(entry, binary, spec.name).map(|command| HookEntry {
+                    owned_command(entry, binary, agent, spec.name).map(|command| HookEntry {
                         event: spec.name.into(),
                         group_index: index,
                         command: command.into(),
@@ -116,7 +140,7 @@ pub(super) fn status(
         })
         .collect();
     Ok(HookStatus {
-        agent: Agent::Copilot,
+        agent,
         state: if complete {
             HookState::Installed
         } else if entries.is_empty() {
@@ -132,13 +156,14 @@ pub(super) fn status(
 
 pub(super) fn reconcile(
     binary: BinaryLocation<'_>,
+    agent: Agent,
     path: &Path,
     events: &[EventSpec],
     mode: ReconcileMode,
 ) -> io::Result<HookStatus> {
     let original = read_optional_bytes(path)?;
     if original.is_none() && matches!(mode, ReconcileMode::Uninstall) {
-        return Ok(empty_status(Agent::Copilot, HookState::Missing, path, None));
+        return Ok(empty_status(agent, HookState::Missing, path, None));
     }
     let mut root = original
         .as_deref()
@@ -150,9 +175,9 @@ pub(super) fn reconcile(
                 .unwrap()
                 .clone()
         });
-    if let Some(reason) = unsupported(&root, binary) {
+    if let Some(reason) = unsupported(&root, binary, agent) {
         return Ok(empty_status(
-            Agent::Copilot,
+            agent,
             HookState::Unsupported,
             path,
             Some(reason),
@@ -172,15 +197,16 @@ pub(super) fn reconcile(
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .expect("validated hook array");
-        if matches!(mode, ReconcileMode::Install) && installed(items, spec, binary) {
+        if matches!(mode, ReconcileMode::Install) && installed(items, spec, binary, agent) {
             continue;
         }
         let original_len = items.len();
-        items.retain(|entry| owned_command(entry, binary, spec.name).is_none());
+        items.retain(|entry| owned_command(entry, binary, agent, spec.name).is_none());
         if matches!(mode, ReconcileMode::Install) {
             items.push(handler(
+                agent,
                 spec,
-                &canonical_command(binary.path, Agent::Copilot, spec.name),
+                &canonical_command(binary.path, agent, spec.name),
             ));
         } else if original_len > 0 && items.is_empty() {
             hooks.remove(spec.name);
@@ -191,7 +217,7 @@ pub(super) fn reconcile(
         bytes.push(b'\n');
         write_agent_config(path, original.as_deref(), &bytes)?;
     }
-    status(binary, path, events)
+    status(binary, agent, path, events)
 }
 
 #[cfg(test)]
@@ -199,6 +225,103 @@ mod tests {
     use super::*;
     use crate::hooks::tests::{config_path, manager};
     use std::fs;
+
+    #[test]
+    fn cursor_hooks_preserve_foreign_policy_and_repair_owned_drift() {
+        let (manager, root) = manager();
+        let path = config_path(&manager, Agent::Cursor);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::json!({"version":1,"custom":true,"hooks":{
+            "preToolUse":[{"type":"command","command":"policy-check","matcher":"Shell","failClosed":true}],
+            "subagentStop":[{"type":"command","command":"child-monitor"}]}});
+        fs::write(&path, original.to_string()).unwrap();
+        assert_eq!(
+            manager.install(Agent::Cursor).unwrap().state,
+            HookState::Installed
+        );
+        let bytes = fs::read(&path).unwrap();
+        manager.install(Agent::Cursor).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let installed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            installed["hooks"]["preToolUse"][0],
+            original["hooks"]["preToolUse"][0]
+        );
+        let ours = &installed["hooks"]["preToolUse"][1];
+        assert_eq!(ours["timeout"], 5);
+        assert_eq!(ours["failClosed"], false);
+        for (field, value) in [
+            ("failClosed", Value::from(true)),
+            ("timeout", Value::from(100)),
+            ("matcher", Value::from("Shell")),
+            (
+                "command",
+                Value::from("/old/hooklinesinker ingest --agent cursor --event preToolUse"),
+            ),
+        ] {
+            let mut changed = installed.clone();
+            changed["hooks"]["preToolUse"][1][field] = value;
+            fs::write(&path, changed.to_string()).unwrap();
+            assert_eq!(
+                manager.status(Agent::Cursor).unwrap().state,
+                HookState::Drifted
+            );
+            assert_eq!(
+                manager.install(Agent::Cursor).unwrap().state,
+                HookState::Installed
+            );
+        }
+        let mut duplicate = installed.clone();
+        duplicate["hooks"]["preToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(ours.clone());
+        fs::write(&path, duplicate.to_string()).unwrap();
+        assert_eq!(
+            manager.status(Agent::Cursor).unwrap().state,
+            HookState::Drifted
+        );
+        manager.install(Agent::Cursor).unwrap();
+        manager.uninstall(Agent::Cursor).unwrap();
+        let remaining: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(remaining, original);
+        let bytes = fs::read(&path).unwrap();
+        manager.uninstall(Agent::Cursor).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_cursor_configs_are_left_untouched() {
+        let (manager, root) = manager();
+        let path = config_path(&manager, Agent::Cursor);
+        manager.install(Agent::Cursor).unwrap();
+        let mut override_config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        override_config["hooks"]["stop"][0]["cwd"] = "/elsewhere".into();
+        for value in [
+            override_config,
+            serde_json::json!({"version":2,"hooks":{}}),
+            serde_json::json!({"version":1,"hooks":{"stop":[{"hooks":[]}]}}),
+            serde_json::json!({"version":1,"hooks":{"stop":{}}}),
+        ] {
+            let bytes = value.to_string();
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                manager.status(Agent::Cursor).unwrap().state,
+                HookState::Unsupported
+            );
+            assert_eq!(
+                manager.install(Agent::Cursor).unwrap().state,
+                HookState::Unsupported
+            );
+            assert_eq!(
+                manager.uninstall(Agent::Cursor).unwrap().state,
+                HookState::Unsupported
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn direct_hooks_preserve_foreign_entries_and_reconcile_duplicates() {

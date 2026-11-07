@@ -44,6 +44,7 @@ waiting.
 | Kimi Code CLI | `PermissionRequest` | `PermissionResult` |
 | Devin CLI | `PermissionRequest` (permission decision, possibly resolved by policy) | No documented resolution; hooklinesinker conservatively waits for root prompt/start/stop |
 | Copilot CLI | lowercase `notification`: `permission_prompt` or `elicitation_dialog` | Root prompt/start/stop; tool completion alone does not resolve a wait |
+| Cursor CLI | No dedicated user-wait signal used by HLS; `preToolUse` alone stays working | Tool completion or a later root event supplies the next state |
 | OpenCode | `permission.asked` | A later authoritative session status, normally `session.status.busy` |
 | Pi | `permission_prompt`, synthesized from the optional permission extension | `permission_resolved`, synthesized after its pending prompts resolve |
 

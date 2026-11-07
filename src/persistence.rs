@@ -84,6 +84,10 @@ pub(crate) struct LockGuard {
 
 impl LockGuard {
     pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
+        Self::acquire_until(path, Instant::now() + LOCK_TIMEOUT)
+    }
+
+    pub(crate) fn acquire_until(path: &Path, deadline: Instant) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true);
         #[cfg(unix)]
@@ -92,22 +96,18 @@ impl LockGuard {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        let deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for {}", path.display()),
+                ));
+            }
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self { file }),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "timed out after {}ms waiting for {}",
-                            LOCK_TIMEOUT.as_millis(),
-                            path.display()
-                        ),
-                    ));
+                    thread::sleep(Duration::from_millis(10).min(remaining));
                 }
                 Err(e) => return Err(e),
             }

@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub(crate) const SUPPORTED_PROTOCOL_MAJOR: u16 = crate::protocol::PROTOCOL_VERSION;
 
@@ -99,6 +100,11 @@ impl ConsumerStore {
 
     pub(crate) fn snapshot(&self) -> io::Result<ConsumerSnapshot> {
         let _guard = self.lock()?;
+        self.read_all_locked()
+    }
+
+    pub(crate) fn snapshot_until(&self, deadline: Instant) -> io::Result<ConsumerSnapshot> {
+        let _guard = LockGuard::acquire_until(&self.lock_path, deadline)?;
         self.read_all_locked()
     }
 

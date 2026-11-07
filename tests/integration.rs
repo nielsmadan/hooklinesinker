@@ -97,7 +97,7 @@ impl RecordingHttpClient {
 }
 
 impl HttpClient for RecordingHttpClient {
-    fn post_json(&self, url: &str, body: &[u8]) -> Result<u16, String> {
+    fn post_json(&self, url: &str, body: &[u8], _: std::time::Duration) -> Result<u16, String> {
         self.calls
             .lock()
             .unwrap()
@@ -109,7 +109,7 @@ impl HttpClient for RecordingHttpClient {
 struct FailingHttpClient;
 
 impl HttpClient for FailingHttpClient {
-    fn post_json(&self, _url: &str, _body: &[u8]) -> Result<u16, String> {
+    fn post_json(&self, _url: &str, _body: &[u8], _: std::time::Duration) -> Result<u16, String> {
         Err("connection refused".to_string())
     }
 }
@@ -3541,7 +3541,12 @@ fn a_slow_sink_cannot_stretch_a_sweep_backlog_past_the_fanout_budget() {
     }
 
     impl HttpClient for SlowHttpClient {
-        fn post_json(&self, _url: &str, _body: &[u8]) -> Result<u16, String> {
+        fn post_json(
+            &self,
+            _url: &str,
+            _body: &[u8],
+            _: std::time::Duration,
+        ) -> Result<u16, String> {
             *self.calls.lock().unwrap() += 1;
             std::thread::sleep(std::time::Duration::from_millis(150));
             Ok(200)

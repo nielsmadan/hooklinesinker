@@ -1681,3 +1681,190 @@ fn antigravity_controlled_exits_return_neutral_json() {
     assert_eq!(output.stdout, b"{\"decision\":\"allow\"}\n");
     std::fs::remove_dir_all(temp).unwrap();
 }
+
+#[test]
+fn cursor_generated_commands_and_handled_failures_return_neutral_json() {
+    let temp = unique_temp_dir("cursor quoted ' path");
+    install_isolated(&temp);
+    hooklinesinker_isolated(&temp)
+        .args(["hooks", "install", "--agent", "cursor"])
+        .assert()
+        .success();
+    let path = temp.join("home/.cursor/hooks.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let hooks = config["hooks"].as_object().unwrap();
+    assert_eq!(hooks.len(), 8);
+    for handlers in hooks.values() {
+        let command = handlers[0]["command"].as_str().unwrap();
+        let output = Command::new("sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", temp.join("home"))
+            .env("XDG_STATE_HOME", &temp)
+            .env("XDG_DATA_HOME", temp.join("data"))
+            .args(["-c", command])
+            .write_stdin(r#"{"conversation_id":"chat"}"#)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}\n");
+    }
+    for invalid in [b"invalid-json".to_vec(), vec![0xff], vec![b'x'; 1_048_577]] {
+        hooklinesinker_isolated(&temp)
+            .args(["ingest", "--agent", "cursor", "--event", "preToolUse"])
+            .write_stdin(invalid)
+            .assert()
+            .success()
+            .stdout("{}\n");
+    }
+    let blocked = temp.join("state-file");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    for state in [blocked.as_os_str(), std::ffi::OsStr::new("relative")] {
+        hooklinesinker_isolated(&temp)
+            .env("XDG_STATE_HOME", state)
+            .args(["ingest", "--agent", "cursor", "--event", "preToolUse"])
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .stdout("{}\n");
+    }
+    hooklinesinker_isolated(&temp)
+        .args(["hooks", "uninstall", "--agent", "cursor"])
+        .assert()
+        .success();
+    let remaining: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(remaining, serde_json::json!({"version":1,"hooks":{}}));
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+fn cursor_owner_output(temp: &std::path::Path, script_body: &str) -> Value {
+    let script = temp.join("cursor-agent/versions/test/index.js");
+    std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(temp.join("home")).unwrap();
+    std::fs::create_dir_all(temp.join("project")).unwrap();
+    std::fs::write(&script, script_body).unwrap();
+    let output = Command::new("node")
+        .arg(&script)
+        .arg("-pf")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", temp.join("home"))
+        .env("XDG_STATE_HOME", temp)
+        .env("XDG_DATA_HOME", temp.join("data"))
+        .env("CURSOR_PROJECT_DIR", temp.join("project"))
+        .current_dir(temp.join("home"))
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn cursor_generated_command_records_the_live_owner_and_reports_malformed_json() {
+    let temp = unique_temp_dir("cursor owner ' path");
+    install_isolated(&temp);
+    hooklinesinker_isolated(&temp)
+        .args(["hooks", "install", "--agent", "cursor"])
+        .assert()
+        .success();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(temp.join("home/.cursor/hooks.json")).unwrap())
+            .unwrap();
+    let command = &config["hooks"]["beforeSubmitPrompt"][0]["command"];
+    let project = temp.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let binary = serde_json::json!(env!("CARGO_BIN_EXE_hooklinesinker"));
+    let result = cursor_owner_output(
+        &temp,
+        &format!(
+            r#"
+const {{ spawnSync }} = require("node:child_process");
+const invoke = (input) => spawnSync("sh", ["-c", {command}], {{input, encoding:"utf8", timeout:4000}});
+const valid = invoke(JSON.stringify({{conversation_id:"chat",workspace_roots:["/workspace"]}}));
+const malformed = invoke("invalid-json");
+const poll = spawnSync({binary}, ["sessions", "--json"], {{encoding:"utf8", timeout:4000}});
+console.log(JSON.stringify({{pid:process.pid, valid, malformed, sessions:JSON.parse(poll.stdout)}}));
+"#
+        ),
+    );
+    assert_eq!(result["valid"]["status"], 0);
+    assert_eq!(result["valid"]["stdout"], "{}\n");
+    assert_eq!(result["malformed"]["status"], 0);
+    assert_eq!(result["malformed"]["stdout"], "{}\n");
+    let sessions = result["sessions"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{result}");
+    assert_eq!(sessions[0]["agent"], "cursor");
+    assert_eq!(sessions[0]["phase"], "working");
+    assert_eq!(sessions[0]["process"]["pid"], result["pid"]);
+    assert_eq!(sessions[0]["session"]["id"], "chat");
+    assert_eq!(sessions[0]["session"]["cwd"], project.to_str().unwrap());
+    assert!(
+        result["malformed"]["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("invalid native event JSON")
+    );
+    assert!(
+        result["sessions"]["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid native event JSON"))
+    );
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn cursor_held_status_lock_keeps_valid_and_invalid_input_responses_within_the_host_timeout() {
+    use fs2::FileExt;
+
+    let temp = unique_temp_dir("cursor-lock-deadline");
+    install_isolated(&temp);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(temp.join("hooklinesinker/status.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let binary = serde_json::json!(env!("CARGO_BIN_EXE_hooklinesinker"));
+    let result = cursor_owner_output(
+        &temp,
+        &format!(
+            r#"
+const {{ spawnSync }} = require("node:child_process");
+const started = Date.now();
+const result = spawnSync({binary}, ["ingest", "--agent", "cursor", "--event", "beforeSubmitPrompt"], {{
+    input:JSON.stringify({{conversation_id:"chat"}}), encoding:"utf8", timeout:4000
+}});
+console.log(JSON.stringify({{...result, elapsed:Date.now()-started}}));
+"#
+        ),
+    );
+    assert_eq!(result["status"], 0, "{result}");
+    assert_eq!(result["stdout"], "{}\n");
+    assert!(result["stderr"].as_str().unwrap().contains("status.lock"));
+    assert!(result["elapsed"].as_u64().unwrap() < 4000, "{result}");
+    for (agent, event, response) in [
+        ("cursor", "preToolUse", "{}\n"),
+        ("antigravity", "Stop", "{\"decision\":\"allow\"}\n"),
+    ] {
+        hooklinesinker_isolated(&temp)
+            .args(["ingest", "--agent", agent, "--event", event])
+            .timeout(std::time::Duration::from_secs(4))
+            .write_stdin(vec![0xff])
+            .assert()
+            .success()
+            .stdout(response);
+    }
+    drop(lock);
+    std::fs::remove_dir_all(temp).unwrap();
+}

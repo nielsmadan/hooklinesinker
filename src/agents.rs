@@ -1,5 +1,5 @@
 use crate::events::{
-    ANTIGRAVITY, CLAUDE, CODEX, COPILOT, DEVIN, DROID, EventSpec, GOOSE, KIMI, QWEN,
+    ANTIGRAVITY, CLAUDE, CODEX, COPILOT, CURSOR, DEVIN, DROID, EventSpec, GOOSE, KIMI, QWEN,
 };
 use crate::protocol::Agent;
 use std::time::Duration;
@@ -25,6 +25,7 @@ pub(crate) enum HookTarget {
     GooseJson,
     CopilotJson,
     AntigravityJson,
+    CursorJson,
 }
 
 impl HookTarget {
@@ -48,6 +49,7 @@ impl HookTarget {
             | Self::DevinJson
             | Self::GooseJson
             | Self::CopilotJson
+            | Self::CursorJson
             | Self::AntigravityJson => true,
             Self::OpenCodeTypeScript
             | Self::KiloTypeScript
@@ -127,7 +129,21 @@ pub(crate) struct AgentProfile {
 
 // An agent whose phase depends on a payload field rather than the event name also needs an
 // arm in events::native_event_lookup; nothing here forces that edit.
-pub(crate) const PROFILES: [AgentProfile; 12] = [
+pub(crate) const PROFILES: [AgentProfile; 13] = [
+    AgentProfile {
+        agent: Agent::Cursor,
+        event_source: EventSource::Native,
+        hook_target: HookTarget::CursorJson,
+        status_events: CURSOR,
+        executable_names: &["agent", "cursor-agent"],
+        shared_host_markers: &[],
+        fork_starts_parallel: false,
+        retains_phase_on_selection: true,
+        attributed_sessions_share_process: false,
+        ambiguous_sessions_share_process: true,
+        child_tracking: ChildTracking::Untracked,
+        subagent_source: SubagentSource::Unreported,
+    },
     AgentProfile {
         agent: Agent::Claude,
         event_source: EventSource::Native,

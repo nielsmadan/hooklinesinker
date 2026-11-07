@@ -16,6 +16,297 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn cursor_private_payloads_stay_out_of_persisted_records_and_sink_bodies() {
+    let mut f = Fixture::new();
+    f.owner.nearest = Some(Agent::Cursor);
+    let payload = json!({
+        "conversation_id": "chat",
+        "tool_name": "Shell",
+        "model_id": "test-model",
+        "prompt": "private-prompt-sentinel",
+        "tool_input": {"command": "private-argument-sentinel"},
+        "tool_output": "private-result-sentinel",
+        "user_email": "private-email-sentinel",
+        "model_parameters": {"token": "private-parameter-sentinel"},
+        "error": "private-error-sentinel"
+    });
+    for event in [
+        "sessionStart",
+        "beforeSubmitPrompt",
+        "preToolUse",
+        "postToolUse",
+        "postToolUseFailure",
+        "preCompact",
+        "stop",
+        "sessionEnd",
+    ] {
+        f.send(Agent::Cursor, event, &payload);
+        let record = f.record("chat");
+        let bodies = f.bodies();
+        let body = bodies.last().unwrap();
+        assert_eq!(record["session"]["id"], "chat");
+        assert_eq!(body["event"], event);
+        assert_eq!(body["session"]["model"], "test-model");
+        for output in [&record, body] {
+            let encoded = output.to_string();
+            for sentinel in [
+                "private-prompt-sentinel",
+                "private-argument-sentinel",
+                "private-result-sentinel",
+                "private-email-sentinel",
+                "private-parameter-sentinel",
+                "private-error-sentinel",
+            ] {
+                assert!(
+                    !encoded.contains(sentinel),
+                    "{event} leaked {sentinel}: {encoded}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cursor_turns_tools_compaction_stop_and_removal_reach_store_and_sink() {
+    let mut f = Fixture::new();
+    f.owner.nearest = Some(Agent::Cursor);
+    let payload = json!({"conversation_id":"chat", "generation_id":"turn-1", "model":"auto", "model_id":"test-model"});
+    for (event, phase) in [
+        ("sessionStart", "idle"),
+        ("beforeSubmitPrompt", "working"),
+        ("preToolUse", "working"),
+        ("postToolUse", "working"),
+        ("preCompact", "compacting"),
+        ("postToolUseFailure", "working"),
+        ("stop", "idle"),
+    ] {
+        let mut input = payload.clone();
+        input["tool_name"] = "Shell".into();
+        f.send(Agent::Cursor, event, &input);
+        let record = f.record("chat");
+        assert_eq!(record["phase"], phase, "{event}");
+        assert_eq!(f.bodies().last().unwrap()["phase"], phase, "{event}");
+        assert_eq!(record["session"]["model"], "test-model");
+        assert_eq!(
+            record["activity"]["tool"],
+            if event == "preToolUse" {
+                json!("Shell")
+            } else {
+                Value::Null
+            }
+        );
+    }
+    assert_eq!(f.record("chat")["activity"]["turns"], 1);
+    f.send(
+        Agent::Cursor,
+        "beforeSubmitPrompt",
+        &json!({"conversation_id":"chat","generation_id":"turn-2"}),
+    );
+    assert_eq!(f.record("chat")["activity"]["turns"], 2);
+    for (status, problem) in [("aborted", "interrupted"), ("error", "error")] {
+        f.send(
+            Agent::Cursor,
+            "stop",
+            &json!({"conversation_id":"chat","status":status,"error":"private failure text"}),
+        );
+        assert_eq!(f.record("chat")["activity"]["problem"], problem);
+        f.send(Agent::Cursor, "beforeSubmitPrompt", &payload);
+        assert_eq!(f.record("chat")["phase"], "working");
+        assert_eq!(f.record("chat")["activity"]["problem"], Value::Null);
+    }
+    f.send(Agent::Cursor, "sessionEnd", &payload);
+    assert_eq!(f.ids(), Vec::<String>::new());
+    assert_eq!(f.bodies().last().unwrap()["running"], false);
+    let count = f.bodies().len();
+    for late in ["sessionStart", "postToolUse", "stop"] {
+        f.send(Agent::Cursor, late, &payload);
+    }
+    assert_eq!(f.ids(), Vec::<String>::new());
+    assert_eq!(f.bodies().len(), count);
+}
+
+#[test]
+fn cursor_late_start_and_child_callbacks_preserve_live_root_work() {
+    let mut f = Fixture::new();
+    f.owner.nearest = Some(Agent::Cursor);
+    let payload = json!({"conversation_id":"chat", "tool_name":"Task"});
+    f.send(Agent::Cursor, "beforeSubmitPrompt", &payload);
+    f.send(Agent::Cursor, "preToolUse", &payload);
+    f.send(Agent::Cursor, "sessionStart", &payload);
+    assert_eq!(f.record("chat")["phase"], "working");
+    assert_eq!(f.record("chat")["activity"]["tool"], "Task");
+    assert_eq!(f.record("chat")["activity"]["turns"], 1);
+    let before = f.bodies();
+    for event in ["preToolUse", "postToolUse", "postToolUseFailure"] {
+        f.send(
+            Agent::Cursor,
+            event,
+            &json!({"conversation_id":"chat","parent_tool_call_id":"task-1","tool_name":"Shell"}),
+        );
+    }
+    assert_eq!(f.bodies(), before);
+    assert_eq!(f.record("chat")["activity"]["tool"], "Task");
+    assert_eq!(f.record("chat")["activity"]["subagents"], 0);
+}
+
+#[test]
+fn cursor_parallel_conversations_end_independently_and_resume_with_new_binding() {
+    let mut f = Fixture::new();
+    f.owner.nearest = Some(Agent::Cursor);
+    for id in ["chat-a", "chat-b"] {
+        f.send(
+            Agent::Cursor,
+            "beforeSubmitPrompt",
+            &json!({"conversation_id":id}),
+        );
+    }
+    assert_eq!(f.ids(), vec!["chat-a", "chat-b"]);
+    let old_binding = f.record("chat-a")["bindingId"].clone();
+    f.send(
+        Agent::Cursor,
+        "sessionEnd",
+        &json!({"conversation_id":"chat-a"}),
+    );
+    assert_eq!(f.ids(), vec!["chat-b"]);
+    f.owner.identity.pid = 43;
+    f.send(
+        Agent::Cursor,
+        "beforeSubmitPrompt",
+        &json!({"conversation_id":"chat-a"}),
+    );
+    assert_eq!(f.ids(), vec!["chat-a", "chat-b"]);
+    assert_ne!(f.record("chat-a")["bindingId"], old_binding);
+    assert_eq!(f.record("chat-a")["phase"], "working");
+}
+
+#[test]
+fn cursor_requires_cli_provenance_and_suppresses_only_inherited_claude_hooks() {
+    let mut f = Fixture::new();
+    let payload = json!({"conversation_id":"chat","session_id":"chat"});
+    f.send(Agent::Cursor, "sessionStart", &payload);
+    assert_eq!(f.ids(), Vec::<String>::new());
+    assert_eq!(f.bodies(), Vec::<Value>::new());
+    f.owner.nearest = Some(Agent::Cursor);
+    f.send(Agent::Claude, "SessionStart", &payload);
+    f.send(Agent::Claude, "PreToolUse", &payload);
+    f.send(Agent::Cursor, "beforeSubmitPrompt", &payload);
+    assert_eq!(f.bodies().len(), 1);
+    assert_eq!(f.bodies()[0]["agent"], "cursor");
+    f.owner.nearest = Some(Agent::Claude);
+    f.send(
+        Agent::Claude,
+        "SessionStart",
+        &json!({"session_id":"nested-claude"}),
+    );
+    assert_eq!(f.bodies()[1]["agent"], "claude");
+    assert_eq!(f.ids(), vec!["chat", "nested-claude"]);
+}
+
+#[test]
+fn cursor_async_start_delivery_converges_after_a_concurrent_prompt_or_end() {
+    for (newer, phase, running) in [
+        ("beforeSubmitPrompt", "working", true),
+        ("sessionEnd", "idle", false),
+    ] {
+        let mut f = Fixture::new();
+        f.owner.nearest = Some(Agent::Cursor);
+        let payload = json!({"conversation_id":"chat"});
+        f.send(Agent::Cursor, "sessionStart", &payload);
+        let (path, _) = f.records().into_iter().next().unwrap();
+        *f.sink.1.lock().unwrap() = Some(Box::new(move || {
+            let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record["event"] = json!(newer);
+            record["phase"] = json!(phase);
+            record["ownPhase"] = json!(phase);
+            record["running"] = json!(running);
+            record["retired"] = json!(!running);
+            record["activity"]["turns"] = json!(1);
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        }));
+        f.send(Agent::Cursor, "sessionStart", &payload);
+        let bodies = f.bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[1]["event"], "sessionStart");
+        assert_eq!(bodies[1]["phase"], "idle");
+        assert_eq!(bodies[2]["event"], format!("resend:{newer}"));
+        assert_eq!(bodies[2]["phase"], phase);
+        assert_eq!(bodies[2]["running"], running);
+        assert_eq!(bodies[2]["activity"]["turns"], 1);
+        assert_eq!(bodies[2]["bindingId"], bodies[1]["bindingId"]);
+    }
+}
+
+#[test]
+fn cursor_ingest_lock_waits_share_the_deadline_including_error_reporting() {
+    use hooklinesinker::persistence::LockGuard;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    for (lock, after_delivery, expected_deliveries, expected_records) in [
+        ("status.lock", false, 0, 0),
+        ("consumers.lock", false, 0, 1),
+        ("status.lock", true, 1, 1),
+        ("consumers.lock", true, 1, 1),
+    ] {
+        let mut f = Fixture::new();
+        f.owner.nearest = Some(Agent::Cursor);
+        let held = Arc::new(Mutex::new(None));
+        let path = f.root.join(lock);
+        if after_delivery {
+            let held = Arc::clone(&held);
+            let records = f.root.join("status");
+            *f.sink.1.lock().unwrap() = Some(Box::new(move || {
+                let record_path = std::fs::read_dir(records)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let mut record: Value =
+                    serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+                record["phase"] = json!("idle");
+                record["ownPhase"] = json!("idle");
+                std::fs::write(record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+                *held.lock().unwrap() = Some(LockGuard::acquire(&path).unwrap());
+            }));
+        } else {
+            *held.lock().unwrap() = Some(LockGuard::acquire(&path).unwrap());
+        }
+        let started = Instant::now();
+        let store = StatusStore::open(&f.root)
+            .unwrap()
+            .with_deadline(started + Duration::from_millis(250));
+        let outcome = handle_ingest(
+            &IngestContext {
+                store: &store,
+                consumers: Some(&f.consumers),
+                liveness: &f.owner,
+                http_client: &f.sink,
+            },
+            Agent::Cursor,
+            "beforeSubmitPrompt",
+            r#"{"conversation_id":"chat"}"#,
+            &HookEnvironment::default(),
+            100,
+        );
+        let elapsed = started.elapsed();
+        held.lock().unwrap().take();
+        let problem = outcome.problem.unwrap();
+        assert!(problem.contains(lock), "{problem}");
+        assert!(
+            problem.contains("failed to record health problems"),
+            "{problem}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "{lock} after_delivery={after_delivery}: {elapsed:?}"
+        );
+        assert_eq!(f.bodies().len(), expected_deliveries);
+        assert_eq!(f.records().len(), expected_records);
+    }
+}
+
 struct Owner {
     identity: ProcessIdentity,
     shared: bool,
@@ -48,7 +339,7 @@ type AfterPost = Box<dyn FnOnce() + Send>;
 struct Sink(Mutex<Vec<Value>>, Mutex<Option<AfterPost>>);
 
 impl HttpClient for Sink {
-    fn post_json(&self, _: &str, body: &[u8]) -> Result<u16, String> {
+    fn post_json(&self, _: &str, body: &[u8], _: std::time::Duration) -> Result<u16, String> {
         self.0
             .lock()
             .unwrap()
@@ -256,6 +547,7 @@ impl Drop for Fixture {
 const fn events(agent: Agent) -> (&'static str, &'static str, &'static str) {
     match agent {
         Agent::Antigravity => ("SessionStart", "PreInvocation", ""),
+        Agent::Cursor => ("sessionStart", "preToolUse", "sessionEnd"),
         Agent::Pi => ("session_start", "agent_start", "session_shutdown"),
         Agent::Opencode | Agent::Kilo => (
             "tui.session.select",
@@ -271,6 +563,7 @@ fn start(agent: Agent, id: &str, source: &str) -> Value {
         Agent::Antigravity => {
             json!({"conversationId": id, "transcriptPath": format!("/home/test/.gemini/antigravity-cli/brain/{id}/.system_generated/logs/transcript.jsonl")})
         }
+        Agent::Cursor => json!({"conversation_id": id}),
         Agent::Pi => json!({"session_id": id, "reason": source}),
         Agent::Opencode | Agent::Kilo => json!({"session_id": id}),
         _ => json!({"session_id": id, "source": source}),
@@ -289,6 +582,7 @@ fn exclusive_agents_replace_foreground_sessions_and_can_resume_them() {
                 | Agent::Copilot
                 | Agent::Goose
                 | Agent::Antigravity
+                | Agent::Cursor
         )
     }) {
         let mut fixture = Fixture::new();
@@ -330,14 +624,15 @@ fn agents_with_session_end_ignore_later_activity() {
         .into_iter()
         .filter(|agent| !events(*agent).2.is_empty())
     {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
+        fixture.owner.nearest = Some(agent);
         let (begin, activity, end) = events(agent);
         fixture.send(agent, begin, &start(agent, "a", "startup"));
-        fixture.send(agent, end, &json!({"session_id": "a"}));
+        fixture.send(agent, end, &start(agent, "a", ""));
         let before = fixture.bodies();
         assert_eq!(before.len(), 2);
         assert_eq!(before[1]["running"], false);
-        fixture.send(agent, activity, &json!({"session_id": "a"}));
+        fixture.send(agent, activity, &start(agent, "a", ""));
         assert_eq!(fixture.bodies(), before, "{agent:?}");
         assert_eq!(fixture.ids(), Vec::<String>::new());
     }
@@ -354,6 +649,7 @@ fn foreground_activity_replaces_legacy_records_when_start_was_missed() {
                 | Agent::Devin
                 | Agent::Copilot
                 | Agent::Antigravity
+                | Agent::Cursor
         )
     }) {
         let fixture = Fixture::new();
@@ -369,12 +665,12 @@ fn foreground_activity_replaces_legacy_records_when_start_was_missed() {
 fn agents_with_the_same_process_and_session_ids_stay_independent() {
     let mut fixture = Fixture::new();
     for agent in Agent::ALL {
-        fixture.owner.nearest = (agent == Agent::Antigravity).then_some(agent);
+        fixture.owner.nearest = Some(agent);
         fixture.send(agent, events(agent).0, &start(agent, "a", "startup"));
     }
     let mut expected_count = Agent::ALL.len();
     for agent in Agent::ALL {
-        fixture.owner.nearest = (agent == Agent::Antigravity).then_some(agent);
+        fixture.owner.nearest = Some(agent);
         fixture.send(agent, events(agent).0, &start(agent, "b", "new"));
         let sessions = fixture.store.running(&fixture.owner).unwrap();
         let expected = if matches!(
@@ -385,6 +681,7 @@ fn agents_with_the_same_process_and_session_ids_stay_independent() {
                 | Agent::Devin
                 | Agent::Copilot
                 | Agent::Antigravity
+                | Agent::Cursor
         ) {
             expected_count += 1;
             vec!["a", "b"]

@@ -75,6 +75,7 @@ ledger transaction in `state.rs`:
 | Droid | Ordinary activity; `SessionStart source: resume` reactivates | A child `SessionStart` naming its parent's (or grandparent's) `calling_session_id` attaches to that root instead of starting its own session; distinct owner processes stay independent; ambiguous same-process sessions are retained conservatively |
 | Qwen | Ordinary activity, including `source: branch`; `source: resume` reactivates | ACP/serve modes and attributed `source_type`/`source_id` sessions stay independent |
 | Devin | Root prompt/start/stop boundaries update its own phase | Same-process conversations remain independent; `SessionEnd` removes only the named session |
+| Cursor | Asynchronous `sessionStart` preserves a live phase; it cannot reactivate an ended binding | Conversations remain independent; `conversation_id` is stable across generations; resume in a new process gets a new binding; `sessionEnd` removes only the named binding |
 | Kimi | Ordinary activity; `SessionStart source: resume` reactivates | ACP, web and wire launch modes stay independent |
 | Pi | UI session activity, including new/fork; `session_start reason: resume` reactivates | Adapter suppresses contexts with `hasUI: false` |
 | OpenCode / Kilo | `tui.session.select` selects/reactivates an independent binding | Selection and activity never retire another conversation |
@@ -367,13 +368,17 @@ reconciliation, normalization, and lifecycle operations remain internal.
 consumers with the `status` capability and a sink. Delivery is best effort and
 never retried. Registration accepts plain HTTP only for loopback hosts; remote
 sinks require HTTPS. Ureq configures separate 200 ms connection, response-receive, and
-body-receive timeouts; these are not a 200 ms total ingest deadline. A failed sink
+body-receive timeouts, plus a request-wide limit of at most 600 ms, capped by the
+remaining delivery budget. A failed sink
 does not undo ledger updates or stop delivery attempts while budget remains.
 
 Live and swept events share a one-second fan-out budget, with the live event attempted
-first. Delivery attempts that do not fit are skipped and recorded as a health problem
-rather than stalling the editor inside the host's hook timeout. The OpenCode and Pi
-adapters also retain at most 32 pending ingest calls.
+first. Ingest also has a 1.5-second cooperative deadline from dispatch: storage lock
+waits, consumer lookup, delivery, convergence and health recording all use its remaining
+time. Error reporting cannot restart a wait after the budget expires. Skipped deliveries
+are reported as health problems when the remaining time permits persistence.
+Stalled stdin or filesystem operations still rely on
+the host's outer timeout. The OpenCode and Pi adapters retain at most 32 pending ingest calls.
 
 ## Privacy and failures
 

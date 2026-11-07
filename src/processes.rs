@@ -432,7 +432,166 @@ fn antigravity_subcommand(cmd: &[std::ffi::OsString]) -> Option<&str> {
     None
 }
 
+fn cursor_option(text: &str) -> (&str, bool) {
+    if let Some(short) = text
+        .strip_prefix('-')
+        .filter(|short| !short.starts_with('-'))
+    {
+        for (index, flag) in short.char_indices() {
+            let name = match flag {
+                'p' => "--print",
+                'f' => "--force",
+                'k' => "--insecure",
+                'H' => return ("--header", index + 1 < short.len()),
+                'e' => return ("--endpoint", index + 1 < short.len()),
+                'w' => return ("--worktree", index + 1 < short.len()),
+                _ => return (text, false),
+            };
+            if index + 1 == short.len() {
+                return (name, false);
+            }
+        }
+        return (text, false);
+    }
+    text.split_once('=')
+        .map_or((text, false), |(flag, _)| (flag, true))
+}
+
+fn cursor_interactive_args(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(text) = arg.to_str() else {
+            return false;
+        };
+        let (flag, inline) = cursor_option(text);
+        match flag {
+            "--api-key"
+            | "--auth-token"
+            | "--header"
+            | "--endpoint"
+            | "--output-format"
+            | "--mode"
+            | "--model"
+            | "--sandbox"
+            | "--workspace"
+            | "--add-dir"
+            | "--plugin-dir"
+            | "--worktree-base"
+            | "--statsig-overrides"
+            | "--website-url"
+            | "--agent-endpoint"
+            | "--base-url"
+            | "--local-agent-api-key"
+            | "--http-version"
+            | "--repo-endpoint"
+            | "--repo-http-version"
+            | "--background-shell-timeout"
+            | "--image"
+            | "--new-session-id"
+            | "--dev-raw-model-slug"
+            | "--system-prompt"
+            | "--conversation-history-file"
+            | "--harness"
+            | "--computer-use-coords"
+            | "--allowed-tools"
+            | "--exclude-tools"
+            | "--data-dir"
+            | "--min-version"
+            | "--conversation-group-id" => {
+                if !inline && args.next().is_none() {
+                    return false;
+                }
+            }
+            "--resume" | "--worktree" => {
+                if !inline
+                    && args
+                        .clone()
+                        .next()
+                        .is_some_and(|arg| !arg.to_string_lossy().starts_with('-'))
+                {
+                    args.next();
+                }
+            }
+            "--print"
+            | "--stream-partial-output"
+            | "--plan"
+            | "--continue"
+            | "--force"
+            | "--yolo"
+            | "--auto-review"
+            | "--approve-mcps"
+            | "--trust"
+            | "--skip-worktree-setup"
+            | "--debug"
+            | "--stderr"
+            | "--disable-project-configs"
+            | "--enable-bedrock"
+            | "--enable-local-bedrock"
+            | "--authless"
+            | "--insecure"
+            | "--repo-insecure"
+            | "--show-thinking"
+            | "--printenv"
+            | "--single-turn"
+            | "--disable-indexing"
+            | "--disable-codebase-ref"
+            | "--warm-request-context"
+            | "--exclude-workspace-context"
+            | "--disable-auto-update"
+            | "--endless-retries"
+            | "--retry-all-inference-errors"
+            | "--with-diffs" => {}
+            "--" => {
+                return args
+                    .next()
+                    .is_none_or(|arg| !matches!(arg.to_str(), Some("worker" | "persist" | "acp")));
+            }
+            _ if text.starts_with('-') => return false,
+            _ => return !matches!(text, "worker" | "persist" | "acp"),
+        }
+    }
+    true
+}
+
+fn is_cursor_process(name: &str, cmd: &[std::ffi::OsString]) -> bool {
+    let launcher = cmd
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "agent" | "cursor-agent"));
+    if !runs_a_script_runtime(name, cmd) && !launcher && !matches!(name, "agent" | "cursor-agent") {
+        return false;
+    }
+    let Some(script) = runtime_script("node", cmd) else {
+        return false;
+    };
+    let path = Path::new(script);
+    let Some(versions) = path.parent().and_then(Path::parent) else {
+        return false;
+    };
+    if !path.is_absolute()
+        || path.file_name().is_none_or(|name| name != "index.js")
+        || versions.file_name().is_none_or(|name| name != "versions")
+        || versions
+            .parent()
+            .and_then(Path::file_name)
+            .is_none_or(|name| name != "cursor-agent")
+        || path
+            .components()
+            .any(|part| part.as_os_str().to_string_lossy().ends_with(".app"))
+    {
+        return false;
+    }
+    let Some(index) = cmd.iter().position(|arg| arg == script) else {
+        return false;
+    };
+    cursor_interactive_args(&cmd[index + 1..])
+}
+
 fn is_agent_process(agent: Agent, name: &str, cmd: &[std::ffi::OsString]) -> bool {
+    if agent == Agent::Cursor {
+        return is_cursor_process(name, cmd);
+    }
     if agent == Agent::Antigravity {
         let Some(executable) = cmd.first().map(Path::new) else {
             return false;
@@ -598,6 +757,149 @@ impl ProcessLookup for SystemProcessLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_owner_requires_the_bundle_entrypoint_and_an_interactive_invocation() {
+        let script = "/home/user/.local/share/cursor-agent/versions/2026.11.05-86047df/index.js";
+        for (name, args, expected) in [
+            (
+                "node",
+                vec![
+                    "/home/user/.local/bin/agent",
+                    "--use-system-ca",
+                    script,
+                    "--print",
+                    "hello",
+                ],
+                true,
+            ),
+            (
+                "cursor-agent",
+                vec!["/bin/cursor-agent", script, "--resume", "chat-id"],
+                true,
+            ),
+            (
+                "node",
+                vec!["node", script, "--model", "worker", "--print", "hello"],
+                true,
+            ),
+            (
+                "node",
+                vec!["node", script, "--model=worker", "--print", "hello"],
+                true,
+            ),
+            ("node", vec!["node", script, "agent", "worker"], true),
+            ("agent", vec!["/bin/agent", "--print", "hello"], false),
+            (
+                "cursor-agent",
+                vec!["cursor-agent", "/other/index.js"],
+                false,
+            ),
+            ("node", vec!["node", "/other/index.js", script], false),
+            ("node", vec!["node", "-e", "hello", script], false),
+            (
+                "node",
+                vec!["node", "--require", script, "/other/index.js"],
+                false,
+            ),
+            ("sh", vec!["sh", "-c", script], false),
+            ("node", vec!["node", script, "worker"], false),
+            (
+                "node",
+                vec!["node", script, "--model", "auto", "persist", "start"],
+                false,
+            ),
+            ("node", vec!["node", script, "--acp"], false),
+            ("node", vec!["node", script, "--", "acp"], false),
+            (
+                "node",
+                vec![
+                    "node",
+                    "/Applications/Cursor.app/cursor-agent/versions/v/index.js",
+                ],
+                false,
+            ),
+        ] {
+            let args = args
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                is_agent_process(Agent::Cursor, name, &args),
+                expected,
+                "{name} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_launchers_survive_linux_thread_names() {
+        let script = "/home/user/.local/share/cursor-agent/versions/test/index.js";
+        for launcher in ["/bin/agent", "/bin/cursor-agent"] {
+            let args = [launcher, "--use-system-ca", script, "--print", "hello"]
+                .map(std::ffi::OsString::from);
+            assert!(is_agent_process(Agent::Cursor, "MainThread", &args));
+        }
+        let unrelated = ["/bin/unrelated", script].map(std::ffi::OsString::from);
+        assert!(!is_agent_process(Agent::Cursor, "MainThread", &unrelated));
+    }
+
+    #[test]
+    fn cursor_options_preserve_chat_ownership_and_server_exclusions() {
+        for (args, expected) in [
+            (vec!["-pf", "hello"], true),
+            (vec!["-HTest:value", "--print", "hello"], true),
+            (vec!["-ehttp://localhost:9000", "--print", "hello"], true),
+            (vec!["-wreview-branch", "--print", "hello"], true),
+            (vec!["-pkfHTest:value", "hello"], true),
+            (
+                vec!["--auth-token", "worker", "--single-turn", "-p", "hello"],
+                true,
+            ),
+            (vec!["--auth-token=worker", "-p", "hello"], true),
+            (
+                vec![
+                    "--background-shell-timeout",
+                    "10",
+                    "--show-thinking",
+                    "-p",
+                    "hello",
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "--system-prompt",
+                    "worker",
+                    "--disable-auto-update",
+                    "-p",
+                    "hello",
+                ],
+                true,
+            ),
+            (vec!["-pf", "worker"], false),
+            (vec!["-HTest:value", "persist", "start"], false),
+            (vec!["-ehttp://localhost:9000", "acp"], false),
+            (vec!["-wreview-branch", "--acp"], false),
+            (vec!["--auth-token", "worker", "worker"], false),
+            (vec!["--single-turn", "persist", "start"], false),
+            (vec!["--image", "worker", "acp"], false),
+            (vec!["-pfq", "hello"], false),
+            (vec!["-pH"], false),
+            (vec!["--auth-token"], false),
+        ] {
+            let cmd = ["node", "/home/user/cursor-agent/versions/test/index.js"]
+                .into_iter()
+                .chain(args)
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                is_agent_process(Agent::Cursor, "node", &cmd),
+                expected,
+                "{cmd:?}"
+            );
+        }
+    }
 
     #[test]
     fn antigravity_owner_requires_the_cli_launcher_not_app_or_backend() {

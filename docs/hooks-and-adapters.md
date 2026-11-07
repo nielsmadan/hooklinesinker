@@ -65,9 +65,11 @@ converts them to the host's units when rendering configuration.
 Both TypeScript adapters spawn with argument arrays, discard child output, and
 resolve failures. Each invocation runs in its own process group and escalates from
 TERM to KILL within two seconds. Queued work uses the same deadline from enqueue time,
-so stale calls are dropped rather than starting late. The host
-timeouts and adapter timers bound waiting outside ingest; ingest's handled
-errors exit zero. See [status lifecycle](status-lifecycle.md) for sink deadlines.
+so stale calls are dropped rather than starting late. Ingest shares a 1.5-second
+cooperative deadline across storage locks, consumer lookup, sink delivery, convergence
+and best-effort health recording. Host timeouts and adapter timers remain the outer
+bound for stalled stdin or filesystem operations; handled errors exit zero.
+See [status lifecycle](status-lifecycle.md) for sink deadlines.
 
 Registration and normalization must move together. `events.rs` owns native command-hook
 registration and actions; `normalize.rs` adds Pi and OpenCode adapter mappings and
@@ -98,6 +100,7 @@ only on `StopFailure`.
 |---|---|
 | Claude | `model` (`SessionStart`), `to_model` (`PostModelSwitch`), `effort` (`{level}` object or bare string), `permission_mode`, `session_title`, `StopFailure.error` as the problem, `tool_name`, live children in `background_tasks[]`, a non-empty `agent_id` as subagent origin |
 | Codex | `model`, `permission_mode`, `tool_name`, `Interrupt` as problem `interrupted` |
+| Cursor | `model_id` (fallback `model`), `tool_name`, `stop.status` as problem `interrupted` for `aborted` or `error` for `error` |
 | Droid | `permission_mode`, `tool_name` |
 | Qwen | `model`, `permission_mode`, `tool_name`, `StopFailure.error`, `Stop.context_usage` (a fraction, scaled to a percentage) |
 | Kimi | `model`, `session_title`, `tool_name`, `StopFailure.error_type`, `Interrupt` as problem `interrupted` |
@@ -121,6 +124,57 @@ later. `hooks status` reports an install without it as drifted.
 wire agent to its event source, hook backend, status-event table, executable names, shared-host
 markers, lifecycle flags, and timeout unit. Backend-specific parsing still lives in the modules
 named above, but a new agent cannot silently omit one of these cross-cutting choices.
+
+## Cursor CLI
+
+`hooks install --agent cursor` manages `~/.cursor/hooks.json`, using version 1
+direct command handlers. Each owned handler has `type: "command"`, a five-second
+`timeout`, and `failClosed: false`. The installer preserves foreign handlers and
+other settings; duplicate handlers, changed matchers, timeouts and binary paths
+are drift. Unsupported versions, grouped handler shapes and ambiguous execution
+overrides are left untouched. This path follows the CLI hook loader, independently
+of `CURSOR_CONFIG_DIR` and `XDG_CONFIG_HOME`.
+
+| Hook | Status |
+|---|---|
+| `sessionStart` | Idle for a new binding; preserves an existing live phase |
+| `beforeSubmitPrompt` | Working; increments turns |
+| `preToolUse` | Working; sets the tool |
+| `postToolUse`, `postToolUseFailure` | Working; clears the tool |
+| `preCompact` | Compacting |
+| `stop` | Idle; `aborted` reports `interrupted`, `error` reports `error` |
+| `sessionEnd` | Removes only the named binding |
+
+All eight hooks emit `{}`, including handled telemetry failures. They supply no
+permission decision, tool-input rewrite, or follow-up prompt. `preToolUse` means
+tool activity; it does not establish that a permission dialog is open. Question
+waiting and child counts are unreported. `subagentStart` and `subagentStop` are
+not subscribed; tool callbacks carrying `parent_tool_call_id` are ignored.
+
+`conversation_id` is required and becomes `session.id`. A conflicting `session_id`
+is rejected; `generation_id` never identifies a session. The effective project
+directory is native `cwd`, then `CURSOR_PROJECT_DIR`, then the first absolute
+`workspace_roots` entry, then the hook launch directory. Git context uses the same
+directory. Prompts, tool arguments/results, model parameters and user email are
+not persisted. `transcript_path` is retained as metadata without reading the file.
+
+Only CLI owners executing the installed `cursor-agent/versions/<version>/index.js`
+bundle qualify. A generic `agent` process, arbitrary `node index.js`, desktop app,
+cloud worker, ACP or persistent-server invocation does not. Ordinary interactive
+and `--print` sessions are the intended scope. Recognition covers the pinned build's
+chat options, combined short flags such as `-pf`, attached values such as `-HName:value`,
+and launcher names retained in `argv[0]` when Linux reports Node as `MainThread`.
+Cursor's imported Claude callbacks
+are suppressed when Cursor is the nearest recognized agent; a real nested Claude
+process keeps its own identity.
+
+Same-process conversations stay independent. Startup is asynchronous, so a late
+`sessionStart` preserves working/compacting state and cannot reopen an ended
+binding. Resume in a new process creates a new binding on its first native event;
+the inspected CLI does not emit `sessionStart` on resume. After sink delivery, HLS
+rechecks the stored state and sends a correction within the remaining delivery
+budget if concurrent activity overtook startup. See the
+[validation record](reference/agent-validation.md) for observed and fixture coverage.
 
 ## Devin CLI
 
@@ -343,9 +397,9 @@ The [hook reference](https://antigravity.google/docs/hooks) describes `command` 
 command to execute.” Its Stop contract says “Any other value allows the stop.” Stop responses
 are `{"decision":"allow"}`; the other subscribed hooks return `{}`. Controlled stdin, path,
 state, normalization, and sink errors still reach that response. Crashes, termination,
-broken stdout, and host timeouts cannot guarantee a response. Existing storage locks can wait
-ten seconds, exceeding this host's five-second hook timeout; real timeout behavior remains
-unverified. No permission hook is subscribed and no approval is emitted.
+broken stdout, and host timeouts cannot guarantee a response. Storage lock waits share
+ingest's 1.5-second deadline, including error reporting. Real host timeout behavior
+remains unverified. No permission hook is subscribed and no approval is emitted.
 
 Callbacks require both a positively identified `agy`/`antigravity` CLI ancestor and a matching
 absolute `.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
