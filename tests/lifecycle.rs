@@ -176,8 +176,15 @@ fn cursor_parallel_conversations_end_independently_and_resume_with_new_binding()
         &json!({"conversation_id":"chat-a"}),
     );
     assert_eq!(f.ids(), vec!["chat-a", "chat-b"]);
-    assert_ne!(f.record("chat-a")["bindingId"], old_binding);
-    assert_eq!(f.record("chat-a")["phase"], "working");
+    // The ended binding stays on disk as a retired record, and read_dir order is filesystem-dependent.
+    let resumed = f
+        .records()
+        .into_iter()
+        .map(|(_, record)| record)
+        .find(|record| record["session"]["id"] == "chat-a" && record["retired"] != true)
+        .unwrap();
+    assert_ne!(resumed["bindingId"], old_binding);
+    assert_eq!(resumed["phase"], "working");
 }
 
 #[test]
