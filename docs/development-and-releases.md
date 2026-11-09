@@ -93,11 +93,15 @@ After confirmation, it rechecks the checkout and remote state. Then
 Cargo metadata to update `Cargo.lock` with the existing resolution. Curtains commits
 changed release files, creates an annotated tag and atomically pushes `main` and that tag.
 It prints a tag-filtered Actions URL and returns after the push.
-The [tag workflow](../.github/workflows/release.yml) first runs adapter, Python, formatting,
-Clippy, and Rust tests with locked dependencies. It then builds all four targets, assembles the
-three artifacts and checksum manifest, verifies the macOS binary's compiled version matches
-the tag, then automatically publishes with `gh release create --verify-tag` using a job-scoped
-contents-write token. Local success confirms the push, not finished artifacts.
+The [tag workflow](../.github/workflows/release.yml) installs `curtains` with the
+`nielsmadan/curtaincall` action and runs `curtains ci validate-tag`, which requires an annotated
+tag whose commit is on `origin/main`. It then runs adapter, Python, formatting, Clippy, and Rust
+tests with locked dependencies, builds all four targets, assembles the three artifacts and
+checksum manifest, and verifies the macOS binary's compiled version matches the tag. The publish
+job revalidates the tag, writes release notes from the commit subjects since
+`curtains ci previous-tag`, and publishes with `curtains ci publish` using a job-scoped
+contents-write token. Publication goes through a draft that becomes public only once every asset
+is uploaded. Local success confirms the push, not finished artifacts.
 
 Wait for both CI and the release workflow to succeed, then verify the published assets. Consumers
 must separately update their helper version/source pins and verify release artifacts in their
@@ -111,3 +115,6 @@ consumer bundles the newer helper first activates it for all of them.
 Failed preparation or push leaves local files, commits or tags available for inspection.
 A failed workflow leaves the remote tag in place. Inspect the Actions failure and fix or
 rerun the workflow; never replace a public tag. Curtains does not automatically resume.
+If publication failed, rerun only the failed publish job: `curtains ci publish` then completes
+the existing draft from the same built artifacts, and refuses assets whose digest differs from
+those already uploaded, which a fresh build would produce.

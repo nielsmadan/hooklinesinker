@@ -4,13 +4,19 @@ on:
     tags: ["v*"]
 permissions:
   contents: read
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - uses: nielsmadan/curtaincall@970d648bc9aaf685b4c924e05c7edf359948b209 # v1.2.0
+      - name: Validate annotated tag and ancestry
+        run: curtains ci validate-tag "$RELEASE_TAG" "$GITHUB_SHA"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
@@ -74,7 +80,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - uses: nielsmadan/curtaincall@970d648bc9aaf685b4c924e05c7edf359948b209 # v1.2.0
+      - name: Revalidate tag
+        run: |
+          RELEASE_COMMIT=$(curtains ci validate-tag "$RELEASE_TAG" "$GITHUB_SHA")
+          echo "RELEASE_COMMIT=$RELEASE_COMMIT" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: binaries
@@ -95,7 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           binary_version="$(./dist/hooklinesinker-macos-universal version --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           if [ "$binary_version" != "$tag_version" ]; then
             echo "Cargo.toml version $binary_version does not match tag $tag_version" >&2
             exit 1
@@ -103,8 +115,24 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/hooklinesinker-*
-      - name: Create release
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          previous_tag="$(curtains ci previous-tag "$RELEASE_TAG")"
+          if [ -n "$previous_tag" ]; then
+            git log --no-merges --format='- %s' "$previous_tag..$RELEASE_TAG" > "$notes"
+            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$previous_tag" "$RELEASE_TAG" >> "$notes"
+          else
+            echo "Initial release." > "$notes"
+          fi
+          cat "$notes"
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --title "hooklinesinker $GITHUB_REF_NAME" --verify-tag
+          curtains ci publish "$RELEASE_TAG" "$RELEASE_COMMIT" \
+            --notes "$RUNNER_TEMP/release-notes.md" \
+            --title "hooklinesinker $RELEASE_TAG" \
+            dist/*
