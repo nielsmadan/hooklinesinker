@@ -1,4 +1,3 @@
 harnesses = ["claude", "codex", "opencode", "pi", "droid"]
-presets = false
-artifacts = "artifacts.toml"
-templates = ["rust", "cli", "typescript"]
+instructions = ["main"]
+kits = ["rust", "cli", "typescript", "macos-vm"]
