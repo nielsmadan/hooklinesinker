@@ -17,7 +17,7 @@ workflows:
         - 'actions/setup-node@v7.1.0'
         - 'actions/upload-artifact@v7.0.2'
         - 'dtolnay/rust-toolchain@stable'
-        - 'nielsmadan/curtaincall@v1.2.0'
+        - 'nielsmadan/curtaincall@v1.3.0'
         - 'swatinem/rust-cache@v2.9.3'
 dependencies:
     'actions/attest-build-provenance@v4.2.2':
@@ -47,7 +47,7 @@ dependencies:
         commit: 'sha1-949feb2413d6458794dcd2491c4babbbce0c15c1'
         owner_id: 44036562
         repo_id: 189476904
-    'actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0':
+    'actions/setup-python@v7.1.0':
         ref: 'v7.1.0'
         commit: 'sha1-6d4fd22b20465ccc0f7354476588e8df7c9ca0e0'
         owner_id: 44036562
@@ -67,13 +67,13 @@ dependencies:
         commit: 'sha1-b725eda525362e7cf34af9a7243cac1e3f01a7ec'
         owner_id: 1940490
         repo_id: 260749683
-    'nielsmadan/curtaincall@v1.2.0':
-        ref: 'v1.2.0'
-        commit: 'sha1-970d648bc9aaf685b4c924e05c7edf359948b209'
+    'nielsmadan/curtaincall@v1.3.0':
+        ref: 'v1.3.0'
+        commit: 'sha1-8362e71ffa86422960d7e356f620085bcc62f925'
         owner_id: 701154
         repo_id: 1418051787
         uses:
-            - 'actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0'
+            - 'actions/setup-python@v7.1.0'
     'swatinem/rust-cache@v2.9.3':
         ref: 'v2.9.3'
         commit: 'sha1-d1527c8f67ef9af357290475d4af4b0fab8f12e0'
