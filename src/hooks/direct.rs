@@ -90,9 +90,21 @@ fn installed(
             matches!(
                 classify_command(command, binary, agent, spec.name),
                 GroupOwnership::Ours { exact: true }
-            ) && **entry == handler(agent, spec, command)
+            ) && matches_handler(agent, entry, &handler(agent, spec, command))
         }
         _ => false,
+    }
+}
+
+// Config managers that translate Claude hooks for Cursor add `loop_limit: null` to every handler.
+fn matches_handler(agent: Agent, entry: &Value, expected: &Value) -> bool {
+    match (agent, entry.as_object()) {
+        (Agent::Cursor, Some(fields)) if fields.get("loop_limit") == Some(&Value::Null) => {
+            let mut fields = fields.clone();
+            fields.remove("loop_limit");
+            Value::Object(fields) == *expected
+        }
+        _ => entry == expected,
     }
 }
 
@@ -254,6 +266,7 @@ mod tests {
             ("failClosed", Value::from(true)),
             ("timeout", Value::from(100)),
             ("matcher", Value::from("Shell")),
+            ("loop_limit", Value::from(5)),
             (
                 "command",
                 Value::from("/old/hooklinesinker ingest --agent cursor --event preToolUse"),
@@ -287,6 +300,31 @@ mod tests {
         assert_eq!(remaining, original);
         let bytes = fs::read(&path).unwrap();
         manager.uninstall(Agent::Cursor).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cursor_handlers_with_a_null_loop_limit_stay_installed() {
+        let (manager, root) = manager();
+        let path = config_path(&manager, Agent::Cursor);
+        manager.install(Agent::Cursor).unwrap();
+        let mut rendered: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for handlers in rendered["hooks"].as_object_mut().unwrap().values_mut() {
+            for handler in handlers.as_array_mut().unwrap() {
+                handler["loop_limit"] = Value::Null;
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&rendered).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            manager.status(Agent::Cursor).unwrap().state,
+            HookState::Installed
+        );
+        assert_eq!(
+            manager.install(Agent::Cursor).unwrap().state,
+            HookState::Installed
+        );
         assert_eq!(fs::read(&path).unwrap(), bytes);
         fs::remove_dir_all(root).unwrap();
     }

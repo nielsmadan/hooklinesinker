@@ -131,7 +131,8 @@ named above, but a new agent cannot silently omit one of these cross-cutting cho
 direct command handlers. Each owned handler has `type: "command"`, a five-second
 `timeout`, and `failClosed: false`. The installer preserves foreign handlers and
 other settings; duplicate handlers, changed matchers, timeouts and binary paths
-are drift. Unsupported versions, grouped handler shapes and ambiguous execution
+are drift. An owned handler may also carry `loop_limit: null`, which config managers that
+translate Claude hooks for Cursor write on every handler; any other `loop_limit` is drift. Unsupported versions, grouped handler shapes and ambiguous execution
 overrides are left untouched. This path follows the CLI hook loader, independently
 of `CURSOR_CONFIG_DIR` and `XDG_CONFIG_HOME`.
 
