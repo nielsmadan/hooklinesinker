@@ -228,17 +228,15 @@ fn list_panes(env: &dyn EnvSource, socket: Option<&str>) -> PaneReports {
         args.extend(["-S", socket]);
     }
     args.extend(["list-panes", "-a", "-F", TMUX_PANES_FORMAT]);
-    env.command_output("tmux", &args)
-        .map(|output| {
-            output
-                .lines()
-                .filter_map(|line| {
-                    let (pane, report) = line.split_once(',')?;
-                    Some((pane.to_string(), parse_pane_report(report)))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    env.command_output("tmux", &args).map_or_default(|output| {
+        output
+            .lines()
+            .filter_map(|line| {
+                let (pane, report) = line.split_once(',')?;
+                Some((pane.to_string(), parse_pane_report(report)))
+            })
+            .collect()
+    })
 }
 
 fn recheck_terminal(

@@ -442,8 +442,7 @@ fn print_hook_status_json(status: &HookStatus) {
 fn print_hook_status_human(status: &HookStatus) {
     let reason = status
         .reason
-        .map(|reason| format!(" ({reason})"))
-        .unwrap_or_default();
+        .map_or_default(|reason| format!(" ({reason})"));
     stdoutln!(
         "[{}] {}{reason}: {}",
         status.agent.as_str(),
@@ -697,8 +696,7 @@ fn doctor_hook_status() -> DoctorCheck {
                         if matches!(status.state, HookState::Drifted | HookState::Unsupported) {
                             let reason = status
                                 .reason
-                                .map(|reason| format!(" ({reason})"))
-                                .unwrap_or_default();
+                                .map_or_default(|reason| format!(" ({reason})"));
                             problems.push(format!(
                                 "{} hooks are {}{reason} at {}",
                                 agent.as_str(),
