@@ -385,6 +385,10 @@ included in all-agent configuration management; `hooks status` and installation 
 its configuration as provisional even when the four definitions are installed correctly.
 Do not interpret `installed` as proof of a usable lifecycle.
 
+Native probes on 2026-11-13–14 found that parents can remain working after their children
+finish and that child callbacks lack authoritative parentage. Hls remains hooks-only;
+status-line integration is out of scope. See the [support decision and reopening criteria](decisions/0006-antigravity-hooks-cannot-establish-reliable-status.md).
+
 The named definition `hooklinesinker` in `~/.gemini/config/hooks.json` subscribes
 `SessionStart`, `PreInvocation`, `PostToolUse`, and `Stop`. Tool events use matcher groups;
 the other events contain direct handlers. Each command has a five-second timeout. Foreign
@@ -411,17 +415,15 @@ uses that effective directory. `PreInvocation` reports working without counting 
 `PostToolUse` refreshes details. Stop requires boolean `fullyIdle`: true reports idle, false
 reports working; missing or invalid values record health and leave existing state unchanged.
 
-Validation used official documentation and isolated binaries `agy` 1.1.11 and `antigravity`
-1.4.12. The initial minimal prompts failed authentication. A subsequent isolated 1.4.12 run
-loaded the generated named hook definition, then failed silent authentication and attempted
-OAuth; it was terminated at the 35-second probe deadline without interaction. Automated fixtures cover the schema,
-responses and conservative lifecycle, but **actual hook ancestry, closing a CLI while its
-backend survives, eventual authoritative settlement after Stop(false), and host timeout/crash
-semantics remain blocked**. The public fullyIdle field definition does not establish a later
-Stop(true) notification. Multiple conversations remain independent and a verified CLI owner
-would drive dead-process sweeping; a live backend is never substituted for that owner. No
-permission, compaction, session-end or complete child state is inferred. These gates must be
-resolved before advertising support.
+Initial isolated probes with `agy` 1.1.11 and `antigravity` 1.4.12 were authentication-blocked.
+Later authenticated probes with `agy` 1.5.8 and 1.5.9 captured hooks under the real CLI and
+confirmed the lifecycle gaps described in the decision. The observed `transcript_full.jsonl`
+name is rejected by the current path guard; its local compatibility fix was withdrawn because
+successful ingestion still left idle parents working. Separate conversations remain independent,
+and a live backend is never substituted for the recorded CLI owner. Cancellation, killed-child
+settlement, backend survival after CLI exit, and host timeout/crash handling remain unverified.
+No permission, compaction, session-end or complete child state is inferred. These probes do not
+establish support.
 
 
 ## Kilo CLI

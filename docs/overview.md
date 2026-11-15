@@ -15,6 +15,7 @@ These documents explain the flows and constraints behind that interface.
 | Understand how child agents fold into their root session | [Child-agent aggregation decision](decisions/0003-child-agent-aggregation.md) |
 | Understand why reset sends no removal events for live sessions | [Explicit session reset decision](decisions/0004-explicit-session-reset.md) |
 | Understand why home-relative hook spellings count as installed | [Home-relative ownership decision](decisions/0005-home-relative-ownership.md) |
+| Understand why Antigravity cannot be supported through its observed hooks | [Antigravity support decision](decisions/0006-antigravity-hooks-cannot-establish-reliable-status.md) |
 | Repeat an upgrade check with real release binaries | [Shared upgrade procedure](tests/shared-upgrade/README.md) |
 | Check host version pins, native evidence, and validation gaps | [Native CLI validation](reference/agent-validation.md) |
 | Repeat one isolated native hook smoke check | [Native smoke procedure](tests/native-agent-smoke/README.md) |

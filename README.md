@@ -2,7 +2,7 @@
 
 I am working on an app ([Juggler](https://github.com/nielsmadan/juggler)) and a CLI ([ringleader](https://github.com/nielsmadan/ringleader)) that both consume agent status hook events from multiple agents. I did not want to register both the app and the CLI in every hook config for every agent. So I built this little CLI utility. Hook events from any supported agent (Claude Code, Codex, OpenCode, Pi, Factory Droid, Qwen Code, Kimi Code CLI, Devin CLI, Goose CLI, GitHub Copilot CLI, Kilo CLI) get sent to hooklinesinker, which keeps its own queryable state on session status and forwards normalized events. Other apps can register with hooklinesinker to receive the the events directly as well.
 
-Eleven CLI agents are supported. Antigravity CLI has [provisional hooks](docs/hooks-and-adapters.md#antigravity-cli--provisional-support-blocked), included in configuration management but not counted as supported: actual CLI ownership, eventual background completion, and host timeout behavior remain unverified.
+Eleven CLI agents are supported. Antigravity CLI has [provisional hooks](docs/hooks-and-adapters.md#antigravity-cli--provisional-support-blocked), included in configuration management but not counted as supported. Native probes found unreliable idle settlement and missing child identity; hls remains hooks-only. See [why Antigravity support is blocked](docs/decisions/0006-antigravity-hooks-cannot-establish-reliable-status.md) before revisiting the integration.
 
 Cursor CLI hooks are implemented; see the [Cursor contract](docs/hooks-and-adapters.md#cursor-cli)
 and [native validation status](docs/reference/agent-validation.md) before enabling them.

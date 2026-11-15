@@ -22,20 +22,20 @@ authentication. Supply an already-injected `CURSOR_API_KEY` to the isolated smok
 process to continue; do not copy credential stores. Native delivery remains a required
 validation gate; source inspection and payload fixtures do not close it.
 
-The five additions were checked on 2026-11-01 against these versions. Versions are
-evidence pins, not minimum-version promises.
+The five additions were initially checked on 2026-11-01; the Antigravity row includes
+follow-up probes on 2026-11-13–14. Versions are evidence pins, not minimum-version promises.
 
 | CLI | Contract pin | Native observation | Remaining native checks |
 |---|---|---|---|
 | Devin | 3000.11.234, build `92c83011d113`; bundled hook documentation | Version/help and isolated auth status; prompt stopped at login | Discovery, inherited Claude suppression, tool/permission/stop/end delivery and owner death |
 | Goose | 1.57.0; source `30bba95105e59bc3e7df624cf6b4d433690cfe12` | Version/help; prompt stopped because no provider was configured | Discovery and complete turn/tool/failure/session-end delivery; desktop remains outside scope |
 | GitHub Copilot | 1.0.105; official hook reference | Version/help; prompt stopped during account-validation network request, including after public CA retry | Discovery, sandbox access, inherited Claude suppression, permission notifications, `/clear`, and crash/timeout handling |
-| Antigravity | 1.4.12 (`agy` 1.1.11 also inspected); official hook reference | Generated named hooks discovered; model execution blocked at authentication | Actual CLI owner and backend lifetime, eventual settlement after `Stop(false)`, callback/neutral response handling and timeout behavior |
+| Antigravity | `agy` 1.5.8 and 1.5.9 (1.1.11 and 1.4.12 earlier) | Authenticated print/interactive probes captured CLI-owned callbacks, separate child conversations, and parent `Stop(false)` without a later settling event; 1.5.8 sent `transcript_full.jsonl` | Unsupported: idle settlement and child identity are insufficient. Cancellation, killed-child settlement, backend lifetime, and host timeout/crash handling remain unverified. See the [decision](../decisions/0006-antigravity-hooks-cannot-establish-reliable-status.md). |
 | Kilo | 7.8.25; source `b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c` | Generated standalone plugin loaded; explicit-model turn succeeded; actual Kilo PID and native disposal removal observed | Background children/wake settlement, overlapping permissions, compaction and long-lived shared backend teardown |
 
 The Kilo turn used `openrouter/openai/gpt-4.1-mini`. Its default provider selection
-failed before that successful explicit-model run. The Antigravity loader observation
-does not establish lifecycle support. An earlier helper-only probe found that a held status
+failed before that successful explicit-model run. Antigravity's successful callback delivery
+does not establish lifecycle support; the local transcript-path fix was withdrawn. An earlier helper-only probe found that a held status
 lock delayed neutral `Stop` output by 10.518 seconds. Ingest now shares a 1.5-second
 deadline across lock waits and delivery; controlled Cursor and Antigravity CLI fixtures
 require their neutral responses before the five-second host deadline while the lock stays
