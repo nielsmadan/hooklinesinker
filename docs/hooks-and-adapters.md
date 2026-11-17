@@ -99,13 +99,21 @@ only on `StopFailure`.
 | Agent | Fields |
 |---|---|
 | Claude | `model` (`SessionStart`), `to_model` (`PostModelSwitch`), `effort` (`{level}` object or bare string), `permission_mode`, `session_title`, `StopFailure.error` as the problem, `tool_name`, live children in `background_tasks[]`, a non-empty `agent_id` as subagent origin |
-| Codex | `model`, `permission_mode`, `tool_name`, `Interrupt` as problem `interrupted` |
+| Codex | `model`, `permission_mode`, `tool_name`, `Interrupt` as problem `interrupted`; title from the session index below |
 | Cursor | `model_id` (fallback `model`), `tool_name`, `stop.status` as problem `interrupted` for `aborted` or `error` for `error` |
 | Droid | `permission_mode`, `tool_name` |
 | Qwen | `model`, `permission_mode`, `tool_name`, `StopFailure.error`, `Stop.context_usage` (a fraction, scaled to a percentage) |
 | Kimi | `model`, `session_title`, `tool_name`, `StopFailure.error_type`, `Interrupt` as problem `interrupted` |
 | Pi | the adapter's `model`, `effort`, `session_title`, `context_percent` and `problem` keys; a JSON `null` clears every one but `problem` |
 | OpenCode | none; the V1 adapter does not load on OpenCode 2.x, and `session.status.busy` repeats on retry and after a permission, so it is no turn start. `activity.turns` stays 0 until the V2 adapter port maps a real prompt event to a turn start |
+
+Codex's hook payload omits the session name. On each root hook, ingestion looks up the
+session ID in `$CODEX_HOME/session_index.jsonl` (default `~/.codex/session_index.jsonl`)
+and maps the newest usable `thread_name` to `session.title`, using the same sanitizer.
+The lookup reads at most the final 8 MiB of this append-only index, skips malformed entries,
+and leaves the stored title unchanged if no name is found or the file cannot be read.
+Renames appear on the next root hook; child hooks never refresh the parent's name.
+No transcript or prompt is read. See the upstream [index format](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/session_index.rs).
 
 The tool is set by `PreToolUse` and `PermissionRequest` and cleared by `PostToolUse` and
 `PostToolUseFailure`. Each agent's [event table](../src/events.rs) declares these roles beside

@@ -272,6 +272,10 @@ capped at 120 Unicode scalars, and, when the cap cut it, stripped of a trailing 
 combining mark; text that ends up empty clears the value. A percentage is any JSON number,
 rounded and clamped to 0–100.
 
+Codex titles come from its local session-name index during ingestion, with renames picked up
+on the next root hook. Missing or unreadable names keep the stored title; see
+[the lookup rules](hooks-and-adapters.md#session-details).
+
 [`ingest_session`](../src/state.rs) merges these with the binding's stored record under the
 ledger lock, using the merge rules in [`details.rs`](../src/details.rs), and every stored and forwarded record carries the merged values:
 

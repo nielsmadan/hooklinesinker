@@ -109,6 +109,9 @@ fn spawn_with_fallback(program: &str, args: &[&str]) -> io::Result<Child> {
 pub(crate) fn gather_environment(env: &dyn EnvSource, cwd: String) -> HookEnvironment {
     let (tmux, attachment) = detect_tmux(env);
     HookEnvironment {
+        codex_home: nonempty(env.var("CODEX_HOME"))
+            .map(std::path::PathBuf::from)
+            .or_else(|| nonempty(env.var("HOME")).map(|home| Path::new(&home).join(".codex"))),
         terminal: displayed_terminal(detect_terminal(env), attachment),
         tmux,
         git: detect_git(env, &cwd),

@@ -16,6 +16,7 @@ use std::io;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HookEnvironment {
+    pub codex_home: Option<std::path::PathBuf>,
     pub cwd: String,
     pub host: String,
     pub terminal: Option<TerminalIdentity>,

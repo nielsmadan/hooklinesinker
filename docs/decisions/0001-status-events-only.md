@@ -91,6 +91,11 @@ without them.
   its next turn without a phase change, so a consumer counting `idle` → `working` transitions
   undercounts. The count is a number derived from event names; it reads no prompt.
 
+Codex's `session.title` is also read from the matching `id` / `thread_name` entry in its
+local `session_index.jsonl`, because its hooks omit the name. Only the sanitized name
+enters the ledger and protocol; the lookup reads no transcript or prompt. It is bounded
+and best-effort, as described in [session details](../hooks-and-adapters.md#session-details).
+
 This also revises the child-agents amendment above: the ledger still stores only child digests
 and phases, but the number of tracked children that are not idle now reaches the wire as
 `activity.subagents`, and for Claude normalization also derives a count of live child entries

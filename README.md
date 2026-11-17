@@ -150,6 +150,9 @@ and is sent when that changes the record, without changing `phase`. Text is sani
 at most 120 characters); prompts, tool input and output, and message bodies are never read. See
 [session details](docs/status-lifecycle.md#session-details) for the merge rules.
 
+Codex session names are read from its local session index (`CODEX_HOME`, default `~/.codex`)
+and exposed as `session.title`. A rename is picked up on the next root hook event.
+
 **A session id is only unique within one agent.** Key on `(agent, session.id)`, or on
 `bindingId`, which also separates two terminals driving the same native session.
 

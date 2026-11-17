@@ -118,7 +118,17 @@ pub(crate) fn handle_ingest(
             agent,
             event,
             &input,
-            normalize(agent, event, &input, env, process),
+            normalize(agent, event, &input, env, process).map(|mut normalized| {
+                if agent == Agent::Codex
+                    && let Normalized::Recordable(status, details, traits) = &mut normalized
+                    && !traits.subagent_origin
+                    && let Some(home) = &env.codex_home
+                    && let Some(title) = crate::codex::session_title(home, &status.session.id)
+                {
+                    details.title = crate::details::Field::Set(title);
+                }
+                normalized
+            }),
         ),
         Err(error) => handle_normalized(ctx, agent, event, input, Err(error)),
     }

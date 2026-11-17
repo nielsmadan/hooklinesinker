@@ -3921,6 +3921,129 @@ fn claude_subagent_events_keep_session_details_but_feed_the_tool() {
 }
 
 #[test]
+fn codex_home_uses_the_override_or_the_users_default_directory() {
+    for (source, expected) in [
+        (
+            FakeEnvSource::new().with_var("HOME", "/home/user"),
+            Some("/home/user/.codex"),
+        ),
+        (
+            FakeEnvSource::new()
+                .with_var("HOME", "/home/user")
+                .with_var("CODEX_HOME", "/custom/codex"),
+            Some("/custom/codex"),
+        ),
+        (
+            FakeEnvSource::new()
+                .with_var("HOME", "/home/user")
+                .with_var("CODEX_HOME", ""),
+            Some("/home/user/.codex"),
+        ),
+        (FakeEnvSource::new(), None),
+    ] {
+        let gathered = environment::gather_environment(&source, "/tmp".into());
+        assert_eq!(gathered.codex_home, expected.map(PathBuf::from));
+    }
+}
+
+#[test]
+fn codex_index_names_reach_snapshots_and_sinks_and_refresh_after_rename() {
+    use std::io::Write as _;
+
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let index = home.join("session_index.jsonl");
+    let store = store();
+    let consumers = consumer_store();
+    consumers
+        .register(&consumer(
+            "juggler",
+            &["status"],
+            Some("http://127.0.0.1:7483/hook"),
+        ))
+        .unwrap();
+    let process = test_process();
+    let liveness = FakeProcessLookup::with_owner(process.clone());
+    liveness.set_alive(process.pid, &process.started_at);
+    let client = RecordingHttpClient::default();
+    let ctx = ingest::IngestContext {
+        store: &store,
+        liveness: &liveness,
+        consumers: Some(&consumers),
+        http_client: &client,
+    };
+    let env = HookEnvironment {
+        codex_home: Some(home.clone()),
+        ..test_environment()
+    };
+    let send = |event, input| {
+        let outcome = ingest::handle_ingest(&ctx, Agent::Codex, event, input, &env, 1);
+        assert_eq!(outcome.problem, None);
+    };
+    let input = r#"{"session_id":"s"}"#;
+    send("SessionStart", input);
+    assert_eq!(
+        store.sessions_envelope(&liveness).sessions[0].session.title,
+        None
+    );
+
+    std::fs::write(
+        &index,
+        "{\"id\":\"s\",\"thread_name\":\" Initial\\n name \"}\n",
+    )
+    .unwrap();
+    send("UserPromptSubmit", input);
+    assert_eq!(
+        client.bodies().last().unwrap()["session"]["title"],
+        "Initial name"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&index)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"id":"s", "thread_name":"Renamed session"})
+    )
+    .unwrap();
+    send("SubagentStart", r#"{"session_id":"s","agent_id":"child"}"#);
+    assert_eq!(
+        store.sessions_envelope(&liveness).sessions[0]
+            .session
+            .title
+            .as_deref(),
+        Some("Initial name")
+    );
+    send("Interrupt", input);
+    assert_eq!(
+        client.bodies().last().unwrap()["session"]["title"],
+        "Renamed session"
+    );
+    assert_eq!(
+        store.sessions_envelope(&liveness).sessions[0]
+            .session
+            .title
+            .as_deref(),
+        Some("Renamed session")
+    );
+
+    std::fs::write(&index, "broken index\n").unwrap();
+    send("UserPromptSubmit", input);
+    assert_eq!(
+        client.bodies().last().unwrap()["session"]["title"],
+        "Renamed session"
+    );
+    std::fs::remove_dir_all(home).unwrap();
+    send("Interrupt", input);
+    assert_eq!(
+        client.bodies().last().unwrap()["session"]["title"],
+        "Renamed session"
+    );
+}
+
+#[test]
 fn codex_details_reach_the_forwarded_event() {
     let native = include_str!("fixtures/details-codex.json");
     let bodies = forwarded_bodies(
