@@ -40,3 +40,16 @@ updates:
         update-types:
           - "patch"
           - "minor"
+
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    assignees:
+      - "nielsmadan"
