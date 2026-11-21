@@ -1,10 +1,10 @@
 {
   "name": "Hooklinesinker",
   "branch": "main",
-  "components": 3,
+  "version_parts": 3,
   "initial_version": "1.0.0",
   "sign": true,
-  "checks": [["just", "check"]],
+  "preflight": [["just", "check"]],
   "tools": ["git", "python3", "just", "cargo", "node", "npm"],
   "stages": [
     {
@@ -15,5 +15,5 @@
   ],
   "repository": "nielsmadan/hooklinesinker",
   "workflow": "release.yml",
-  "publication": "GitHub Actions will build and automatically publish the release with macOS/Linux binaries and SHA256SUMS"
+  "success_message": "GitHub Actions will build and automatically publish the release with macOS/Linux binaries and SHA256SUMS"
 }
