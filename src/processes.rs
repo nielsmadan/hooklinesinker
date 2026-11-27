@@ -374,6 +374,18 @@ fn is_owning_process(name: &str, cmd: &[std::ffi::OsString], expected: &[&str]) 
     if expected.iter().any(|e| name.eq_ignore_ascii_case(e)) {
         return true;
     }
+    // A CLI that sets its process title (Pi does) overwrites the runtime's argv, so the
+    // script path is gone and only argv[0] still names it.
+    if is_script_runtime(name)
+        && cmd.first().is_some_and(|argv0| {
+            let argv0 = argv0.to_string_lossy();
+            expected
+                .iter()
+                .any(|e| argv0.trim().eq_ignore_ascii_case(e))
+        })
+    {
+        return true;
+    }
     runs_a_script_runtime(name, cmd)
         && runtime_script(name, cmd).is_some_and(|arg| {
             Path::new(arg)
@@ -1107,6 +1119,27 @@ mod tests {
     fn a_launcher_that_merely_mentions_a_runtime_in_its_arguments_never_matches() {
         let argv = os_string_argv(&["sudo", "/usr/local/bin/node", "/usr/local/bin/qwen"]);
         assert!(!is_owning_process("sudo", &argv, &["qwen"]));
+    }
+
+    #[test]
+    fn a_runtime_retitled_to_the_agents_name_matches_by_argv0() {
+        let candidates = SystemProcessLookup::expected_executables(Agent::Pi);
+        assert!(is_owning_process(
+            "node",
+            &os_string_argv(&["pi"]),
+            candidates
+        ));
+        assert!(is_owning_process(
+            "node",
+            &os_string_argv(&["pi     "]),
+            candidates
+        ));
+    }
+
+    #[test]
+    fn a_runtime_retitled_to_another_name_does_not_match() {
+        let argv = os_string_argv(&["qwen"]);
+        assert!(!is_owning_process("node", &argv, &["pi"]));
     }
 
     #[test]
